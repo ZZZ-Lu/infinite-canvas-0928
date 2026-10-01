@@ -10,6 +10,10 @@ export interface AgentTurnTrace {
   taskBefore: RuntimeTask;
   transport?: AgentTurnDebugSnapshot;
   parsedResult?: AgentTurnResult;
+  stateNodeTrace?: {
+    prompt?: string;
+    response?: any;
+  };
   error?: string;
 }
 

@@ -37,11 +37,14 @@ export interface RuntimeTask {
   negotiationLog: Array<{ role: 'user' | 'agent', content: string, timestamp: number }>;
   lastGoalUpdatedAt: number;
   lastUserInputAt: number;
+  images?: string[];
+  cardContext?: Record<string, any>;
 }
 
 export interface AgentRuntimeOptions {
   requestTurn: (task: RuntimeTask, requireTool: boolean, signal?: AbortSignal) => Promise<AgentTurnResult>;
   executeTool: (call: AgentToolCall, task: RuntimeTask, signal?: AbortSignal) => Promise<unknown>;
+  updateStateNode?: (task: RuntimeTask, result: AgentTurnResult, signal?: AbortSignal) => Promise<void>;
   onTaskChange?: (task: RuntimeTask) => void;
   maxTurns?: number;
   /** Full Theater V1: a task must include one successful, Agent-selected UI action before completion. */
@@ -66,7 +69,7 @@ export class AgentRuntime {
     this.options = { ...options, maxTurns: options.maxTurns ?? 12 };
   }
 
-  createTask(input: { id: string; sessionId: string; goal: string }): RuntimeTask {
+  createTask(input: { id: string; sessionId: string; goal: string; images?: string[]; cardContext?: Record<string, any> }): RuntimeTask {
     const task: RuntimeTask = {
       id: input.id,
       sessionId: input.sessionId,
@@ -84,6 +87,8 @@ export class AgentRuntime {
       negotiationLog: [{ role: 'user', content: input.goal, timestamp: Date.now() }],
       lastGoalUpdatedAt: 0,
       lastUserInputAt: Date.now(),
+      images: input.images,
+      cardContext: input.cardContext,
     };
     this.tasks.set(task.id, task);
     this.addEvent(task, { type: 'user', text: input.goal });
@@ -94,10 +99,16 @@ export class AgentRuntime {
     return this.tasks.get(taskId);
   }
 
-  addUserInput(taskId: string, input: string) {
+  addUserInput(taskId: string, input: string, images?: string[], cardContext?: Record<string, any>) {
     const task = this.requireTask(taskId);
     task.negotiationLog.push({ role: 'user', content: input, timestamp: Date.now() });
     task.lastUserInputAt = Date.now();
+    if (images && images.length > 0) {
+      task.images = images;
+    }
+    if (cardContext) {
+      task.cardContext = cardContext;
+    }
     this.addEvent(task, { type: 'user', text: input });
     // If it was waiting, completed, or paused, resume it
     if (task.status === 'waiting_user' || terminal.has(task.status) || task.status === 'paused') {
@@ -150,22 +161,27 @@ export class AgentRuntime {
           this.addEvent(task, { turnId, type: 'answer', text: result.speak });
         }
 
+        // Dedicated State Node: Automatically extract and update cognitive state after every turn's output
+        if (this.options.updateStateNode && !this.isInterrupted(task, signal)) {
+          try {
+            await this.options.updateStateNode(task, result, signal);
+          } catch (nodeErr) {
+            console.warn('Dedicated state node execution failed:', nodeErr);
+          }
+        }
+
+        if (result.complete) {
+          task.status = 'completed';
+          if (result.speak) task.summary = result.speak;
+          this.publish(task);
+          break;
+        }
+
         if (result.toolCalls.length === 0 && !this.isInterrupted(task, signal)) {
-          recoveryCount += 1;
-          if (recoveryCount > 2) throw new Error('Agent 未完成任务且连续未请求下一步工具。');
-          this.addEvent(task, {
-            turnId,
-            type: 'system',
-            text: '正在要求 Agent 根据新事实继续决策。',
-          });
-          task.history.push({
-            role: 'tool',
-            content: {
-              name: 'runtime.protocol.reminder', status: 'requires_action',
-              message: '上一轮未完成且没有调用任何工具结束任务。请基于已知事实继续调用工具获取信息，或使用 sys.endTask 结束任务。',
-            },
-          });
-          continue;
+          task.status = 'completed';
+          if (result.speak) task.summary = result.speak;
+          this.publish(task);
+          break;
         }
 
         if (this.isInterrupted(task, signal)) {
@@ -203,6 +219,7 @@ export class AgentRuntime {
           await flushReadBatch();
         }
         task.pendingCallIds = [];
+
         this.publish(task);
       }
     } catch (error) {
@@ -295,14 +312,6 @@ export class AgentRuntime {
     }
 
     if (call.name === 'sys.endTask') {
-      const hasVisibleInteraction = task.events.some(event => event.toolName === 'ui.actAndObserve' && event.status === 'succeeded');
-      if (this.options.requireVisibleInteraction && !hasVisibleInteraction) {
-        const error = 'Full Theater V1：本任务尚未有成功的 ui.actAndObserve。请先调用 page.inspect 获取当前可用目标，再自主选择一项与目标相关的 ui.actAndObserve；不要套用固定页面路径。完成后再判断是否可回答。';
-        this.updateLastTool(task, call.id, 'failed', `失败：${call.name} · ${error}`, { error });
-        task.history.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'failed', error } });
-        task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'failed', error } });
-        return;
-      }
       if (typeof call.arguments.waitForUser === 'string' && call.arguments.waitForUser) {
         task.status = 'waiting_user';
         this.addEvent(task, { turnId, type: 'answer', text: call.arguments.waitForUser });

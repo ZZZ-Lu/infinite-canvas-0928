@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import { Sparkles, Image as ImageIcon, Trash2, Wand2, ArrowUp, Video } from 'lucide-react';
 import { motion } from 'motion/react';
+import type { CardData } from './GenerationCard';
 
 interface AgentContextMenuProps {
   key?: string;
@@ -8,6 +9,7 @@ interface AgentContextMenuProps {
   x: number;
   y: number;
   targetId: string | null;
+  targetCard?: CardData | null;
   agentPrompt: string;
   onPromptChange: (val: string) => void;
   onSubmit: () => void;
@@ -16,7 +18,7 @@ interface AgentContextMenuProps {
 }
 
 export function AgentContextMenu({
-  isOpen, x, y, targetId, agentPrompt, onPromptChange, onSubmit, onClose, onAction
+  isOpen, x, y, targetId, targetCard, agentPrompt, onPromptChange, onSubmit, onClose, onAction
 }: AgentContextMenuProps) {
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -64,6 +66,31 @@ export function AgentContextMenu({
         transition={{ duration: 0.15 }}
         className="bg-gray-100 dark:bg-neutral-800 border border-gray-200/80 dark:border-[#404040]/80 shadow-[0_12px_40px_rgb(0,0,0,0.12)] rounded-2xl corner-squircle w-[260px] overflow-hidden"
       >
+        {/* Linked Card Preview Header */}
+        {targetCard && (
+          <div className="px-2.5 py-1.5 bg-purple-50 dark:bg-purple-950/40 border-b border-purple-100 dark:border-purple-900/40 flex items-center gap-2">
+            {(targetCard.thumbnailUrl || targetCard.imageUrl) ? (
+              <img 
+                src={targetCard.thumbnailUrl || targetCard.imageUrl!} 
+                alt="" 
+                className="w-7 h-7 rounded object-cover border border-purple-300 dark:border-purple-700 shrink-0"
+              />
+            ) : (
+              <div className="w-7 h-7 rounded bg-purple-200 dark:bg-purple-800 flex items-center justify-center text-purple-700 dark:text-purple-300 text-[10px] shrink-0 font-medium">
+                {targetCard.isVideo ? '视频' : '卡片'}
+              </div>
+            )}
+            <div className="min-w-0 flex-1">
+              <div className="text-[12px] font-semibold text-purple-900 dark:text-purple-200 truncate leading-tight">
+                {targetCard.fileName || `卡片 #${targetCard.id.slice(-6)}`}
+              </div>
+              <div className="text-[10px] text-purple-600 dark:text-purple-400 truncate leading-tight mt-0.5">
+                {targetCard.prompt ? targetCard.prompt : `${targetCard.ratio || '9:16'} · ${targetCard.res || '2K'}`}
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Input Area */}
         <div className="p-2 flex items-center gap-1 border-b border-gray-100 dark:border-[#404040]">
           <input

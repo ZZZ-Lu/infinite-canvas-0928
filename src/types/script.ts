@@ -46,6 +46,7 @@ export interface SceneChunk {
 
 export type ExtractionModelType = 
   | 'auto' 
+  | 'deepseek-flash'
   | 'deepseek-v4-flash' 
   | 'deepseek-v4-pro' 
   | 'deepseek-v4.1-flash-expires-on-0910'
@@ -76,6 +77,7 @@ export const DEFAULT_NODE_MODELS: NodeModelConfig = {
 export interface NodePromptConfig {
   tocInferSystemPrompt: string;
   changeAssessSystemPrompt: string;
+  stateNodePrompt?: string;
 }
 
 export { CODE_PIPELINE_PROMPTS as DEFAULT_NODE_PROMPTS } from '../constants/prompts';

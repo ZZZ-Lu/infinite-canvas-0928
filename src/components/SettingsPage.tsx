@@ -44,7 +44,7 @@ interface SettingsPageProps {
   agentRuntimeTraces?: AgentRuntimeTrace[];
 }
 
-type NodeKey = 'toc_infer' | 'data_viewer' | 'change_assess';
+type NodeKey = 'toc_infer' | 'data_viewer' | 'change_assess' | 'state_node';
 type ResultTab = 'json' | 'logs';
 type CenterTab = 'source' | 'input' | 'prompt' | 'payload';
 type SettingsSection = 'debug' | 'runtime' | 'architecture' | 'tools' | 'prompt';
@@ -85,6 +85,14 @@ const NODE_DEFINITIONS: NodeDefinition[] = [
     description: '分析用户的删改操作并提取意图',
     promptKey: 'changeAssessSystemPrompt',
     modelKey: 'changeAssessModel',
+  },
+  {
+    key: 'state_node',
+    name: '认知状态提取节点',
+    shortName: 'State Node',
+    description: '解析主 Agent 思考/发言并提取更新认知状态 JSON',
+    promptKey: 'stateNodePrompt',
+    modelKey: 'agentModel',
   },
   {
     key: 'data_viewer',
@@ -176,6 +184,20 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
       char_delta: 5,
       before_snippet: '这是修改前的内容',
       after_snippet: '这是修改后的内容，增加了几句话'
+    }, null, 2),
+    state_node: JSON.stringify({
+      currentTask: {
+        title: "分析图像质感",
+        goal: "提炼出可用的质感描述词",
+        subGoal: "分析当前特写图片",
+        progress: "已看到目标图片",
+        plan: [{ id: "1", title: "分析视觉特征", status: "pending" }],
+        notes: "- 特写表现力极高"
+      },
+      userMessage: "分析这张图片的视觉质感",
+      lastTurnOutput: {
+        speak: "正在为你分析画面中的复古奢侈质感..."
+      }
     }, null, 2),
     data_viewer: '',
   }));
@@ -394,7 +416,23 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
       let body: any = {};
       const keyToUse = isDashscopeOrGlm(activeModel) ? qwenKey : deepseekKey;
       
-      if (selectedNode === 'change_assess') {
+      if (selectedNode === 'state_node') {
+        endpoint = '/api/agent/update-state-node';
+        let parsedInput: any = {};
+        try {
+          parsedInput = JSON.parse(input);
+        } catch {
+          parsedInput = {
+            userMessage: input,
+            lastTurnOutput: { speak: input }
+          };
+        }
+        body = {
+          ...parsedInput,
+          model: activeModel,
+          apiKey: keyToUse
+        };
+      } else if (selectedNode === 'change_assess') {
         endpoint = '/api/script/assess-change';
         let parsedInput: any = {};
         try {

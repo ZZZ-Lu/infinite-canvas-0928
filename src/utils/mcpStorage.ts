@@ -110,15 +110,69 @@ export async function getMcpKeys(): Promise<McpKeyItem[]> {
   }
 }
 
+const CACHE_KEY = 'mira_cached_active_mcp';
+const TOKEN_KEY = 'mira_active_mcp_token';
+let activeMcpKeyCache: McpKeyItem | null = null;
+
+if (typeof window !== 'undefined') {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (raw) activeMcpKeyCache = JSON.parse(raw);
+  } catch {}
+}
+
+export function getActiveMcpKeySync(): McpKeyItem | null {
+  return activeMcpKeyCache;
+}
+
+export function getActiveMcpTokenSync(): string {
+  if (activeMcpKeyCache?.token) return activeMcpKeyCache.token;
+  if (typeof window !== 'undefined') {
+    try {
+      const direct = localStorage.getItem(TOKEN_KEY);
+      if (direct) return direct;
+      const raw = localStorage.getItem(CACHE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed?.token) return parsed.token;
+      }
+    } catch {}
+  }
+  return '';
+}
+
+function updateActiveCache(item: McpKeyItem | null) {
+  activeMcpKeyCache = item;
+  if (typeof window !== 'undefined') {
+    try {
+      if (item) {
+        localStorage.setItem(CACHE_KEY, JSON.stringify(item));
+        if (item.token) {
+          localStorage.setItem(TOKEN_KEY, item.token);
+        }
+      } else {
+        localStorage.removeItem(CACHE_KEY);
+        localStorage.removeItem(TOKEN_KEY);
+      }
+    } catch {}
+  }
+}
+
+// Prime cache on module load
+if (typeof window !== 'undefined') {
+  setTimeout(() => {
+    getActiveMcpKey().catch(() => {});
+  }, 0);
+}
+
 /**
  * Get currently active MCP Key from IndexedDB
  */
 export async function getActiveMcpKey(): Promise<McpKeyItem | null> {
   const keys = await getMcpKeys();
-  const active = keys.find(k => k.isActive);
-  if (active) return active;
-  if (keys.length > 0) return keys[0];
-  return null;
+  const active = keys.find(k => k.isActive) || (keys.length > 0 ? keys[0] : null);
+  updateActiveCache(active);
+  return active;
 }
 
 /**
@@ -166,6 +220,9 @@ export async function saveMcpKey(
     const request = store.put(newItem);
 
     request.onsuccess = () => {
+      if (newItem.isActive) {
+        updateActiveCache(newItem);
+      }
       notifyListeners();
       resolve(newItem);
     };
@@ -195,6 +252,8 @@ export async function setActiveMcpKey(id: string): Promise<void> {
     });
 
     transaction.oncomplete = () => {
+      const active = allKeys.find(k => k.id === id) || null;
+      if (active) updateActiveCache({ ...active, isActive: true });
       notifyListeners();
       resolve();
     };
@@ -227,6 +286,7 @@ export async function deleteMcpKey(id: string): Promise<void> {
     }
 
     transaction.oncomplete = () => {
+      getActiveMcpKey().catch(() => {});
       notifyListeners();
       resolve();
     };

@@ -43,16 +43,20 @@ export const PAGE_COMPONENT_REGISTRY: PageComponentDefinition[] = [
   { id: 'assets.item.*.generate', label: '资产条目-生成图片', location: '资产清单面板', description: '定妆生成或环境生成。', actions: ['mouse.move', 'mouse.click', 'mouse.hover'] },
   { id: 'assets.empty.state', label: '资产空状态提示', location: '资产清单面板', description: '提示当前暂无资产条目，需点击一键提取按钮。', actions: ['mouse.hover'] },
   { id: 'script.view.universe', label: '画面风格标签', location: '剧本面板顶部', description: '切换到画面风格。', actions: ['mouse.move', 'mouse.click', 'mouse.hover'] },
+  { id: 'script.view.cards', label: '卡片管理标签', location: '剧本面板顶部', description: '切换到卡片管理。', actions: ['mouse.move', 'mouse.click', 'mouse.hover'] },
   { id: 'script.text', label: '剧本文本编辑区', location: '剧本面板主体', description: '连续长卷编辑区；光标所在位置即当前场次。', actions: ['mouse.move', 'mouse.click', 'mouse.hover', 'mouse.drag', 'mouse.scroll', 'mouse.type', 'mouse.keyPress'] },
   { id: 'script.scene.indicator', label: '当前场次指示器', location: '编辑区角落/边槽', description: '标识当前光标所在场次编号（如“第3场”），点击可呼出该场信息。', actions: ['mouse.move', 'mouse.hover', 'mouse.click'] },
   { id: 'script.version.status', label: '版本暂存状态', location: '二级工具栏', description: '显示改动检测最新状态（如“第3场已自动暂存”）。', actions: ['mouse.move', 'mouse.hover', 'mouse.click'] },
   { id: 'script.version.open', label: '版本管理按钮', location: '二级工具栏', description: '展开版本快照列表抽屉。', actions: ['mouse.move', 'mouse.hover', 'mouse.click'] },
   { id: 'script.version.item.*', label: '版本历史卡片', location: '版本抽屉', description: '查看特定快照的摘要，支持单场回滚或全剧查看。', actions: ['mouse.move', 'mouse.hover', 'mouse.click'] },
+  { id: 'canvas.viewport', label: '无限画布视口', location: '主画布工作区', description: '无限画布背景工作区，支持缩放(mouse.scroll)与平移拖拽(mouse.drag)。', actions: ['mouse.move', 'mouse.hover', 'mouse.drag', 'mouse.scroll', 'mouse.click', 'mouse.doubleClick'] },
+  { id: 'canvas.card.*', label: '画布卡片', location: '无限画布', description: '画布上的生图或视频卡片，支持移动选中、悬停、拖拽或查看详情。', actions: ['mouse.move', 'mouse.click', 'mouse.doubleClick', 'mouse.hover', 'mouse.drag'] },
 ];
 
 export const getPageComponentDefinition = (id: string) => {
   const exact = PAGE_COMPONENT_REGISTRY.find((component) => component.id === id);
   if (exact) return exact;
+  if (id.startsWith('canvas.card.')) return PAGE_COMPONENT_REGISTRY.find((c) => c.id === 'canvas.card.*');
   if (id.startsWith('script.toc.item.')) return PAGE_COMPONENT_REGISTRY.find((c) => c.id === 'script.toc.item.*');
   if (id.startsWith('script.version.item.')) return PAGE_COMPONENT_REGISTRY.find((c) => c.id === 'script.version.item.*');
   if (id.startsWith('assets.item.')) {

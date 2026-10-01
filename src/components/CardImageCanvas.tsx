@@ -138,7 +138,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
 
     // Plan A: Image fills full canvas bounds. Corner clipping is seamlessly handled by parent container's overflow-hidden squircle to ensure 100% precision fit.
     ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
+    ctx.imageSmoothingQuality = isGestureActive ? 'low' : 'high';
 
     // 1. Check loaded states for Micro, Full, and Original
     const microImg = thumbnailUrl
@@ -236,8 +236,17 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
         (window as any).__paintedCardIds = new Set<string>();
       }
       if (!(window as any).__paintedCardIds.has(cardId)) {
-        (window as any).__paintedCardIds.add(cardId);
-        window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId } }));
+        requestAnimationFrame(() => {
+          if (typeof window !== 'undefined') {
+            if (!(window as any).__paintedCardIds) {
+              (window as any).__paintedCardIds = new Set<string>();
+            }
+            if (!(window as any).__paintedCardIds.has(cardId)) {
+              (window as any).__paintedCardIds.add(cardId);
+              window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId } }));
+            }
+          }
+        });
       }
     }
 

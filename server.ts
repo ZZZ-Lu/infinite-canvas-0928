@@ -7,18 +7,29 @@ import { AGENT_TOOL_REGISTRY } from './src/agent/toolRegistry';
 import { mcpRouter } from './src/server/mcpRouter';
 dotenv.config();
 const defaultPromptFilePath = path.join(process.cwd(), "src/agent/systemPrompt.txt");
+const defaultStatePromptFilePath = path.join(process.cwd(), "src/agent/stateNodePrompt.txt");
 const customPromptDir = path.join(process.cwd(), ".data");
 const customPromptFilePath = path.join(customPromptDir, "systemPrompt.txt");
+const customStatePromptFilePath = path.join(customPromptDir, "stateNodePrompt.txt");
 
-function getSystemPrompt() {
+function getPrompt(type: 'main' | 'state' = 'main') {
   try {
-    if (fs.existsSync(customPromptFilePath)) {
-      return fs.readFileSync(customPromptFilePath, "utf-8");
+    const customPath = type === 'state' ? customStatePromptFilePath : customPromptFilePath;
+    const defaultPath = type === 'state' ? defaultStatePromptFilePath : defaultPromptFilePath;
+    if (fs.existsSync(customPath)) {
+      return fs.readFileSync(customPath, "utf-8");
     }
-    return fs.readFileSync(defaultPromptFilePath, "utf-8");
+    if (fs.existsSync(defaultPath)) {
+      return fs.readFileSync(defaultPath, "utf-8");
+    }
+    return "";
   } catch (e) {
     return "";
   }
+}
+
+function getSystemPrompt() {
+  return getPrompt('main');
 }
 
 const functionNameForTool = (toolId: string) => toolId.replaceAll('.', '_');
@@ -38,6 +49,81 @@ const parametersForTool = (toolId: string) => {
   return { type: 'object', properties: schema.properties, ...(schema.required ? { required: schema.required } : {}) };
 };
 
+function tryFastParseToolCalls(actionDesc: string): any[] | null {
+  try {
+    const rawMatches = [...actionDesc.matchAll(/\{\{([\s\S]*?)\}\}/g)];
+    const items = rawMatches.length > 0 ? rawMatches.map(m => m[1].trim()) : actionDesc.split('\n').map(l => l.trim()).filter(Boolean);
+    const parsedCalls: any[] = [];
+    
+    for (const item of items) {
+      const trimmed = item.replace(/^调用\s*|^call\s*/i, '').trim();
+      const commaIdx = trimmed.search(/[,，:\s]/);
+      let toolName = commaIdx > 0 ? trimmed.slice(0, commaIdx).trim() : trimmed;
+      let rest = commaIdx > 0 ? trimmed.slice(commaIdx + 1).trim() : '';
+      
+      toolName = toolName.replaceAll('_', '.');
+
+      const jsonMatch = rest.match(/(\{[\s\S]*\})/);
+      if (jsonMatch) {
+        try {
+          const args = JSON.parse(jsonMatch[1]);
+          if (args && typeof args === 'object') {
+            parsedCalls.push({ name: toolName, arguments: args });
+            continue;
+          }
+        } catch {}
+      }
+      
+      if (toolName === 'page.inspect') {
+        if (!rest || rest.includes('overview') || rest.includes('概览')) {
+          parsedCalls.push({ name: 'page.inspect', arguments: { scope: 'overview' } });
+        } else {
+          parsedCalls.push({ name: 'page.inspect', arguments: { scope: rest.replace(/^["'“]|["'”]$/g, '').trim() } });
+        }
+      } else if (toolName === 'guide.lookup') {
+        parsedCalls.push({ name: 'guide.lookup', arguments: { query: rest.replace(/^["'“]|["'”]$/g, '').trim() } });
+      } else if (toolName === 'sys.endTask') {
+        parsedCalls.push({ name: 'sys.endTask', arguments: { success: true, finalResponse: rest.replace(/^["'“]|["'”]$/g, '').trim() || '任务完成。' } });
+      } else if (toolName === 'user.ask') {
+        parsedCalls.push({ name: 'user.ask', arguments: { question: rest.replace(/^["'“]|["'”]$/g, '').trim() } });
+      } else if (toolName === 'sys.updateState') {
+        const goalMatch = rest.match(/(?:更新总目标为|总目标|目标|goal)[:：]?\s*([^,，;\n]+)/i);
+        const subGoalMatch = rest.match(/(?:更新当前小目标为|当前小目标|小目标|subGoal|子目标)[:：]?\s*([^,，;\n]+)/i);
+        const notesMatch = rest.match(/(?:重点笔记|记录.*?到笔记|笔记|notes)[:：]?\s*([^,，;\n]+)/i);
+        const progressMatch = rest.match(/(?:当前进度|进度|progress)[:：]?\s*([^,，;\n]+)/i);
+        const stateArgs: Record<string, any> = {};
+        if (goalMatch) stateArgs.goal = goalMatch[1].trim();
+        if (subGoalMatch) stateArgs.subGoal = subGoalMatch[1].trim();
+        if (notesMatch) stateArgs.notes = notesMatch[1].trim();
+        if (progressMatch) stateArgs.progress = progressMatch[1].trim();
+
+        if (Object.keys(stateArgs).length === 0 && rest.trim()) {
+          if (rest.includes('目标')) {
+            stateArgs.goal = rest.trim();
+          } else if (rest.includes('笔记')) {
+            stateArgs.notes = rest.trim();
+          } else {
+            stateArgs.progress = rest.trim();
+          }
+        }
+        parsedCalls.push({ name: 'sys.updateState', arguments: stateArgs });
+      } else if (toolName === 'ui.actAndObserve') {
+        const clickMatch = rest.match(/(?:点击|click)\s*([a-zA-Z0-9_.-]+)/i);
+        if (clickMatch) {
+          parsedCalls.push({ name: 'ui.actAndObserve', arguments: { action: 'mouse.click', targetId: clickMatch[1].trim() } });
+        } else {
+          return null;
+        }
+      } else {
+        return null;
+      }
+    }
+    return parsedCalls.length > 0 ? parsedCalls : null;
+  } catch {
+    return null;
+  }
+}
+
 interface ModelConfig {
   endpoint: string;
   actualModel: string;
@@ -49,18 +135,31 @@ interface ModelConfig {
 
 function getModelConfig(modelType: string, userKey?: string): ModelConfig {
   let endpoint = 'https://api.deepseek.com/chat/completions';
-  let actualModel = 'deepseek-chat';
+  let actualModel = 'deepseek-flash';
   let apiKey = userKey || process.env.DEEPSEEK_API_KEY;
-  let stream = false;
+  let stream = true;
   let enableThinking = false;
   let reasoningEffort: 'low' | 'high' | 'max' = 'max';
 
   if (modelType === 'deepseek-v4-pro') {
     actualModel = 'deepseek-reasoner';
+    enableThinking = true;
+    stream = true;
+  } else if (
+    modelType === 'deepseek-v4-flash' ||
+    modelType === 'deepseek-v4.1-flash-expires-on-0910' ||
+    modelType === 'deepseek-flash' ||
+    modelType === 'deepseek' ||
+    modelType === 'auto'
+  ) {
+    actualModel = 'deepseek-flash';
+    enableThinking = false;
+    stream = true;
   } else if (modelType === 'qwen3.8-flash') {
     endpoint = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
     actualModel = 'qwen3.8-flash';
     apiKey = userKey || process.env.DASHSCOPE_API_KEY || process.env.DEEPSEEK_API_KEY;
+    stream = true;
   } else if (
     modelType.toLowerCase().includes('5.3-flash') ||
     modelType.toLowerCase().includes('glm-5.3')
@@ -240,18 +339,26 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
 
     try {
       if (modelType !== 'heuristic') {
-        const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(modelType, apiKey || deepseekKey);
+        const { endpoint, actualModel, apiKey: keyToUse, enableThinking } = getModelConfig(modelType, apiKey || deepseekKey);
+        const requestPayload: Record<string, unknown> = {
+          model: actualModel,
+          response_format: { type: 'json_object' },
+          messages: [
+            { role: 'system', content: systemPrompt || '分析剧本标题格式并返回 pattern、flags、patternDescription 的 JSON。' },
+            { role: 'user', content: sampleText.slice(0, 4000) }
+          ]
+        };
+        if (enableThinking) {
+          requestPayload.enable_thinking = true;
+          requestPayload.extra_body = { thinking: { type: 'enabled' } };
+        } else {
+          requestPayload.thinking = { type: 'disabled' };
+          requestPayload.extra_body = { thinking: { type: 'disabled' } };
+        }
         const response = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${keyToUse}` },
-          body: JSON.stringify({
-            model: actualModel,
-            response_format: { type: 'json_object' },
-            messages: [
-              { role: 'system', content: systemPrompt || '分析剧本标题格式并返回 pattern、flags、patternDescription 的 JSON。' },
-              { role: 'user', content: sampleText.slice(0, 4000) }
-            ]
-          })
+          body: JSON.stringify(requestPayload)
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const body = await response.json();
@@ -283,9 +390,9 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
   app.post("/api/script/assess-change", async (req, res) => {
     try {
       const { action, affected_scene_orders, char_delta, before_snippet, after_snippet, apiKey, modelType = 'auto' } = req.body;
-      const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(modelType, apiKey);
+      const { endpoint, actualModel, apiKey: keyToUse, enableThinking } = getModelConfig(modelType, apiKey);
 
-      const requestPayload = {
+      const requestPayload: Record<string, unknown> = {
         model: actualModel,
         response_format: { type: 'json_object' },
         messages: [
@@ -305,6 +412,14 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
           }
         ]
       };
+
+      if (enableThinking) {
+        requestPayload.enable_thinking = true;
+        requestPayload.extra_body = { thinking: { type: 'enabled' } };
+      } else {
+        requestPayload.thinking = { type: 'disabled' };
+        requestPayload.extra_body = { thinking: { type: 'disabled' } };
+      }
 
       const fetchOptions: RequestInit = {
         method: "POST",
@@ -366,6 +481,12 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         requestPayload.extra_body = {
           enable_thinking: true,
           reasoning_effort: reasoningEffort,
+          thinking: { type: 'enabled' },
+        };
+      } else {
+        requestPayload.thinking = { type: 'disabled' };
+        requestPayload.extra_body = {
+          thinking: { type: 'disabled' },
         };
       }
 
@@ -394,20 +515,28 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
-    res.json({ prompt: getSystemPrompt() });
+    const type = req.query.type === 'state' ? 'state' : 'main';
+    res.json({ prompt: getPrompt(type), type });
   });
 
   app.post('/api/agent/prompt', express.json(), (req, res) => {
     try {
-      const { prompt } = req.body;
+      const { prompt, type = 'main' } = req.body;
       if (typeof prompt !== 'string') {
         return res.status(400).json({ error: 'Invalid prompt content' });
+      }
+      const targetType = type === 'state' ? 'state' : 'main';
+      const defaultPath = targetType === 'state' ? defaultStatePromptFilePath : defaultPromptFilePath;
+      const customPath = targetType === 'state' ? customStatePromptFilePath : customPromptFilePath;
+
+      if (fs.existsSync(path.dirname(defaultPath))) {
+        fs.writeFileSync(defaultPath, prompt, 'utf-8');
       }
       if (!fs.existsSync(customPromptDir)) {
         fs.mkdirSync(customPromptDir, { recursive: true });
       }
-      fs.writeFileSync(customPromptFilePath, prompt, 'utf-8');
-      res.json({ success: true });
+      fs.writeFileSync(customPath, prompt, 'utf-8');
+      res.json({ success: true, type: targetType });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -415,7 +544,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
 
   app.post('/api/agent/turn', async (req, res) => {
     try {
-      const { userMessage, history = [], events = [], observations = [], project, task, apiKey, modelType = 'deepseek-v4-flash', enabledTools, requireTool = false } = req.body;
+      const { userMessage, history = [], events = [], observations = [], project, task, apiKey, modelType = 'deepseek-v4-flash', enabledTools, requireTool = false, images = [], cardContext } = req.body;
       const { endpoint, actualModel, apiKey: keyToUse, stream, enableThinking, reasoningEffort } = getModelConfig(modelType, apiKey);
       if (!userMessage || typeof userMessage !== 'string') return res.status(400).json({ error: '缺少用户消息。' });
 
@@ -437,6 +566,19 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
           let text = `【观察结果】 (区域: ${page.scope || 'overview'})\n`;
           if (page.notices && page.notices.length) {
             text += `页面提示：${page.notices.map((n: any) => n.label).join(' | ')}\n`;
+          }
+          if (page.canvas) {
+            text += `画布状态：缩放比例 ${(page.canvas.scale * 100).toFixed(0)}% (LOD模式: ${page.canvas.lodMode}) | 画布卡片总数: ${page.canvas.totalCards} | 视口内可见卡片数: ${page.canvas.visibleCount}\n`;
+            if (page.canvas.focusedCard) {
+              const fc = page.canvas.focusedCard;
+              text += `【聚焦卡片详情】ID: ${fc.id} | 标题: ${fc.title} | 状态: ${fc.state} | 比例: ${fc.ratio} | 分辨率: ${fc.resolution}\n- 提示词: "${fc.prompt || '无'}"\n`;
+              if (fc.lastGeneratedPrompt && fc.lastGeneratedPrompt !== fc.prompt) {
+                text += `- 历史生成提示词: "${fc.lastGeneratedPrompt}"\n`;
+              }
+              if (fc.model) text += `- 关联模型: ${fc.model}\n`;
+              if (fc.referenceImagesCount) text += `- 参考图: ${fc.referenceImagesCount} 张\n`;
+              if (fc.hasImage) text += `- 图像画面: 已生成可用\n`;
+            }
           }
           if (page.script) {
             if (page.script.directory) {
@@ -553,27 +695,35 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
 
       const formattedObs = formatObservations(observations);
       
-      let negotiationInjection = '';
-      let displayUserMessage = userMessage;
+      const cleanUserGoalText = (text: string): string => {
+        if (!text) return '';
+        let cleaned = text.replace(/# 目标卡片与拓扑上下文信息[\s\S]*?用户针对该卡片的指令[:：]\s*/gi, '');
+        cleaned = cleaned.replace(/【当前右键聚焦的目标卡片信息】[\s\S]*?用户针对该卡片的指令[:：]\s*/gi, '');
+        return cleaned.trim() || text.trim();
+      };
 
-      if (task.lastUserInputAt > task.lastGoalUpdatedAt) {
-        const logs = task.negotiationLog?.map((log: any) => `[${log.role === 'user' ? '用户' : '你'}] ${log.content}`).join('\n') || '';
-        negotiationInjection = `
-【系统强制告警】用户刚刚补充了新的指令或回复！
-以下是你们完整的对话记录：
-${logs}
+      const displayUserMessage = cleanUserGoalText(userMessage) || '（无新指令）';
 
-请注意：你目前的首要任务是提炼终极目标！
-请立即调用 \`sys.updateState\` 工具，根据上述对话原文，重写全局终极目标 (goal)。在目标尚未明确更新前，绝对禁止调用任何 UI 交互操作 (ui.actAndObserve)。
+      const effectiveCardContext = cardContext || task?.cardContext;
+      let cardContextInjection = '';
+      if (effectiveCardContext) {
+        if (effectiveCardContext.markdownSummary) {
+          cardContextInjection = `\n${effectiveCardContext.markdownSummary}\n\n`;
+        } else {
+          cardContextInjection = `
+# 目标卡片上下文信息 (Selected Card Context)
+- 卡片ID：${effectiveCardContext.cardId || effectiveCardContext.id || '未知'}
+- 标题/分集：${effectiveCardContext.title || effectiveCardContext.fileName || '未命名卡片'}
+- 卡片提示词：${effectiveCardContext.prompt || '无提示词'}
+- 比例/分辨率：${effectiveCardContext.aspectRatio || effectiveCardContext.ratio || '默认'} (${effectiveCardContext.resolution || effectiveCardContext.res || '2K'})
+${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态视觉上下文' : ''}
 `;
-      } else {
-        // Goal is up to date. Do not show userMessage to prevent context drift!
-        displayUserMessage = '（已锁定终极目标，专注执行中，历史指令已隐藏）';
+        }
       }
 
-      const finalPrompt = (negotiationInjection + getSystemPrompt())
+      const finalPrompt = (cardContextInjection + getSystemPrompt())
         .replace('{{taskTitle}}', task.title || '尚未命名')
-        .replace('{{taskGoal}}', task.goal || '尚未设定')
+        .replace('{{taskGoal}}', cleanUserGoalText(task.goal) || '尚未设定')
         .replace('{{taskSubGoal}}', task.subGoal || '暂未设定')
         .replace('{{taskProgress}}', task.progress || '刚刚开始')
         .replace('{{taskPlan}}', formatPlan(task.plan))
@@ -584,8 +734,26 @@ ${logs}
         .replace('{{pageObservations}}', formattedObs.pageObservations)
         .replace('{{toolResults}}', formattedObs.toolResults);
 
+      const allImages: string[] = [
+        ...(Array.isArray(images) ? images : []),
+        ...(Array.isArray(task?.images) ? task.images : []),
+        ...(Array.isArray(effectiveCardContext?.images) ? effectiveCardContext.images : []),
+        ...(effectiveCardContext?.imageUrl ? [effectiveCardContext.imageUrl] : []),
+      ].filter((img, idx, arr) => typeof img === 'string' && img.length > 0 && arr.indexOf(img) === idx);
+
+      let userContent: any = finalPrompt;
+      if (allImages.length > 0) {
+        userContent = [
+          { type: 'text', text: finalPrompt },
+          ...allImages.map((img: string) => ({
+            type: 'image_url',
+            image_url: { url: img }
+          }))
+        ];
+      }
+
       const messages = [
-        { role: 'user', content: finalPrompt },
+        { role: 'user', content: userContent },
       ];
       const requestPayload: Record<string, unknown> = {
         model: actualModel,
@@ -601,14 +769,31 @@ ${logs}
         requestPayload.extra_body = {
           enable_thinking: true,
           reasoning_effort: reasoningEffort,
+          thinking: { type: 'enabled' },
+        };
+      } else {
+        requestPayload.thinking = { type: 'disabled' };
+        requestPayload.extra_body = {
+          thinking: { type: 'disabled' },
         };
       }
 
-      const response = await fetch(endpoint, {
+      let response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${keyToUse}` },
         body: JSON.stringify(requestPayload),
       });
+
+      // If multimodal payload was rejected (e.g. text-only model or provider error), transparently retry with text-only payload
+      if (!response.ok && Array.isArray(userContent)) {
+        console.warn(`Vision payload rejected (${response.status}), retrying with text-only payload`);
+        requestPayload.messages = [{ role: 'user', content: finalPrompt }];
+        response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${keyToUse}` },
+          body: JSON.stringify(requestPayload),
+        });
+      }
       if (!response.ok) {
         const detail = await response.json().catch(() => ({}));
         throw new Error(detail?.error?.message || `HTTP ${response.status}`);
@@ -617,6 +802,9 @@ ${logs}
       
       const narration: string[] = [];
       let speakText = '';
+      if (message.reasoning_content && message.reasoning_content.trim()) {
+        narration.push(message.reasoning_content.trim());
+      }
       if (typeof message.content === 'string' && message.content.trim()) {
         const fullContent = message.content;
         const speakMatch = fullContent.match(/对用户说的话：([\s\S]*?)(?=\{\{|$)/);
@@ -657,33 +845,40 @@ ${logs}
         }
 
         if (actionDesc) {
-          try {
-            const parseResponse = await fetch(endpoint, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${keyToUse}` },
-              body: JSON.stringify({
-                model: actualModel === 'deepseek-reasoner' ? 'deepseek-chat' : actualModel,
-                response_format: { type: 'json_object' },
-                messages: [
-                  { 
-                    role: 'system', 
-                    content: `你是一个极其精准的工具参数适配器。你的任务是将 Agent 的自然语言动作意图，严格翻译为对应工具的 JSON 调用参数。\n\n【核心转换规则】\n1. 目标识别：根据自然语言描述，推断出最合理的 targetId。\n2. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 数值（像素）。"向下滚一点/一屏" -> 正数 (如 480)；"向上滚一点/一屏" -> 负数 (如 -480)；"滚到最底部" -> 极大的正数 (如 99999)；"滚到最顶部" -> 极小的负数 (如 -99999)。\n3. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, notes, notesMode 等）的文本内容。如果包含重写/替换笔记意图，提取 notesMode 为 "overwrite"；若为追加新增笔记，提取 notesMode 为 "append"。注意：绝对不要在没有明确指令的情况下脑补并写入 goal 和 subGoal。除非指令中明确说了"更新总目标"，否则不要输出 goal 字段。同理，除非明确说明，否则不要随意填写其他非必要的更新字段。\n\n可用工具的 JSON Schema：\n${adapterToolPrompt}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }` 
-                  },
-                  { role: 'user', content: actionDesc }
-                ]
-              })
-            });
-            if (parseResponse.ok) {
-              const parseBody = await parseResponse.json();
-              const parsed = JSON.parse(parseBody.choices?.[0]?.message?.content || '{}');
-              if (Array.isArray(parsed.tool_calls)) {
-                parsedToolCalls = parsed.tool_calls;
+          const fastCalls = tryFastParseToolCalls(actionDesc);
+          if (fastCalls && fastCalls.length > 0) {
+            parsedToolCalls = fastCalls;
+          } else {
+            try {
+              const parseResponse = await fetch(endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${keyToUse}` },
+                body: JSON.stringify({
+                  model: actualModel,
+                  response_format: { type: 'json_object' },
+                  thinking: { type: 'disabled' },
+                  extra_body: { thinking: { type: 'disabled' } },
+                  messages: [
+                    { 
+                      role: 'system', 
+                      content: `你是一个极其精准的工具参数适配器。你的任务是将 Agent 的自然语言动作意图，严格翻译为对应工具的 JSON 调用参数。\n\n【核心转换规则】\n1. 目标识别：根据自然语言描述，推断出最合理的 targetId。\n2. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 数值（像素）。"向下滚一点/一屏" -> 正数 (如 480)；"向上滚一点/一屏" -> 负数 (如 -480)；"滚到最底部" -> 极大的正数 (如 99999)；"滚到最顶部" -> 极小的负数 (如 -99999)。\n3. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, notes, notesMode 等）的文本内容。如果包含重写/替换笔记意图，提取 notesMode 为 "overwrite"；若为追加新增笔记，提取 notesMode 为 "append"。注意：绝对不要在没有明确指令的情况下脑补并写入 goal 和 subGoal。除非指令中明确说了"更新总目标"，否则不要输出 goal 字段。同理，除非明确说明，否则不要随意填写其他非必要的更新字段。\n\n可用工具的 JSON Schema：\n${adapterToolPrompt}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }` 
+                    },
+                    { role: 'user', content: actionDesc }
+                  ]
+                })
+              });
+              if (parseResponse.ok) {
+                const parseBody = await parseResponse.json();
+                const parsed = JSON.parse(parseBody.choices?.[0]?.message?.content || '{}');
+                if (Array.isArray(parsed.tool_calls)) {
+                  parsedToolCalls = parsed.tool_calls;
+                }
+              } else {
+                console.warn('Failed to parse natural language tool call. Status:', parseResponse.status);
               }
-            } else {
-              console.warn('Failed to parse natural language tool call. Status:', parseResponse.status);
+            } catch (e) {
+              console.warn('Failed to parse natural language tool call:', e);
             }
-          } catch (e) {
-            console.warn('Failed to parse natural language tool call:', e);
           }
         }
       }
@@ -702,7 +897,10 @@ ${logs}
         } catch { return []; }
       });
 
-      if (requireTool && toolCalls.length === 0) {
+      const hasEndTask = toolCalls.some(c => c.name === 'sys.endTask');
+      const isComplete = hasEndTask || parsed.complete === true;
+
+      if (requireTool && toolCalls.length === 0 && !isComplete) {
         console.warn('Agent required a tool call but returned none:', JSON.stringify({ content: message.content }));
       }
       res.json({
@@ -718,7 +916,7 @@ ${logs}
         toolCalls,
         response: typeof parsed.response === 'string' ? parsed.response : undefined,
         waitForUser: typeof parsed.waitForUser === 'string' ? parsed.waitForUser : undefined,
-        complete: toolCalls.length === 0 && parsed.complete === true,
+        complete: isComplete,
         // This is a local development endpoint. The browser debugging panel
         // receives the assembled model request and raw provider response, but
         // never API credentials.
@@ -736,6 +934,113 @@ ${logs}
     } catch (error: any) {
       console.error('Agent turn error:', error);
       res.status(500).json({ error: error.message || 'Agent turn failed' });
+    }
+  });
+
+  // Dedicated Lightweight Cognitive State Update Node
+  app.post('/api/agent/update-state-node', async (req, res) => {
+    try {
+      const { currentTask, userMessage, lastTurnOutput, apiKey, model } = req.body || {};
+      const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(model || 'deepseek-v4-flash', apiKey);
+
+      let statePromptTemplate = getPrompt('state');
+      if (!statePromptTemplate || !statePromptTemplate.trim()) {
+        statePromptTemplate = `你是一个超高效、高精度的 Agent 认知状态提取与更新节点。
+你的唯一职责是：根据用户原始指令、Agent 最新的思考与发言、工具执行动作，提炼并无缝更新 Agent 的认知状态 JSON。
+
+【当前认知状态】
+- 任务标题: {{taskTitle}}
+- 终极目标: {{taskGoal}}
+- 当前小目标: {{taskSubGoal}}
+- 当前进度: {{taskProgress}}
+- 当前计划: {{taskPlan}}
+- 重点笔记: {{taskNotes}}
+
+【最新对话与 Agent 主模型发言】
+- 用户指令/回复: {{userMessage}}
+- Agent 主模型发言/思考: {{lastTurnOutput}}
+
+【输出规约】
+请输出严谨且合法的 JSON 对象，格式如下：
+{
+  "taskTitle": "8字以内的任务简短标题",
+  "goal": "归纳出的最新终极目标（根据用户指令提炼）",
+  "subGoal": "当前步骤对应的具体小目标，清晰明确",
+  "progress": "当前最新进度描述（如：已完成xxx，准备处理xxx）",
+  "notes": "提取关键笔记文本",
+  "notesMode": "append 或 overwrite",
+  "plan": [{"id": "1", "title": "步骤标题", "status": "pending | completed"}]
+}
+`;
+      }
+
+      const prompt = statePromptTemplate
+        .replace('{{taskTitle}}', currentTask?.title || '尚未命名')
+        .replace('{{taskGoal}}', currentTask?.goal || '尚未设定')
+        .replace('{{taskSubGoal}}', currentTask?.subGoal || '暂未设定')
+        .replace('{{taskProgress}}', currentTask?.progress || '刚刚开始')
+        .replace('{{taskPlan}}', JSON.stringify(currentTask?.plan || []))
+        .replace('{{taskNotes}}', currentTask?.notes || '暂无笔记')
+        .replace('{{userMessage}}', userMessage || '（无新指令）')
+        .replace('{{lastTurnOutput}}', typeof lastTurnOutput === 'string' ? lastTurnOutput : JSON.stringify(lastTurnOutput || {}));
+
+      const requestPayload = {
+        model: actualModel,
+        response_format: { type: 'json_object' },
+        thinking: { type: 'disabled' },
+        extra_body: { thinking: { type: 'disabled' } },
+        messages: [
+          { role: 'system', content: '你是一个严格输出 JSON 的认知状态更新节点。' },
+          { role: 'user', content: prompt }
+        ]
+      };
+
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${keyToUse}` },
+        body: JSON.stringify(requestPayload),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        const speakText = typeof lastTurnOutput === 'object' && lastTurnOutput?.speak ? String(lastTurnOutput.speak) : '';
+        const fallbackTitle = (userMessage || currentTask?.title || '任务运行').slice(0, 10);
+        const fallbackSubGoal = speakText ? speakText.slice(0, 30) : (currentTask?.subGoal || userMessage || '正在推进任务');
+
+        return res.status(200).json({
+          taskTitle: fallbackTitle,
+          goal: userMessage || currentTask?.goal,
+          subGoal: fallbackSubGoal,
+          progress: speakText ? '已完成本轮回答与分析' : (currentTask?.progress || '步骤运行中'),
+          notes: speakText ? speakText.slice(0, 100) : undefined,
+          notesMode: 'append',
+          debugPrompt: prompt,
+          fallbackNotice: `接口响应异常 (${response.status})，已启用启发式保底提炼机制`,
+          apiError: errText,
+        });
+      }
+
+      const data = await parseChatCompletionResponse(response, false);
+      let parsed: any = {};
+      try {
+        parsed = JSON.parse(data.content || '{}');
+      } catch {
+        console.warn('Failed to parse json from state node output:', data.content);
+      }
+
+      res.json({
+        taskTitle: typeof parsed.taskTitle === 'string' && parsed.taskTitle.trim() ? parsed.taskTitle.trim() : undefined,
+        goal: typeof parsed.goal === 'string' && parsed.goal.trim() ? parsed.goal.trim() : undefined,
+        subGoal: typeof parsed.subGoal === 'string' && parsed.subGoal.trim() ? parsed.subGoal.trim() : undefined,
+        progress: typeof parsed.progress === 'string' && parsed.progress.trim() ? parsed.progress.trim() : undefined,
+        plan: Array.isArray(parsed.plan) ? parsed.plan : undefined,
+        notes: typeof parsed.notes === 'string' ? parsed.notes : undefined,
+        notesMode: parsed.notesMode === 'overwrite' ? 'overwrite' : 'append',
+        debugPrompt: prompt,
+      });
+    } catch (err: any) {
+      console.error('Update state node error:', err);
+      res.status(500).json({ error: err.message || 'State node update failed' });
     }
   });
 

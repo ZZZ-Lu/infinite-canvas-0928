@@ -1,4 +1,4 @@
-export type ScriptView = 'script' | 'directory' | 'assets' | 'universe';
+export type ScriptView = 'script' | 'directory' | 'assets' | 'universe' | 'cards';
 
 export interface ScriptEpisode {
   id: string;

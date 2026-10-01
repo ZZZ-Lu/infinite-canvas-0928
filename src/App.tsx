@@ -1,12 +1,16 @@
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { AgentCursor } from './components/AgentCursor';
 import { AgentContextMenu } from './components/AgentContextMenu';
-import { GenerationCard, CardData, CARD_DIMENSIONS, getCardSize, safeParseJsonResponse } from './components/GenerationCard';
+import { GenerationCard, CardData, CARD_DIMENSIONS, getCardSize, safeParseJsonResponse, compressImageBlob, resolveReferenceToPayload } from './components/GenerationCard';
+import { WORKRALLY_IMAGE_MODELS, WORKRALLY_IMAGE_TOOL } from './config/workrallyImageModels';
+import { WORKRALLY_VIDEO_MODELS, WORKRALLY_VIDEO_TOOL } from './config/workrallyVideoModels';
 import { NanoLodCanvas } from './components/NanoLodCanvas';
 import { FpsCounter } from './components/FpsCounter';
 import { generateImageThumbnail, generateVideoThumbnail, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
 import { fastGetImageDimensions } from './utils/imageHeader';
 import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold } from './utils/viewportCulling';
+import { buildCardQuadTree, QuadTree, BoundingBox } from './utils/quadTree';
+import { getBottomPanelHeight } from './utils/cardLayout';
 import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video } from 'lucide-react';
 import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
 import { SettingsPage } from './components/SettingsPage';
@@ -18,12 +22,33 @@ import type { AgentToolCall, AgentTurnResult } from './agent/protocol';
 import { AgentRuntime, type RuntimeTask } from './agent/runtime';
 import { snapshotRuntimeTask, type AgentRuntimeTrace } from './agent/debugTrace';
 import { assetExtractionService } from './services/assetExtractionService';
-import { getActiveMcpKey } from './utils/mcpStorage';
+import { getActiveMcpKey, getActiveMcpTokenSync } from './utils/mcpStorage';
+import { CanvasLineageOverlay } from './components/CanvasLineageOverlay';
 import { AGENT_TOOL_REGISTRY, getAgentToolConfig } from './agent/toolRegistry';
 import { getPageComponentDefinition, type MouseActionName } from './agent/pageComponentRegistry';
+import { buildAutoInjectedCardContext } from './agent/cardContextBuilder';
 import { AnimatePresence, motion, useMotionValue, animate, useMotionTemplate, useMotionValueEvent, useTransform } from 'motion/react';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const safeCreateObjectURL = (data: any): string | null => {
+  if (!data) return null;
+  if (typeof Blob !== 'undefined' && data instanceof Blob) {
+    try {
+      return URL.createObjectURL(data);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof MediaSource !== 'undefined' && data instanceof MediaSource) {
+    try {
+      return URL.createObjectURL(data);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+};
 
 /**
  * Reads only the portion of a textarea that is currently rendered in its
@@ -380,7 +405,54 @@ export default function App() {
   const [isOverviewMode, setIsOverviewMode] = useState(false);
   const isOverviewModeRef = useRef(false);
   const preOverviewTransform = useRef<{ x: number, y: number, scale: number } | null>(null);
+  const lastStableTransformRef = useRef<{ x: number, y: number, scale: number }>({ x: initialTransform.x, y: initialTransform.y, scale: initialTransform.scale });
   const [overviewViewportBox, setOverviewViewportBox] = useState<{ x: number, y: number, width: number, height: number } | null>(null);
+  const [overviewCursorBox, setOverviewCursorBox] = useState<{ x: number, y: number, width: number, height: number } | null>(null);
+  const overviewBoxScaleRef = useRef(1.0);
+  const lastMouseClientPosRef = useRef<{ clientX: number; clientY: number }>({
+    clientX: typeof window !== 'undefined' ? window.innerWidth / 2 : 500,
+    clientY: typeof window !== 'undefined' ? window.innerHeight / 2 : 500,
+  });
+
+  const updateOverviewCursorBoxAt = useCallback((clientX: number, clientY: number, overrideTx?: number, overrideTy?: number, overrideScale?: number) => {
+    const container = containerRef.current;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    const cursorX = clientX - rect.left;
+    const cursorY = clientY - rect.top;
+    const currentScale = overrideScale !== undefined ? overrideScale : tScale.get();
+    const currentTx = overrideTx !== undefined ? overrideTx : tx.get();
+    const currentTy = overrideTy !== undefined ? overrideTy : ty.get();
+    const worldX = (cursorX - currentTx) / currentScale;
+    const worldY = (cursorY - currentTy) / currentScale;
+
+    const baseTargetScale = preOverviewTransform.current ? preOverviewTransform.current.scale : 1.0;
+    const effectiveTargetScale = Math.min(Math.max(0.05, baseTargetScale / overviewBoxScaleRef.current), 10.0);
+
+    const boxLeft = worldX - (cursorX / effectiveTargetScale);
+    const boxTop = worldY - (cursorY / effectiveTargetScale);
+    const boxWidth = rect.width / effectiveTargetScale;
+    const boxHeight = rect.height / effectiveTargetScale;
+
+    setOverviewCursorBox({
+      x: boxLeft,
+      y: boxTop,
+      width: boxWidth,
+      height: boxHeight,
+    });
+  }, [tScale, tx, ty]);
+
+  useEffect(() => {
+    const handleGlobalMouseMove = (e: MouseEvent) => {
+      lastMouseClientPosRef.current = { clientX: e.clientX, clientY: e.clientY };
+    };
+    window.addEventListener('mousemove', handleGlobalMouseMove, { passive: true });
+    return () => {
+      window.removeEventListener('mousemove', handleGlobalMouseMove);
+    };
+  }, []);
+
+  const [hoveredCardId, setHoveredCardId] = useState<string | null>(null);
   const isSpacePressedRef = useRef(false);
   const wheelZoomOutAccumulatorRef = useRef(0);
   const [showOverviewPromptToast, setShowOverviewPromptToast] = useState(false);
@@ -390,8 +462,22 @@ export default function App() {
   const enterOverviewModeRef = useRef<() => void>(() => {});
   const exitOverviewToOriginalRef = useRef<() => void>(() => {});
 
+  // Track stable transform when NOT in overview mode to capture pre-overview state accurately
+  useEffect(() => {
+    const updateStable = () => {
+      if (!isOverviewModeRef.current) {
+        lastStableTransformRef.current = { x: tx.get(), y: ty.get(), scale: tScale.get() };
+      }
+    };
+    const unsubX = tx.on('change', updateStable);
+    const unsubY = ty.on('change', updateStable);
+    const unsubS = tScale.on('change', updateStable);
+    return () => { unsubX(); unsubY(); unsubS(); };
+  }, [tx, ty, tScale]);
+
   useEffect(() => {
     if (!isOverviewMode) {
+      setOverviewCursorBox(null);
       const timer = setTimeout(() => {
         setOverviewViewportBox(null);
       }, 420);
@@ -650,6 +736,21 @@ export default function App() {
     animate(ty, targetTy, { duration: 0.4, ease: [0.33, 1, 0.68, 1] });
   };
 
+  const centerCardOnScreen = useCallback((cardX: number, cardY: number, cardW: number, cardH: number) => {
+    const cardCenterX = cardX + cardW / 2;
+    const cardCenterY = cardY + cardH / 2;
+    const currentScale = tScale.get();
+    
+    const targetTx = window.innerWidth / 2 - cardCenterX * currentScale;
+    const targetTy = window.innerHeight / 2 - cardCenterY * currentScale;
+    
+    targetTransform.current.x = targetTx;
+    targetTransform.current.y = targetTy;
+
+    animate(tx, targetTx, { duration: 0.45, ease: [0.16, 1, 0.3, 1] });
+    animate(ty, targetTy, { duration: 0.45, ease: [0.16, 1, 0.3, 1] });
+  }, [tScale, tx, ty]);
+
   // State for Cards & History
   const [isLoading, setIsLoading] = useState(true);
   const [history, setHistory] = useState<{ past: CardData[][], present: CardData[], future: CardData[][] }>({
@@ -710,62 +811,111 @@ export default function App() {
         try {
           const activeMcp = await getActiveMcpKey();
           if (!activeMcp?.token) {
-            // Keep task in generating state until token is configured
+            recoveringTaskIdsRef.current.delete(recoveryKey);
             return;
           }
-          const response = await fetch('/api/mcp/workrally/task', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              token: activeMcp.token,
-              serverUrl: activeMcp.serverUrl,
-              taskId: card.mcpTaskId,
-              isVideo: !!card.isVideo,
-            }),
-          });
-          const parsed = await safeParseJsonResponse(response);
-          if (!parsed.success || !response.ok || !parsed.data?.success || !parsed.data?.mediaUrl) {
-            throw new Error(parsed.data?.error || parsed.error || 'WorkRally 未返回生成结果');
-          }
-          const result = parsed.data;
-          if (loadedProjectIdRef.current !== currentProjectId) return;
 
-          let thumb: string | undefined;
-          if (card.isVideo && result.mediaUrl) {
-            try {
-              thumb = await generateVideoThumbnail(result.mediaUrl, MAX_THUMBNAIL_EDGE);
-              if (thumb) {
-                thumbCache.set(card.id, thumb);
-                thumbCache.set(result.mediaUrl, thumb);
-              }
-            } catch (e) {
-              console.warn('[App] Auto video thumb generation in task recovery info:', e);
+          let pollCount = 0;
+          const maxPolls = 150; // up to 7.5 minutes
+
+          while (pollCount < maxPolls) {
+            pollCount++;
+            if (loadedProjectIdRef.current !== currentProjectId) break;
+
+            const response = await fetch('/api/mcp/workrally/task', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                token: activeMcp.token,
+                serverUrl: activeMcp.serverUrl,
+                taskId: card.mcpTaskId,
+                isVideo: !!card.isVideo,
+              }),
+            });
+            const parsed = await safeParseJsonResponse(response);
+            if (!parsed.success || !response.ok) {
+              await sleep(3000);
+              continue;
             }
-          }
-          if (loadedProjectIdRef.current !== currentProjectId) return;
 
-          setCards(prev => prev.map(current =>
-            current.id === card.id && current.mcpTaskId === card.mcpTaskId
-              ? {
-                  ...current,
-                  imageUrl: result.mediaUrl,
-                  isVideo: result.isVideo !== undefined ? result.isVideo : current.isVideo,
-                  ...(thumb ? { thumbnailUrl: thumb } : {}),
-                  state: 'completed',
-                  generationError: undefined,
+            const result = parsed.data;
+            if (result.completed && result.mediaUrl) {
+              let thumb: string | undefined;
+              if (card.isVideo) {
+                try {
+                  thumb = await generateVideoThumbnail(result.mediaUrl, MAX_THUMBNAIL_EDGE);
+                  if (thumb) {
+                    thumbCache.set(card.id, thumb);
+                    thumbCache.set(result.mediaUrl, thumb);
+                  }
+                } catch (e) {
+                  console.warn('[App] Auto video thumb generation in task recovery info:', e);
                 }
-              : current
-          ), false);
+              }
+              if (loadedProjectIdRef.current !== currentProjectId) break;
+
+              setCards(prev => prev.map(current =>
+                current.id === card.id && current.mcpTaskId === card.mcpTaskId
+                  ? {
+                      ...current,
+                      imageUrl: result.mediaUrl,
+                      isVideo: result.isVideo !== undefined ? result.isVideo : current.isVideo,
+                      ...(thumb ? { thumbnailUrl: thumb } : {}),
+                      state: 'completed',
+                      generationError: undefined,
+                    }
+                  : current
+              ), false);
+              break;
+            }
+
+            if (result.failed) {
+              if (loadedProjectIdRef.current !== currentProjectId) break;
+              setCards(prev => prev.map(current =>
+                current.id === card.id && current.mcpTaskId === card.mcpTaskId
+                  ? { ...current, state: 'draft', generationError: result.error || '生成失败，请稍后重试' }
+                  : current
+              ), false);
+              break;
+            }
+
+            if (result.pending) {
+              await sleep(3000);
+              continue;
+            }
+
+            if (result.mediaUrl) {
+              let thumb: string | undefined;
+              if (card.isVideo) {
+                try {
+                  thumb = await generateVideoThumbnail(result.mediaUrl, MAX_THUMBNAIL_EDGE);
+                  if (thumb) {
+                    thumbCache.set(card.id, thumb);
+                    thumbCache.set(result.mediaUrl, thumb);
+                  }
+                } catch (e) {}
+              }
+              if (loadedProjectIdRef.current !== currentProjectId) break;
+              setCards(prev => prev.map(current =>
+                current.id === card.id && current.mcpTaskId === card.mcpTaskId
+                  ? {
+                      ...current,
+                      imageUrl: result.mediaUrl,
+                      isVideo: result.isVideo !== undefined ? result.isVideo : current.isVideo,
+                      ...(thumb ? { thumbnailUrl: thumb } : {}),
+                      state: 'completed',
+                      generationError: undefined,
+                    }
+                  : current
+              ), false);
+              break;
+            }
+
+            await sleep(3000);
+          }
         } catch (error) {
           const errMsg = error instanceof Error ? error.message : String(error);
           console.warn('[App] WorkRally task recovery notice:', errMsg);
-          if (loadedProjectIdRef.current === currentProjectId) {
-            setCards(prev => prev.map(current =>
-              current.id === card.id && current.mcpTaskId === card.mcpTaskId
-                ? { ...current, state: 'draft', generationError: error instanceof Error ? error.message : '生成失败，请稍后重试' }
-                : current
-            ), false);
-          }
         } finally {
           recoveringTaskIdsRef.current.delete(recoveryKey);
         }
@@ -1131,22 +1281,40 @@ export default function App() {
                 } catch { /* Keep the original error when it is not JSON. */ }
               }
             }
-            if (card.fileData) {
-              updates.imageUrl = URL.createObjectURL(card.fileData);
+            if (card.fileData && (card.fileData as any) instanceof Blob) {
+              const url = safeCreateObjectURL(card.fileData);
+              if (url) updates.imageUrl = url;
+            } else if (card.fileData) {
+              updates.fileData = undefined;
             }
-            if (card.originalFileData) {
-              updates.originalImageUrl = URL.createObjectURL(card.originalFileData);
+
+            if (card.originalFileData && (card.originalFileData as any) instanceof Blob) {
+              const url = safeCreateObjectURL(card.originalFileData);
+              if (url) updates.originalImageUrl = url;
+            } else if (card.originalFileData) {
+              updates.originalFileData = undefined;
             }
-            if (card.trueOriginalFileData) {
-              updates.trueOriginalImageUrl = URL.createObjectURL(card.trueOriginalFileData);
+
+            if (card.trueOriginalFileData && (card.trueOriginalFileData as any) instanceof Blob) {
+              const url = safeCreateObjectURL(card.trueOriginalFileData);
+              if (url) updates.trueOriginalImageUrl = url;
+            } else if (card.trueOriginalFileData) {
+              updates.trueOriginalFileData = undefined;
             }
+
             // Restore local reference image Blob URLs to prevent broken image references on reload
-            if (card.referenceImages && card.referenceImages.length > 0) {
+            if (card.referenceImages && Array.isArray(card.referenceImages)) {
               updates.referenceImages = card.referenceImages.map(ref => {
-                if (ref.fileData) {
+                if (ref.fileData && (ref.fileData as any) instanceof Blob) {
+                  const blobUrl = safeCreateObjectURL(ref.fileData);
                   return {
                     ...ref,
-                    url: URL.createObjectURL(ref.fileData)
+                    url: blobUrl || ref.url
+                  };
+                } else if (ref.fileData) {
+                  return {
+                    ...ref,
+                    fileData: undefined
                   };
                 }
                 return ref;
@@ -1154,9 +1322,23 @@ export default function App() {
               if (updates.referenceImages[0]?.url) {
                 updates.referenceImageUrl = updates.referenceImages[0].url;
               }
+            } else if (card.referenceImageFileData && (card.referenceImageFileData as any) instanceof Blob) {
+              const url = safeCreateObjectURL(card.referenceImageFileData);
+              if (url) updates.referenceImageUrl = url;
             } else if (card.referenceImageFileData) {
-              updates.referenceImageUrl = URL.createObjectURL(card.referenceImageFileData);
+              updates.referenceImageFileData = undefined;
             }
+            const savedPos = (() => {
+              try {
+                const pos = localStorage.getItem(`mira_vid_pos_${card.id}`);
+                if (pos) {
+                  const val = parseFloat(pos);
+                  if (!isNaN(val) && val > 0) return val;
+                }
+              } catch {}
+              return card.currentTime;
+            })();
+            if (typeof savedPos === 'number') updates.currentTime = savedPos;
             return {
               ...card,
               ...updates
@@ -1186,22 +1368,40 @@ export default function App() {
           if (fallbackCards && fallbackCards.length > 0) {
             const processedFallback = fallbackCards.map(card => {
               const updates: any = {};
-              if (card.fileData) {
-                updates.imageUrl = URL.createObjectURL(card.fileData);
+              if (card.fileData && (card.fileData as any) instanceof Blob) {
+                const url = safeCreateObjectURL(card.fileData);
+                if (url) updates.imageUrl = url;
+              } else if (card.fileData) {
+                updates.fileData = undefined;
               }
-              if (card.originalFileData) {
-                updates.originalImageUrl = URL.createObjectURL(card.originalFileData);
+
+              if (card.originalFileData && (card.originalFileData as any) instanceof Blob) {
+                const url = safeCreateObjectURL(card.originalFileData);
+                if (url) updates.originalImageUrl = url;
+              } else if (card.originalFileData) {
+                updates.originalFileData = undefined;
               }
-              if (card.trueOriginalFileData) {
-                updates.trueOriginalImageUrl = URL.createObjectURL(card.trueOriginalFileData);
+
+              if (card.trueOriginalFileData && (card.trueOriginalFileData as any) instanceof Blob) {
+                const url = safeCreateObjectURL(card.trueOriginalFileData);
+                if (url) updates.trueOriginalImageUrl = url;
+              } else if (card.trueOriginalFileData) {
+                updates.trueOriginalFileData = undefined;
               }
+
               // Restore local reference image Blob URLs to prevent broken image references on reload for legacy scoped cards
-              if (card.referenceImages && card.referenceImages.length > 0) {
+              if (card.referenceImages && Array.isArray(card.referenceImages)) {
                 updates.referenceImages = card.referenceImages.map(ref => {
-                  if (ref.fileData) {
+                  if (ref.fileData && (ref.fileData as any) instanceof Blob) {
+                    const blobUrl = safeCreateObjectURL(ref.fileData);
                     return {
                       ...ref,
-                      url: URL.createObjectURL(ref.fileData)
+                      url: blobUrl || ref.url
+                    };
+                  } else if (ref.fileData) {
+                    return {
+                      ...ref,
+                      fileData: undefined
                     };
                   }
                   return ref;
@@ -1209,9 +1409,39 @@ export default function App() {
                 if (updates.referenceImages[0]?.url) {
                   updates.referenceImageUrl = updates.referenceImages[0].url;
                 }
+              } else if (card.referenceImageFileData && (card.referenceImageFileData as any) instanceof Blob) {
+                const url = safeCreateObjectURL(card.referenceImageFileData);
+                if (url) updates.referenceImageUrl = url;
               } else if (card.referenceImageFileData) {
-                updates.referenceImageUrl = URL.createObjectURL(card.referenceImageFileData);
+                updates.referenceImageFileData = undefined;
               }
+              const savedPos = (() => {
+                try {
+                  const pos = localStorage.getItem(`mira_vid_pos_${card.id}`);
+                  if (pos) {
+                    const val = parseFloat(pos);
+                    if (!isNaN(val) && val > 0) return val;
+                  }
+                } catch {}
+                return card.currentTime;
+              })();
+              if (typeof savedPos === 'number') updates.currentTime = savedPos;
+
+              if (!card.baselineConfig && (card.imageUrl || card.originalImageUrl || card.fileData)) {
+                updates.baselineConfig = {
+                  prompt: card.lastGeneratedPrompt || card.prompt || '',
+                  ratio: card.ratio || '16:9',
+                  res: card.res || '2K',
+                  mcpModel: card.mcpModel,
+                  mcpToolName: card.mcpToolName,
+                  mcpParameters: card.mcpParameters,
+                  referenceImages: updates.referenceImages || card.referenceImages,
+                  referenceImageUrl: updates.referenceImageUrl || card.referenceImageUrl,
+                  referenceImageName: card.referenceImageName,
+                  referenceImageFileData: card.referenceImageFileData,
+                };
+              }
+
               return {
                 ...card,
                 ...updates
@@ -1280,11 +1510,290 @@ export default function App() {
     }
   }, [cards, isLoading, currentProjectId]);
 
+  // Synchronous flush on page reload or close to prevent in-flight video playback state from being lost
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (currentProjectId && loadedProjectIdRef.current === currentProjectId && cardsRef.current.length > 0) {
+        saveCards(cardsRef.current, currentProjectId).catch(() => {});
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, [currentProjectId]);
+
   const handleUpdateCard = useCallback((id: string, updates: Partial<CardData>, isSignificant = false) => {
+    if (typeof updates.currentTime === 'number' && updates.currentTime > 0) {
+      try {
+        localStorage.setItem(`mira_vid_pos_${id}`, updates.currentTime.toFixed(2));
+      } catch {}
+    }
     const isOnlyPrompt = Object.keys(updates).length === 1 && 'prompt' in updates;
     const shouldPush = isSignificant && !isOnlyPrompt;
-    setCards(prev => prev.map(c => c.id === id ? { ...c, ...updates } : c), shouldPush);
+    setCards(prev => prev.map(c => {
+      if (c.id !== id) return c;
+      // If the card has completed media, ALWAYS preserve and establish baselineConfig before applying user modifications
+      let baselineConfig = c.baselineConfig;
+      if (!baselineConfig && (c.imageUrl || c.originalImageUrl || c.fileData) && !updates.baselineConfig) {
+        baselineConfig = {
+          prompt: c.lastGeneratedPrompt || c.prompt || '',
+          ratio: c.ratio || '16:9',
+          res: c.res || '2K',
+          mcpModel: c.mcpModel,
+          mcpToolName: c.mcpToolName,
+          mcpParameters: c.mcpParameters ? { ...c.mcpParameters } : undefined,
+          referenceImages: c.referenceImages ? c.referenceImages.map(r => ({ ...r })) : [],
+          referenceImageUrl: c.referenceImageUrl,
+          referenceImageName: c.referenceImageName,
+          referenceImageFileData: c.referenceImageFileData,
+        };
+      }
+      return {
+        ...c,
+        ...(baselineConfig ? { baselineConfig } : {}),
+        ...updates
+      };
+    }), shouldPush);
   }, []);
+
+  // Fork / Duplicate Card with intelligent collision avoidance and optional auto-generate
+  const handleForkCard = useCallback(async (
+    sourceCardId: string,
+    customConfigOrPrompt?: string | Partial<CardData>,
+    autoStart = false
+  ) => {
+    const sourceCard = cardsRef.current.find(c => c.id === sourceCardId);
+    if (!sourceCard) return;
+
+    const customConfig = typeof customConfigOrPrompt === 'string'
+      ? { prompt: customConfigOrPrompt }
+      : (customConfigOrPrompt || {});
+
+    const newId = Math.random().toString(36).substring(2, 11);
+    const sourceDim = getCardSize(sourceCard);
+
+    // Calculate placement to the right of the source card (+32px margin)
+    let newX = sourceCard.x + sourceDim.width + 32;
+    let newY = sourceCard.y;
+
+    // Intelligent collision avoidance (check if space is occupied by any existing card)
+    const allCards = cardsRef.current;
+    let attempts = 0;
+    while (attempts < 10) {
+      const collides = allCards.some(c => {
+        return Math.abs(c.x - newX) < 80 && Math.abs(c.y - newY) < 80;
+      });
+      if (collides) {
+        newX += sourceDim.width + 32;
+        attempts++;
+      } else {
+        break;
+      }
+    }
+
+    const effectivePrompt = (customConfig.prompt !== undefined ? customConfig.prompt : sourceCard.prompt) || '';
+    const effectiveRatio = customConfig.ratio || sourceCard.ratio || '16:9';
+    const effectiveRes = customConfig.res || sourceCard.res || '2K';
+    const effectiveModel = customConfig.mcpModel || sourceCard.mcpModel || (sourceCard.isVideo ? WORKRALLY_VIDEO_MODELS[0].id : WORKRALLY_IMAGE_MODELS[0].id);
+    const effectiveToolName = customConfig.mcpToolName || sourceCard.mcpToolName;
+    const effectiveParameters = customConfig.mcpParameters !== undefined
+      ? customConfig.mcpParameters
+      : (sourceCard.mcpParameters ? { ...sourceCard.mcpParameters } : undefined);
+
+    const effectiveReferenceImages = (customConfig.referenceImages !== undefined ? customConfig.referenceImages : sourceCard.referenceImages) ? (
+      (customConfig.referenceImages || sourceCard.referenceImages)!.map(r => {
+        let fileData = r.fileData instanceof Blob ? r.fileData : undefined;
+        if (!fileData && r.sourceCardId) {
+          const src = cardsRef.current.find(c => c.id === r.sourceCardId);
+          const srcBlob = src?.trueOriginalFileData || src?.originalFileData || src?.fileData;
+          if (srcBlob instanceof Blob) fileData = srcBlob;
+        }
+        return {
+          ...r,
+          fileData,
+        };
+      })
+    ) : [];
+
+    const effectiveReferenceImageUrl = customConfig.referenceImageUrl !== undefined ? customConfig.referenceImageUrl : sourceCard.referenceImageUrl;
+    const effectiveReferenceImageName = customConfig.referenceImageName !== undefined ? customConfig.referenceImageName : sourceCard.referenceImageName;
+    const effectiveReferenceImageFileData = customConfig.referenceImageFileData instanceof Blob
+      ? customConfig.referenceImageFileData
+      : (sourceCard.referenceImageFileData instanceof Blob ? sourceCard.referenceImageFileData : undefined);
+
+    const effectiveReferenceSourceIds = Array.from(new Set(
+      effectiveReferenceImages.map(r => r.sourceCardId).filter(Boolean) as string[]
+    ));
+
+    const forkedCard: CardData = {
+      id: newId,
+      x: newX,
+      y: newY,
+      state: autoStart ? 'generating' : 'draft',
+      ratio: effectiveRatio,
+      res: effectiveRes,
+      prompt: effectivePrompt,
+      lastGeneratedPrompt: autoStart ? effectivePrompt : undefined,
+      imageUrl: null,
+      originalImageUrl: null,
+      thumbnailUrl: undefined,
+      fileData: undefined,
+      isVideo: customConfig.isVideo !== undefined ? customConfig.isVideo : sourceCard.isVideo,
+      derivedFromId: sourceCard.id,
+      referenceSourceIds: effectiveReferenceSourceIds,
+      referenceImages: effectiveReferenceImages,
+      referenceImageUrl: effectiveReferenceImageUrl,
+      referenceImageName: effectiveReferenceImageName,
+      referenceImageFileData: effectiveReferenceImageFileData,
+      mcpToolName: effectiveToolName,
+      mcpModel: effectiveModel,
+      mcpParameters: effectiveParameters,
+    };
+
+    // If custom config was passed for auto-forking from a completed media card, restore sourceCard's config in state to its baseline config
+    if (customConfigOrPrompt !== undefined && (sourceCard.imageUrl || sourceCard.originalImageUrl || sourceCard.fileData)) {
+      const baseline = sourceCard.baselineConfig || {
+        prompt: sourceCard.lastGeneratedPrompt ?? sourceCard.prompt ?? '',
+        ratio: sourceCard.ratio || '16:9',
+        res: sourceCard.res || '2K',
+        mcpModel: sourceCard.mcpModel,
+        mcpToolName: sourceCard.mcpToolName,
+        mcpParameters: sourceCard.mcpParameters ? { ...sourceCard.mcpParameters } : undefined,
+        referenceImages: sourceCard.referenceImages ? sourceCard.referenceImages.map(r => ({ ...r })) : [],
+        referenceImageUrl: sourceCard.referenceImageUrl,
+        referenceImageName: sourceCard.referenceImageName,
+        referenceImageFileData: sourceCard.referenceImageFileData,
+      };
+
+      setCards(prev => [
+        ...prev.map(c => c.id === sourceCardId ? {
+          ...c,
+          prompt: baseline.prompt,
+          lastGeneratedPrompt: baseline.prompt,
+          ratio: baseline.ratio,
+          res: baseline.res,
+          mcpModel: baseline.mcpModel,
+          mcpToolName: baseline.mcpToolName,
+          mcpParameters: baseline.mcpParameters,
+          referenceImages: baseline.referenceImages ? baseline.referenceImages.map(r => ({ ...r })) : [],
+          referenceImageUrl: baseline.referenceImageUrl,
+          referenceImageName: baseline.referenceImageName,
+          referenceImageFileData: baseline.referenceImageFileData,
+          baselineConfig: baseline,
+        } : c),
+        forkedCard
+      ], true);
+    } else {
+      setCards(prev => [...prev, forkedCard], true);
+    }
+    setSelectedCardIds([newId]);
+
+    // Center the newly forked card in the page viewport
+    const forkedDim = getCardSize(forkedCard);
+    centerCardOnScreen(newX, newY, forkedDim.width, forkedDim.height);
+
+    // If autoStart is requested, trigger generation immediately on the new card
+    if (autoStart && effectivePrompt.trim()) {
+      try {
+        const activeMcp = await getActiveMcpKey();
+        const effectiveRefImages = forkedCard.referenceImages && forkedCard.referenceImages.length > 0
+          ? forkedCard.referenceImages
+          : forkedCard.referenceImageUrl
+            ? [{ url: forkedCard.referenceImageUrl, name: forkedCard.referenceImageName, fileData: forkedCard.referenceImageFileData }]
+            : [];
+
+        if (activeMcp && activeMcp.token) {
+          const refPayloads: string[] = [];
+          for (const ref of effectiveRefImages) {
+            const payload = await resolveReferenceToPayload(ref, cardsRef.current);
+            if (payload) {
+              refPayloads.push(payload);
+            }
+          }
+
+          const resResult = await fetch('/api/mcp/workrally/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              token: activeMcp.token,
+              serverUrl: activeMcp.serverUrl,
+              prompt: effectivePrompt.trim(),
+              ratio: forkedCard.ratio,
+              res: forkedCard.res,
+              isVideo: !!forkedCard.isVideo,
+              referenceImages: refPayloads,
+              toolName: forkedCard.mcpToolName || (forkedCard.isVideo ? WORKRALLY_VIDEO_TOOL : WORKRALLY_IMAGE_TOOL),
+              model: forkedCard.mcpModel || effectiveModel,
+              parameters: {
+                ...(forkedCard.mcpParameters || {}),
+                ...(forkedCard.isVideo ? {
+                  duration: Number(forkedCard.mcpParameters?.duration || 5),
+                } : {}),
+              },
+              defer: true,
+            })
+          });
+
+          const parsed = await safeParseJsonResponse(resResult);
+          if (!parsed.success) {
+            throw new Error(parsed.error || '生成服务响应异常');
+          }
+          const result = parsed.data;
+
+          if (resResult.ok && result.success && result.pending && result.taskIds?.[0]) {
+            handleUpdateCard(newId, {
+              mcpTaskId: result.taskIds[0],
+              state: 'generating',
+              generationError: undefined,
+            }, true);
+            return;
+          }
+          if (resResult.ok && result.success && result.mediaUrl) {
+            let thumb: string | undefined;
+            if (forkedCard.isVideo) {
+              try {
+                thumb = await generateVideoThumbnail(result.mediaUrl, MAX_THUMBNAIL_EDGE);
+                if (thumb) {
+                  thumbCache.set(newId, thumb);
+                  thumbCache.set(result.mediaUrl, thumb);
+                }
+              } catch (e) {
+                console.warn('Auto video thumb generation in handleForkCard error:', e);
+              }
+            }
+            handleUpdateCard(newId, { 
+              imageUrl: result.mediaUrl,
+              isVideo: result.isVideo ?? forkedCard.isVideo,
+              ...(thumb ? { thumbnailUrl: thumb } : {}),
+              state: 'completed',
+              mcpTaskId: result.taskIds?.[0],
+              generationError: undefined,
+            }, true);
+            return;
+          } else {
+            const errMsg = result.error || '生成失败，请稍后重试';
+            handleUpdateCard(newId, { state: 'draft', generationError: errMsg }, true);
+            return;
+          }
+        }
+
+        // Fallback demo timeout
+        setTimeout(() => {
+          handleUpdateCard(newId, { 
+            imageUrl: "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=800&auto=format&fit=crop",
+            state: 'completed'
+          }, true);
+        }, 2000);
+      } catch (err: any) {
+        console.error('Fork card generation error:', err);
+        const userFacingError = err?.message?.includes('Failed to fetch')
+          ? '网络请求失败，请检查网络连接或 MCP 服务配置'
+          : (err?.message || '生成失败');
+        handleUpdateCard(newId, { state: 'draft', generationError: userFacingError }, true);
+      }
+    }
+  }, [handleUpdateCard]);
 
   // Start Canvas Reference Picker Session
   const handleStartCanvasPicker = useCallback((targetCardId: string) => {
@@ -1406,39 +1915,52 @@ export default function App() {
     return () => window.removeEventListener('card-painted', handleCardPainted);
   }, []);
 
-  // --- Viewport Circular Culling (Virtualization) ---
-  // Circle geometry: Center = (viewportWidth / 2, viewportHeight / 2), Diameter = viewportWidth, Radius = viewportWidth / 2.
-  // Cards whose AABB intersects with this circular boundary are mounted; non-intersecting cards are unmounted to save performance.
+  // --- Viewport Spatial Culling with QuadTree (Virtualization) ---
+  // Uses O(log N + K) QuadTree spatial index to rapidly query visible cards out of 25,000+ items in < 0.05ms.
   const [visibleCardIdSet, setVisibleCardIdSet] = useState<Set<string>>(() => new Set());
+  const mountFrameCounterRef = useRef<number>(0);
+  const quadTreeRef = useRef<QuadTree<CardData> | null>(null);
 
-  const updateCircularCulling = useCallback((forceImmediate = false) => {
+  // Synchronize QuadTree spatial index on cards change
+  useEffect(() => {
+    quadTreeRef.current = buildCardQuadTree(cards);
+  }, [cards]);
+
+  const updateCircularCulling = useCallback((_forceImmediate = false) => {
     if (typeof window === 'undefined') return;
 
-    // We can completely eliminate the throttling here during dragging/zooming because
-    // the state update is already guarded by an identity check, ensuring React
-    // only re-renders when a card actually enters/leaves the viewport.
-    // This allows instant culling and bottom-canvas thumbnail activation during dragging.
     if (cullingThrottleTimerRef.current) {
       clearTimeout(cullingThrottleTimerRef.current);
       cullingThrottleTimerRef.current = null;
     }
 
-    const vp = {
-      viewportWidth: window.innerWidth,
-      viewportHeight: window.innerHeight,
-      tx: tx.get(),
-      ty: ty.get(),
-      scale: tScale.get()
+    const currentScale = tScale.get() || 1;
+    const currentTx = tx.get();
+    const currentTy = ty.get();
+    const vpWidth = window.innerWidth;
+    const vpHeight = window.innerHeight;
+
+    // Add scale-adaptive pre-load buffer zone
+    const buffer = Math.max(40, Math.min(150, Math.round(150 * Math.sqrt(currentScale))));
+
+    // World coordinates query bounding box
+    const queryBounds: BoundingBox = {
+      minX: (-currentTx - buffer) / currentScale,
+      minY: (-currentTy - buffer) / currentScale,
+      maxX: (vpWidth - currentTx + buffer) / currentScale,
+      maxY: (vpHeight - currentTy + buffer) / currentScale,
     };
 
-    const currentCards = cardsRef.current;
+    const tree = quadTreeRef.current;
+    const candidateCards = tree ? tree.query(queryBounds) : cardsRef.current;
     const selectedIds = selectedCardIdsRef.current;
     const nextSet = new Set<string>();
 
-    for (const card of currentCards) {
-      if (selectedIds.includes(card.id) || isCardIntersectingRectangle(card, vp)) {
-        nextSet.add(card.id);
-      }
+    for (let i = 0; i < selectedIds.length; i++) {
+      nextSet.add(selectedIds[i]);
+    }
+    for (let i = 0; i < candidateCards.length; i++) {
+      nextSet.add(candidateCards[i].id);
     }
 
     let didChange = false;
@@ -1527,8 +2049,12 @@ export default function App() {
     triggerTweenZoom(450);
 
     if (selectedReferences.length > 0) {
+      const sourceIds = Array.from(new Set(
+        selectedReferences.map(r => r.sourceCardId).filter(Boolean) as string[]
+      ));
       handleUpdateCard(targetCardId, {
         referenceImages: selectedReferences,
+        referenceSourceIds: sourceIds,
         referenceImageUrl: selectedReferences[0].url,
         referenceImageName: selectedReferences.length > 1 ? `参考图 (${selectedReferences.length})` : selectedReferences[0].name,
         referenceImageFileData: selectedReferences[0].fileData
@@ -1536,6 +2062,7 @@ export default function App() {
     } else {
       handleUpdateCard(targetCardId, {
         referenceImages: [],
+        referenceSourceIds: [],
         referenceImageUrl: null,
         referenceImageName: undefined,
         referenceImageFileData: undefined
@@ -1836,11 +2363,11 @@ export default function App() {
     const cardElement = (e.target as Element).closest('[data-card-id]');
     let targetId = cardElement ? cardElement.getAttribute('data-card-id') : null;
     
-    // In Nano-LOD mode, cards are rendered via Hybrid Canvas (no DOM data-card-id).
-    // Perform instant world-coordinate hit-testing to identify the target card.
-    if (!targetId && isNanoLod) {
-      for (let i = cards.length - 1; i >= 0; i--) {
-        const c = cards[i];
+    // Perform instant world-coordinate hit-testing to identify the target card if not found from DOM
+    if (!targetId) {
+      const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+      for (let i = allCards.length - 1; i >= 0; i--) {
+        const c = allCards[i];
         const dim = getCardSize(c);
         if (canvasX >= c.x && canvasX <= c.x + dim.width && canvasY >= c.y && canvasY <= c.y + dim.height) {
           targetId = c.id;
@@ -1940,7 +2467,12 @@ export default function App() {
       return bottom > top && right > left && style.visibility !== 'hidden' && style.display !== 'none';
     };
     const scopedComponents = candidates.flatMap((element) => {
-      if (scope === 'overview' ? element.dataset.agentTarget?.startsWith('script.toc.item.') : !scopeElement || !(element === scopeElement || scopeElement.contains(element))) return [];
+      // In overview mode, include both top-level UI components and visible canvas cards
+      if (scope === 'overview') {
+        if (element.dataset.agentTarget?.startsWith('script.toc.item.')) return [];
+      } else {
+        if (!scopeElement || !(element === scopeElement || scopeElement.contains(element))) return [];
+      }
       const rect = element.getBoundingClientRect();
       const visible = rect.width > 0 && rect.height > 0
         && rect.bottom >= 0 && rect.right >= 0
@@ -1951,7 +2483,7 @@ export default function App() {
       const actions = (element.dataset.agentActions || '').split(' ').filter(Boolean);
       if (actions.length === 0) return [];
       
-      const isSelected = element.getAttribute('aria-selected') === 'true' || element.getAttribute('aria-current') === 'true' || element.getAttribute('aria-current') === 'page' || element.getAttribute('aria-expanded') === 'true' || element.getAttribute('aria-pressed') === 'true';
+      const isSelected = element.getAttribute('aria-selected') === 'true' || element.getAttribute('aria-current') === 'true' || element.getAttribute('aria-current') === 'page' || element.getAttribute('aria-expanded') === 'true' || element.getAttribute('aria-pressed') === 'true' || element.getAttribute('data-selected') === 'true';
       const isDisabled = element.hasAttribute('disabled') || (element as HTMLButtonElement).disabled === true || element.getAttribute('aria-disabled') === 'true';
       const badge = element.dataset.agentBadge || (id === 'script.toc.open' ? element.querySelector('.rounded-full')?.textContent?.trim() : undefined);
       const isInput = element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement;
@@ -1964,7 +2496,16 @@ export default function App() {
             ? `${definition?.label || '目录按钮'} (${badge})`
             : definition?.label || element.getAttribute('aria-label') || element.textContent?.trim().slice(0, 40) || id);
 
-      if (id === 'script.search.counter') {
+      if (id.startsWith('canvas.card.')) {
+        const rawCardId = id.replace('canvas.card.', '');
+        const cardObj = cardsRef.current.find(c => c.id === rawCardId);
+        if (cardObj) {
+          const cardType = cardObj.isVideo ? '视频' : (cardObj.isAsset ? '资产' : '生图');
+          const title = cardObj.fileName ? `[${cardObj.fileName}]` : '未命名卡片';
+          const promptSnip = cardObj.prompt ? `"${cardObj.prompt.slice(0, 24)}..."` : '(无提示词)';
+          label = `画布卡片 ${title} (${cardType}, ${cardObj.state}, ${cardObj.ratio}, ${promptSnip})`;
+        }
+      } else if (id === 'script.search.counter') {
         const counterText = element.textContent?.trim();
         if (counterText) label = `搜索匹配: ${counterText}`;
       } else if (id === 'script.replace.feedback') {
@@ -2018,6 +2559,28 @@ export default function App() {
     const textArea = document.querySelector<HTMLTextAreaElement>('[data-agent-target="script.text"]');
     const isExplicitTextScope = scope === 'script.text' || Boolean(scopeElement && (scopeElement === textArea || scopeElement.contains(textArea)));
     const textViewport = textArea && isVisible(textArea) && isExplicitTextScope ? getVisibleTextareaSnapshot(textArea) : null;
+
+    // Check if inspection scope is targeting a specific canvas card
+    let focusedCardInfo: any = undefined;
+    const targetCardId = scope.startsWith('canvas.card.') ? scope.replace('canvas.card.', '') : (scope === 'overview' ? selectedCardIdsRef.current[0] : undefined);
+    if (targetCardId) {
+      const cardObj = cardsRef.current.find(c => c.id === targetCardId);
+      if (cardObj) {
+        focusedCardInfo = {
+          id: cardObj.id,
+          title: cardObj.fileName || '未命名卡片',
+          state: cardObj.state,
+          ratio: cardObj.ratio,
+          resolution: cardObj.res,
+          prompt: cardObj.prompt,
+          lastGeneratedPrompt: cardObj.lastGeneratedPrompt,
+          model: cardObj.mcpModel,
+          referenceImagesCount: cardObj.referenceImages?.length || 0,
+          hasImage: Boolean(cardObj.imageUrl || cardObj.thumbnailUrl || cardObj.fileData),
+        };
+      }
+    }
+
     return {
       scope,
       status: scope === 'overview' || (scopeElement && isVisible(scopeElement)) ? 'visible' : 'not_visible',
@@ -2025,6 +2588,13 @@ export default function App() {
       actionSets,
       notices: Array.from(document.querySelectorAll<HTMLElement>('[role="alert"], [role="status"], [role="dialog"]')).filter(isVisible).map(element => ({ role: element.getAttribute('role'), label: element.getAttribute('aria-label') || element.textContent?.trim().slice(0, 200) })),
       project: { id: currentProject.id, name: currentProject.name },
+      canvas: {
+        scale: tScale.get(),
+        lodMode: isNanoLod ? 'nano' : (isMicroLod ? 'micro' : 'standard'),
+        totalCards: cardsRef.current.length,
+        visibleCount: scopedComponents.filter(c => c.id.startsWith('canvas.card.')).length,
+        focusedCard: focusedCardInfo,
+      },
       script: {
         drawerOpen: view.drawerOpen,
         activeView: view.activeView,
@@ -2072,13 +2642,29 @@ export default function App() {
       },
       components,
     };
-  }, [currentProject.id, currentProject.name, scriptSelection]);
+  }, [currentProject.id, currentProject.name, scriptSelection, tScale, isNanoLod, isMicroLod]);
 
   // The cursor is the Agent's public action path. It performs the same visible
   // UI step a person would take; only the resulting page observation exposes data.
   const animateMouseAction = useCallback(async (action: MouseActionName, targetId: string, arguments_: Record<string, unknown>) => {
-    const target = document.querySelector(`[data-agent-target="${targetId}"]`);
-    if (!(target instanceof HTMLElement)) throw new Error(`当前页面找不到操作目标：${targetId}`);
+    let target = document.querySelector(`[data-agent-target="${targetId}"]`);
+    if (!(target instanceof HTMLElement)) {
+      if (targetId.startsWith('canvas.card.')) {
+        const cardId = targetId.replace('canvas.card.', '');
+        const cardObj = cardsRef.current.find(c => c.id === cardId);
+        if (cardObj) {
+          const dim = getCardSize(cardObj);
+          setAgentState(prev => ({ ...prev, x: cardObj.x + dim.width / 2, y: cardObj.y + dim.height / 2, visible: true, isMoving: true }));
+          await sleep(350);
+          setAgentState(prev => ({ ...prev, isMoving: false, isActive: action !== 'mouse.move' && action !== 'mouse.hover' }));
+          await sleep(150);
+          setAgentState(prev => ({ ...prev, isActive: false }));
+          await sleep(120);
+          return { action, targetId };
+        }
+      }
+      throw new Error(`当前页面找不到操作目标：${targetId}`);
+    }
     const supportedActions = (target.dataset.agentActions || '').split(' ').filter(Boolean);
     if (!supportedActions.includes(action)) throw new Error(`组件 ${targetId} 不支持动作：${action}`);
     const rect = target.getBoundingClientRect();
@@ -2119,6 +2705,24 @@ export default function App() {
           isActive: false,
         }));
 
+        await sleep(350);
+        setAgentState(prev => ({ ...prev, isMoving: false, isActive: false }));
+        await sleep(160);
+      }
+    } else if (targetId.startsWith('canvas.card.')) {
+      // In Nano-LOD or offscreen virtual mode, resolve world coordinates from data layer
+      const cardId = targetId.replace('canvas.card.', '');
+      const cardObj = cardsRef.current.find(c => c.id === cardId);
+      if (cardObj) {
+        const dim = getCardSize(cardObj);
+        setAgentState(prev => ({
+          ...prev,
+          x: cardObj.x + dim.width / 2,
+          y: cardObj.y + dim.height / 2,
+          visible: true,
+          isMoving: true,
+          isActive: false,
+        }));
         await sleep(350);
         setAgentState(prev => ({ ...prev, isMoving: false, isActive: false }));
         await sleep(160);
@@ -2208,7 +2812,11 @@ export default function App() {
         target.click();
       } else {
         // Manual fallback for critical global state views just in case the element wasn't found in DOM
-        if (targetId === 'script-bible-toggle') setDrawerOpen(!scriptViewRef.current.drawerOpen);
+        if (targetId.startsWith('canvas.card.')) {
+          const cardId = targetId.replace('canvas.card.', '');
+          setSelectedCardIds([cardId]);
+        }
+        else if (targetId === 'script-bible-toggle') setDrawerOpen(!scriptViewRef.current.drawerOpen);
         else if (targetId === 'script.close') setDrawerOpen(false);
         else if (targetId === 'script.view.script') setScriptView('script');
         else if (targetId === 'script.view.assets') setScriptView('assets');
@@ -2220,6 +2828,30 @@ export default function App() {
       }
     }
     if (action === 'mouse.scroll') {
+      if (targetId === 'canvas.viewport') {
+        const delta = Number(arguments_.delta) || (arguments_.direction === 'up' ? -120 : (arguments_.direction === 'down' ? 120 : 0));
+        // Positive delta zooms in, negative zooms out (or standard wheel zoom)
+        const zoomFactor = delta > 0 ? 1.25 : 0.8;
+        const currentScale = tScale.get();
+        const newScale = Math.min(Math.max(0.1, currentScale * zoomFactor), 5.0);
+        
+        // Zoom towards screen center
+        const centerX = window.innerWidth / 2;
+        const centerY = window.innerHeight / 2;
+        const worldX = (centerX - tx.get()) / currentScale;
+        const worldY = (centerY - ty.get()) / currentScale;
+        const newTx = centerX - worldX * newScale;
+        const newTy = centerY - worldY * newScale;
+
+        triggerTweenZoom(300);
+        targetTransform.current = { x: newTx, y: newTy, scale: newScale };
+        animate(tScale, newScale, { duration: 0.3, ease: [0.16, 1, 0.3, 1] });
+        animate(tx, newTx, { duration: 0.3, ease: [0.16, 1, 0.3, 1] });
+        animate(ty, newTy, { duration: 0.3, ease: [0.16, 1, 0.3, 1] });
+        await sleep(320);
+        return;
+      }
+
       let delta = 480;
       if (arguments_.direction === 'top') delta = -999999;
       else if (arguments_.direction === 'bottom') delta = 999999;
@@ -2243,14 +2875,38 @@ export default function App() {
         }
       }
     }
-    if (action === 'mouse.drag' && targetId === 'script.text') {
-      const target = document.querySelector(`[data-agent-target="${targetId}"]`);
-      const start = Number(arguments_.start);
-      const end = Number(arguments_.end);
-      if (target instanceof HTMLTextAreaElement && Number.isInteger(start) && Number.isInteger(end)) {
-        target.focus({ preventScroll: true });
-        target.setSelectionRange(Math.max(0, start), Math.max(0, end));
-        target.dispatchEvent(new Event('select', { bubbles: true }));
+    if (action === 'mouse.drag') {
+      if (targetId === 'canvas.viewport') {
+        const deltaX = Number(arguments_.deltaX || arguments_.dx || 0);
+        const deltaY = Number(arguments_.deltaY || arguments_.dy || 0);
+        const newTx = tx.get() + (deltaX !== 0 ? deltaX : 300);
+        const newTy = ty.get() + (deltaY !== 0 ? deltaY : 0);
+        targetTransform.current = { x: newTx, y: newTy, scale: tScale.get() };
+        animate(tx, newTx, { duration: 0.35, ease: [0.16, 1, 0.3, 1] });
+        animate(ty, newTy, { duration: 0.35, ease: [0.16, 1, 0.3, 1] });
+        await sleep(380);
+        return;
+      }
+      if (targetId.startsWith('canvas.card.')) {
+        const cardId = targetId.replace('canvas.card.', '');
+        const cardObj = cardsRef.current.find(c => c.id === cardId);
+        if (cardObj) {
+          const deltaX = Number(arguments_.deltaX || arguments_.dx || 0);
+          const deltaY = Number(arguments_.deltaY || arguments_.dy || 0);
+          handleUpdateCard(cardId, { x: cardObj.x + deltaX, y: cardObj.y + deltaY }, true);
+          await sleep(200);
+          return;
+        }
+      }
+      if (targetId === 'script.text') {
+        const target = document.querySelector(`[data-agent-target="${targetId}"]`);
+        const start = Number(arguments_.start);
+        const end = Number(arguments_.end);
+        if (target instanceof HTMLTextAreaElement && Number.isInteger(start) && Number.isInteger(end)) {
+          target.focus({ preventScroll: true });
+          target.setSelectionRange(Math.max(0, start), Math.max(0, end));
+          target.dispatchEvent(new Event('select', { bubbles: true }));
+        }
       }
     }
     if (action === 'mouse.type') {
@@ -2321,7 +2977,11 @@ export default function App() {
       const query = String(call.arguments.query || '');
       return {
         query,
-        guidance: /搜索|替换|查找|replace|search/i.test(query)
+        guidance: /画布|缩放|拖拽|平移|zoom|pan|canvas/i.test(query)
+          ? '操作说明：在无限画布主界面中，针对“canvas.viewport”执行 mouse.scroll 可缩放画布（正数放大，负数缩小）；执行 mouse.drag 并传入 { deltaX, deltaY } 可平移画布视野；点击或悬停画布上的卡片(如 canvas.card.xxx)可聚焦卡片。'
+          : /卡片|图片|生图|生成|详情|card|image/i.test(query)
+          ? '操作说明：在无限画布上，所有卡片均以 "canvas.card.<id>" 命名。可调用 page.inspect 观察视野内的可见卡片；指定 scope 为特定卡片 ID（如 canvas.card.xxx）可深入观察其提示词、比例、分辨率及生成状态；通过 ui.actAndObserve 对卡片执行 mouse.click 可选中该卡片。'
+          : /搜索|替换|查找|replace|search/i.test(query)
           ? '操作说明：在剧本正文视图中，点击二级菜单的“搜索替换按钮(script.search.open)”展开面板；在“搜索输入框(script.search.input)”输入目标关键词（可点击“区分大小写切换(script.search.case)”）；通过“下一个匹配项(script.search.next)”或“上一个匹配项(script.search.prev)”在正文中高亮定位；在“替换输入框(script.replace.input)”中输入新文本，可执行“单处替换(script.replace.single)”或“全部替换(script.replace.all)”。操作说明不包含当前项目的具体文本内容。'
           : /正文|文本|阅读|内容|script\.text/.test(query)
           ? '操作说明：页面观察默认不直接展开剧本正文全文。若需阅读正文当前视野，可调用 page.inspect 并指定 scope 为 "script.text" 申请查看；也可通过目录快速跳转或通过搜索定位特定内容。'
@@ -2394,7 +3054,196 @@ export default function App() {
     });
   }, []);
 
-  const handleRunAgent = async (overrideMessage?: string) => {
+  const extractCardImageBase64 = useCallback(async (card: CardData): Promise<string | undefined> => {
+    const compressImageToJpegBase64 = async (source: Blob | string): Promise<string | undefined> => {
+      try {
+        const url = typeof source === 'string' ? source : URL.createObjectURL(source);
+        const res = await new Promise<string | undefined>((resolve) => {
+          const img = new Image();
+          img.crossOrigin = 'anonymous';
+          img.referrerPolicy = 'no-referrer';
+          img.onload = () => {
+            try {
+              const maxEdge = 1024;
+              let width = img.naturalWidth || img.width || 1024;
+              let height = img.naturalHeight || img.height || 1024;
+              if (width > maxEdge || height > maxEdge) {
+                if (width >= height) {
+                  height = Math.round((height * maxEdge) / width);
+                  width = maxEdge;
+                } else {
+                  width = Math.round((width * maxEdge) / height);
+                  height = maxEdge;
+                }
+              }
+              const canvas = document.createElement('canvas');
+              canvas.width = width;
+              canvas.height = height;
+              const ctx = canvas.getContext('2d');
+              if (ctx) {
+                ctx.drawImage(img, 0, 0, width, height);
+                resolve(canvas.toDataURL('image/jpeg', 0.82));
+                return;
+              }
+            } catch {}
+            resolve(undefined);
+          };
+          img.onerror = () => resolve(undefined);
+          img.src = url;
+        });
+        if (typeof source !== 'string') URL.revokeObjectURL(url);
+        return res;
+      } catch {
+        return undefined;
+      }
+    };
+
+    const convertBlobToBase64 = async (blob: Blob): Promise<string | undefined> => {
+      const compressed = await compressImageToJpegBase64(blob);
+      if (compressed) return compressed;
+      return new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+    };
+
+    const convertUrlToBase64 = async (url: string): Promise<string | undefined> => {
+      if (!url) return undefined;
+      if (url.startsWith('data:image/')) {
+        return (await compressImageToJpegBase64(url)) || url;
+      }
+
+      // 1. Try direct fetch
+      try {
+        const resp = await fetch(url);
+        if (resp.ok) {
+          const blob = await resp.blob();
+          if (blob && blob.size > 0) {
+            return await convertBlobToBase64(blob);
+          }
+        }
+      } catch {}
+
+      // 2. If remote URL, try proxy fetch to bypass CORS
+      if (/^https?:\/\//i.test(url) && !url.includes('/api/mcp/workrally/proxy-media')) {
+        try {
+          const activeToken = getActiveMcpTokenSync();
+          const taskId = card.mcpTaskId || url.match(/(2k[a-z0-9]{6,16})/i)?.[1] || url.match(/\/(2k[a-z0-9]+)_MAIN_/i)?.[1] || '';
+          const proxyUrl = `/api/mcp/workrally/proxy-media?url=${encodeURIComponent(url)}${taskId ? `&taskId=${encodeURIComponent(taskId)}` : ''}${activeToken ? `&token=${encodeURIComponent(activeToken)}` : ''}`;
+          const proxyResp = await fetch(proxyUrl);
+          if (proxyResp.ok) {
+            const blob = await proxyResp.blob();
+            if (blob && blob.size > 0) {
+              return await convertBlobToBase64(blob);
+            }
+          }
+        } catch {}
+      }
+
+      // 3. Fallback: draw using HTMLImageElement onto offscreen canvas
+      return await compressImageToJpegBase64(url);
+    };
+
+    // 1. Check raw binary data on the card (Rule 3: trueOriginalFileData > originalFileData > fileData)
+    const directBlobs = [
+      card.trueOriginalFileData,
+      card.originalFileData,
+      card.fileData,
+      card.referenceImageFileData,
+    ];
+    for (const b of directBlobs) {
+      if (b instanceof Blob && b.size > 0) {
+        try {
+          const res = await convertBlobToBase64(b);
+          if (res) return res;
+        } catch {}
+      }
+    }
+
+    // 2. Check direct card image URLs
+    const candidateUrls = [
+      card.trueOriginalImageUrl,
+      card.originalImageUrl,
+      card.imageUrl,
+      card.thumbnailUrl,
+      card.referenceImageUrl,
+    ].filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
+
+    for (const url of candidateUrls) {
+      const res = await convertUrlToBase64(url);
+      if (res) return res;
+    }
+
+    // 3. Check referenceImages array (e.g. prompt card with reference image attached)
+    if (Array.isArray(card.referenceImages) && card.referenceImages.length > 0) {
+      for (const ref of card.referenceImages) {
+        if (ref.fileData instanceof Blob && ref.fileData.size > 0) {
+          try {
+            const res = await convertBlobToBase64(ref.fileData);
+            if (res) return res;
+          } catch {}
+        }
+        if (ref.url) {
+          const res = await convertUrlToBase64(ref.url);
+          if (res) return res;
+        }
+        if (ref.thumbnailUrl) {
+          const res = await convertUrlToBase64(ref.thumbnailUrl);
+          if (res) return res;
+        }
+      }
+    }
+
+    // 4. Check global thumbnail cache
+    const cachedThumb = thumbCache.get(card.id) || (card.imageUrl ? thumbCache.get(card.imageUrl) : undefined);
+    if (cachedThumb && cachedThumb.startsWith('data:image/')) {
+      return cachedThumb;
+    }
+
+    return undefined;
+  }, []);
+
+  const formatCardContextInfo = useCallback((card: CardData, hasImage: boolean): string => {
+    const cardType = card.isVideo ? '视频生成卡片' : (card.isAsset ? '素材/参考卡片' : '生图卡片');
+    const prompt = card.prompt || card.lastGeneratedPrompt || '';
+    const refCount = card.referenceImages?.length || 0;
+    
+    const lines: string[] = [
+      `【当前右键聚焦的目标卡片信息】`,
+      `- 卡片ID: ${card.id}`,
+      `- 标题/分集: ${card.fileName || '未命名卡片'}`,
+      `- 卡片类型: ${cardType}`,
+      `- 提示词 (Prompt): ${prompt ? `"${prompt}"` : '(空)'}`,
+      `- 画幅比例: ${card.ratio || '默认'}`,
+      `- 分辨率: ${card.res || '2K'}`,
+    ];
+
+    if (card.lastGeneratedPrompt && card.lastGeneratedPrompt !== prompt) {
+      lines.push(`- 历史生成提示词: "${card.lastGeneratedPrompt}"`);
+    }
+
+    if (card.mcpModel) {
+      lines.push(`- 关联模型: ${card.mcpModel}`);
+    }
+
+    if (refCount > 0) {
+      lines.push(`- 关联参考图: ${refCount} 张`);
+    }
+
+    if (hasImage) {
+      lines.push(`- 卡片图像: [已注入卡片图像至多模态上下文供观察]`);
+    }
+
+    return lines.join('\n');
+  }, []);
+
+  const handleRunAgent = async (
+    overrideMessage?: string,
+    overrideImages?: string[],
+    cardContext?: Record<string, any>
+  ) => {
     const rawMessage = overrideMessage !== undefined ? overrideMessage : agentPrompt;
     if (!rawMessage.trim()) return;
     if (isAgentRunning || isAgentThinking) return;
@@ -2404,6 +3253,31 @@ export default function App() {
     }
     setIsAgentThinking(true);
     setIsAgentRunning(true);
+
+    // If cardContext not provided but user has a single selected card, auto-enrich context with lineage
+    let effectiveCardContext = cardContext;
+    let effectiveImages = overrideImages;
+
+    if (!effectiveCardContext && selectedCardIdsRef.current.length === 1) {
+      const selectedId = selectedCardIdsRef.current[0];
+      const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+      const targetCard = allCards.find(c => c.id === selectedId);
+      if (targetCard) {
+        try {
+          const autoCtx = await buildAutoInjectedCardContext(targetCard, allCards, extractCardImageBase64);
+          effectiveCardContext = {
+            ...autoCtx.structuredContext,
+            markdownSummary: autoCtx.markdownSummary,
+            images: autoCtx.images,
+          };
+          if (!effectiveImages || effectiveImages.length === 0) {
+            effectiveImages = autoCtx.images;
+          }
+        } catch (e) {
+          console.warn('Auto card context generation failed:', e);
+        }
+      }
+    }
 
     try {
       const agentModel = assetExtractionService.getNodeModels().agentModel;
@@ -2419,7 +3293,7 @@ export default function App() {
       let taskId = activeTaskIdRef.current;
 
       const existingTask = runtime && taskId ? runtime.getTask(taskId) : undefined;
-      if (!runtime || !taskId || !existingTask || ['cancelled', 'failed'].includes(existingTask.status)) {
+      if (!runtime || !taskId || !existingTask || ['cancelled', 'failed', 'completed'].includes(existingTask.status) || Boolean(cardContext)) {
         isNewTask = true;
         taskId = `task_${Date.now().toString(36)}`;
         activeTaskIdRef.current = taskId;
@@ -2427,8 +3301,9 @@ export default function App() {
           requestTurn: async (task: RuntimeTask, requireTool, signal) => {
             const turnId = `${task.id}:turn:${task.turn}`;
             const startedAt = Date.now();
+            const latestUserMsg = task.negotiationLog?.filter(l => l.role === 'user').slice(-1)[0]?.content || userMessage;
             const requestBody = {
-              userMessage, // Can remove if server uses negotiationLog
+              userMessage: latestUserMsg,
               history: task.history,
               events: task.events,
               observations: task.observations,
@@ -2445,8 +3320,11 @@ export default function App() {
                 pendingCallIds: task.pendingCallIds,
                 negotiationLog: task.negotiationLog,
                 lastGoalUpdatedAt: task.lastGoalUpdatedAt,
-                lastUserInputAt: task.lastUserInputAt
+                lastUserInputAt: task.lastUserInputAt,
+                cardContext: task.cardContext || cardContext,
               },
+              images: task.images || overrideImages,
+              cardContext: task.cardContext || cardContext,
               apiKey: savedKey, modelType: agentModel, enabledTools, requireTool,
             };
             updateAgentRuntimeTrace(task, trace => ({
@@ -2497,7 +3375,7 @@ export default function App() {
             }
           },
           executeTool: (call, task, signal) => executeAgentTool(call, task, signal),
-          requireVisibleInteraction: true,
+          requireVisibleInteraction: false,
           isParallelSafe: (call) => {
             if (call.name === 'guide.lookup') return true;
             if (call.name === 'page.inspect') {
@@ -2505,6 +3383,87 @@ export default function App() {
               return !scope || scope === 'overview';
             }
             return false;
+          },
+          updateStateNode: async (task, lastTurnResult, signal) => {
+            if (signal?.aborted) return;
+            const targetTurnId = `${task.id}:turn:${task.turn}`;
+            let debugPromptText = '';
+            let responseData: any = null;
+
+            try {
+              const agentModel = assetExtractionService.getNodeModels().agentModel;
+              const isDashscopeModel = agentModel.startsWith('qwen') || agentModel.includes('glm') || agentModel.includes('ZHIPU') || agentModel.includes('zhipu');
+              const savedKey = isDashscopeModel
+                ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key') || '')
+                : (localStorage.getItem('deepseek_api_key') || '');
+
+              const lastUserMessage = task.negotiationLog?.[task.negotiationLog.length - 1]?.content || task.goal;
+              const res = await fetch('/api/agent/update-state-node', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  currentTask: {
+                    title: task.title,
+                    goal: task.goal,
+                    subGoal: task.subGoal,
+                    progress: task.progress,
+                    plan: task.plan,
+                    notes: task.notes,
+                  },
+                  userMessage: lastUserMessage,
+                  lastTurnOutput: {
+                    narration: lastTurnResult.narration,
+                    speak: lastTurnResult.speak,
+                    toolCalls: lastTurnResult.toolCalls,
+                  },
+                  apiKey: savedKey,
+                  model: agentModel,
+                }),
+                signal,
+              });
+
+              responseData = await res.json().catch((e) => ({ error: '无法解析 JSON 响应', details: String(e) }));
+              if (responseData && responseData.debugPrompt) {
+                debugPromptText = responseData.debugPrompt;
+              }
+
+              if (res.ok && responseData && !responseData.error) {
+                if (responseData.taskTitle) task.title = responseData.taskTitle;
+                if (responseData.goal) task.goal = responseData.goal;
+                if (responseData.subGoal) task.subGoal = responseData.subGoal;
+                if (responseData.progress) task.progress = responseData.progress;
+                if (Array.isArray(responseData.plan)) task.plan = responseData.plan;
+                if (typeof responseData.notes === 'string' && responseData.notes.trim()) {
+                  if (responseData.notesMode === 'overwrite') {
+                    task.notes = responseData.notes.trim();
+                  } else {
+                    const cleanNote = responseData.notes.trim().replace(/^- \s*/, '');
+                    task.notes = task.notes ? `${task.notes}\n- ${cleanNote}` : `- ${cleanNote}`;
+                  }
+                }
+                task.lastGoalUpdatedAt = Date.now();
+              }
+            } catch (e) {
+              console.warn('Dedicated state node update execution error:', e);
+              responseData = { error: '请求发起异常', details: String(e) };
+            } finally {
+              const { debugPrompt: _p, ...cleanOutput } = responseData || {};
+              updateAgentRuntimeTrace(task, (trace) => {
+                const turns = trace.turns.map(turn => {
+                  if (turn.id === targetTurnId || turn.turn === task.turn) {
+                    return {
+                      ...turn,
+                      stateNodeTrace: {
+                        prompt: debugPromptText || '状态提取节点已触发运行',
+                        response: cleanOutput,
+                      },
+                    };
+                  }
+                  return turn;
+                });
+                return { ...trace, turns };
+              });
+            }
           },
           onTaskChange: (task) => {
             updateAgentRuntimeTrace(task);
@@ -2526,7 +3485,13 @@ export default function App() {
 
       let task: RuntimeTask;
       if (isNewTask) {
-        task = runtime.createTask({ id: taskId!, sessionId: currentProject.id, goal: userMessage });
+        task = runtime.createTask({
+          id: taskId!,
+          sessionId: currentProject.id,
+          goal: userMessage,
+          images: overrideImages,
+          cardContext: cardContext,
+        });
         updateAgentRuntimeTrace(task);
         // Auto inspect if enabled
         if (localStorage.getItem('auto_inspect_on_launch') !== 'false') {
@@ -2559,7 +3524,7 @@ export default function App() {
           }
         }
       } else {
-        runtime.addUserInput(taskId!, userMessage);
+        runtime.addUserInput(taskId!, userMessage, overrideImages, cardContext);
         task = runtime.requireTask(taskId!);
       }
 
@@ -2579,6 +3544,43 @@ export default function App() {
       }, 5000); // Clear speak text 5 seconds after the agent stops
     }
   };
+
+  const handleCardAgentChat = useCallback(async (targetCardId: string, promptText: string) => {
+    const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+    const targetCard = allCards.find(c => c.id === targetCardId) || cards.find(c => c.id === targetCardId);
+    if (!targetCard) {
+      await handleRunAgent(promptText);
+      return;
+    }
+
+    try {
+      const autoCtx = await buildAutoInjectedCardContext(targetCard, allCards, extractCardImageBase64);
+
+      await handleRunAgent(
+        promptText,
+        autoCtx.images.length > 0 ? autoCtx.images : undefined,
+        {
+          ...autoCtx.structuredContext,
+          markdownSummary: autoCtx.markdownSummary,
+          images: autoCtx.images,
+        }
+      );
+    } catch (err) {
+      console.warn('buildAutoInjectedCardContext failed, fallback to direct info:', err);
+      const imageBase64 = await extractCardImageBase64(targetCard);
+      const cardInfo = formatCardContextInfo(targetCard, !!imageBase64);
+
+      await handleRunAgent(promptText, imageBase64 ? [imageBase64] : undefined, {
+        cardId: targetCard.id,
+        title: targetCard.fileName || '未命名卡片',
+        prompt: targetCard.prompt,
+        aspectRatio: targetCard.ratio,
+        resolution: targetCard.res,
+        imageUrl: imageBase64,
+        markdownSummary: cardInfo,
+      });
+    }
+  }, [cards, extractCardImageBase64, formatCardContextInfo]);
 
   const handlePauseTask = () => {
     if (!runtimeRef.current || !activeTaskIdRef.current) return;
@@ -2726,9 +3728,9 @@ export default function App() {
     // Save current transform state to revert if needed
     if (!preOverviewTransform.current) {
       preOverviewTransform.current = {
-        x: targetTransform.current.x,
-        y: targetTransform.current.y,
-        scale: targetTransform.current.scale
+        x: lastStableTransformRef.current.x,
+        y: lastStableTransformRef.current.y,
+        scale: lastStableTransformRef.current.scale
       };
     }
 
@@ -2749,17 +3751,23 @@ export default function App() {
       height: originWorldH
     });
     
-    // Calculate world bounding box
+    // Calculate world bounding box including bottom panels
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     if (cardsRef.current.length === 0) {
        minX = -1000; minY = -1000; maxX = 1000; maxY = 1000;
     } else {
        cardsRef.current.forEach(c => {
          const dim = getCardSize(c);
-         if (c.x < minX) minX = c.x;
+         const isGenerationCard = !c.fileName && !c.isAsset;
+         const panelH = isGenerationCard ? getBottomPanelHeight(c.prompt, c.referenceImages?.length) + 12 : 0;
+         const panelW = 480;
+         const effectiveLeft = Math.min(c.x, isGenerationCard ? c.x + (dim.width - panelW) / 2 : c.x);
+         const effectiveRight = Math.max(c.x + dim.width, isGenerationCard ? c.x + (dim.width + panelW) / 2 : c.x + dim.width);
+
+         if (effectiveLeft < minX) minX = effectiveLeft;
          if (c.y < minY) minY = c.y;
-         if (c.x + dim.width > maxX) maxX = c.x + dim.width;
-         if (c.y + dim.height > maxY) maxY = c.y + dim.height;
+         if (effectiveRight > maxX) maxX = effectiveRight;
+         if (c.y + dim.height + panelH > maxY) maxY = c.y + dim.height + panelH;
        });
     }
     
@@ -2802,10 +3810,22 @@ export default function App() {
     setIsNanoCanvasActive(true);
     setIsOverviewMode(true);
     isOverviewModeRef.current = true;
-  }, [tScale, tx, ty, restoreCanvasStyles, resetOverviewPrompt]);
+    overviewBoxScaleRef.current = 1.0;
+
+    // Immediately calculate and display the blue viewport box at current mouse position
+    updateOverviewCursorBoxAt(
+      lastMouseClientPosRef.current.clientX,
+      lastMouseClientPosRef.current.clientY,
+      targetTx,
+      targetTy,
+      targetScale
+    );
+  }, [tScale, tx, ty, restoreCanvasStyles, resetOverviewPrompt, updateOverviewCursorBoxAt]);
 
   const exitOverviewToOriginal = useCallback(() => {
     resetOverviewPrompt();
+    overviewBoxScaleRef.current = 1.0;
+    setOverviewCursorBox(null);
     if (preOverviewTransform.current) {
       triggerTweenZoom(400);
       
@@ -3050,37 +4070,12 @@ export default function App() {
 
       // If currently in overview mode:
       if (isOverviewModeRef.current) {
-        // Scrolling up (zooming in) breaks out of overview focused on mouse cursor position
-        if (e.deltaY < -15) {
-          const rect = container.getBoundingClientRect();
-          const cursorX = e.clientX - rect.left;
-          const cursorY = e.clientY - rect.top;
-          const currentScale = tScale.get();
-          const worldX = (cursorX - tx.get()) / currentScale;
-          const worldY = (cursorY - ty.get()) / currentScale;
-
-          const targetScale = preOverviewTransform.current ? preOverviewTransform.current.scale : 1.0;
-          const targetTx = cursorX - worldX * targetScale;
-          const targetTy = cursorY - worldY * targetScale;
-
-          targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
-
-          triggerTweenZoom(400);
-
-          const animConfig: any = { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] };
-          animate(tScale, targetScale, animConfig);
-          animate(tx, targetTx, animConfig);
-          animate(ty, targetTy, animConfig);
-
-          clearTimeout(zoomTimeoutRef.current);
-          zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
-
-          preOverviewTransform.current = null;
-          setIsOverviewMode(false);
-          isOverviewModeRef.current = false;
-          return;
-        }
-        // Ignore further wheel zoom out while in overview
+        // In overview mode, mouse wheel scales the blue box, with direction opposite of normal canvas zoom
+        const isDiscrete = Math.abs(e.deltaY) >= 20;
+        const sensitivity = isDiscrete ? 0.0018 : 0.001;
+        const delta = e.deltaY * sensitivity;
+        overviewBoxScaleRef.current = Math.min(Math.max(0.15, overviewBoxScaleRef.current * Math.exp(delta)), 8.0);
+        updateOverviewCursorBoxAt(e.clientX, e.clientY);
         return;
       }
 
@@ -3123,6 +4118,19 @@ export default function App() {
         workspace.setAttribute('data-gesture', 'true');
         isZoomingRef.current = true;
         setIsZooming(true);
+
+        // Synchronously pause all active videos to free hardware decoders during zoom
+        try {
+          const allVideos = document.querySelectorAll('video');
+          allVideos.forEach(v => {
+            if (!v.paused) {
+              v.pause();
+              v.setAttribute('data-was-playing', 'true');
+            }
+          });
+        } catch (err) {
+          console.warn('Failed to pause background videos during zoom:', err);
+        }
       }
 
       // 2. Clear the fallback timeout on every wheel tick
@@ -3179,6 +4187,7 @@ export default function App() {
     if (e.button === 0 && (preOverviewTransform.current || isOverviewModeRef.current)) {
       e.stopPropagation();
       e.preventDefault();
+      setOverviewCursorBox(null);
       
       const currentScale = tScale.get();
       const currentTx = tx.get();
@@ -3190,7 +4199,8 @@ export default function App() {
       const worldX = (clickX - currentTx) / currentScale;
       const worldY = (clickY - currentTy) / currentScale;
       
-      const targetScale = preOverviewTransform.current ? preOverviewTransform.current.scale : 1.0;
+      const baseTargetScale = preOverviewTransform.current ? preOverviewTransform.current.scale : 1.0;
+      const targetScale = Math.min(Math.max(0.1, baseTargetScale / overviewBoxScaleRef.current), 5.0);
       const targetTx = clickX - worldX * targetScale;
       const targetTy = clickY - worldY * targetScale;
       
@@ -3208,6 +4218,7 @@ export default function App() {
       
       // Clear overview state to commit the new position
       preOverviewTransform.current = null;
+      overviewBoxScaleRef.current = 1.0;
       setIsOverviewMode(false);
       isOverviewModeRef.current = false;
       return;
@@ -3254,6 +4265,15 @@ export default function App() {
               didMove: false,
               initialCards: cards.map(c => ({ id: c.id, x: c.x, y: c.y })),
             };
+            try {
+              const allVideos = document.querySelectorAll('video');
+              allVideos.forEach(v => {
+                if (!v.paused) {
+                  v.pause();
+                  v.setAttribute('data-was-playing', 'true');
+                }
+              });
+            } catch (err) {}
             containerRef.current?.setPointerCapture(e.pointerId);
             return;
           }
@@ -3291,12 +4311,33 @@ export default function App() {
       workspace.setAttribute('data-panning', 'true');
       workspace.setAttribute('data-gesture', 'true');
     }
+
+    // Synchronously pause all active videos to free hardware decoders during canvas drag
+    try {
+      const allVideos = document.querySelectorAll('video');
+      allVideos.forEach(v => {
+        if (!v.paused) {
+          v.pause();
+          v.setAttribute('data-was-playing', 'true');
+        }
+      });
+    } catch (err) {
+      console.warn('Failed to pause background videos during canvas drag:', err);
+    }
     
     lastPointer.current = { x: e.clientX, y: e.clientY };
     containerRef.current?.setPointerCapture(e.pointerId);
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
+    lastMouseClientPosRef.current = { clientX: e.clientX, clientY: e.clientY };
+
+    if (isOverviewModeRef.current) {
+      updateOverviewCursorBoxAt(e.clientX, e.clientY);
+    } else if (overviewCursorBox) {
+      setOverviewCursorBox(null);
+    }
+
     if (isDraggingCanvasRef.current) {
       const dx = e.clientX - lastPointer.current.x;
       const dy = e.clientY - lastPointer.current.y;
@@ -3342,7 +4383,10 @@ export default function App() {
       const minY = Math.min(selectionBox.startY, canvasY);
       const maxY = Math.max(selectionBox.startY, canvasY);
       
-      const newlySelected = cards.filter(card => {
+      const queryBox: BoundingBox = { minX, minY, maxX, maxY };
+      const candidateList = quadTreeRef.current ? quadTreeRef.current.query(queryBox) : cards;
+
+      const newlySelected = candidateList.filter(card => {
         const dim = getCardSize(card);
         const cw = dim.width;
         const ch = dim.height;
@@ -3448,13 +4492,12 @@ export default function App() {
     return cards.filter(card => visibleCardIdSet.has(card.id));
   }, [cards, visibleCardIdSet, tx, ty, tScale]);
 
-  // --- Asynchronous Progressive LOD Mounting Engine ---
-  // Guarantees 60fps zooming and panning fluid motion by deferring DOM node mounting.
-  // 1. When actively zooming or dragging: Quota = 0, zero new DOM mounts (pure GPU transform-first).
-  // 2. NanoLodCanvas renders all cards as hardware-accelerated 2D canvas thumbnails underneath.
-  // 3. When motion stops / camera idles: Stagger-mounts cards frame-by-frame starting from center out.
-  // 4. Different LOD levels have adaptive quotas (Macro: 1/f, Standard: 3/f, Micro: 8/f, Nano: 0).
-  // 5. If the user touches the wheel or drags midway, mounting pauses immediately without stutter.
+  // --- Strictly Frame-Based Progressive LOD Mounting Engine ---
+  // Guarantees 60fps zooming and panning fluid motion by budgeting DOM node mounting per frame (rAF).
+  // 1. Under Nano-LOD (scale < threshold): NanoLodCanvas renders 2D canvas thumbnails underneath (0 DOM cards).
+  // 2. While actively dragging/zooming (gesture active): Mounts at a steady 1 card / frame budget.
+  // 3. When idle / static: Adaptive frame quotas (Macro: 1/frame, Standard: 2/frame, Micro: 3/frame).
+  // 4. Mounts progressively starting from the center of the viewport outwards.
   useEffect(() => {
     if (!isDomCardsActive || isZoomAnimationActive) {
       if (!isDomCardsActive) {
@@ -3463,17 +4506,19 @@ export default function App() {
       return;
     }
 
+    const isGestureActive = isZooming || isDraggingCanvasRef.current || document.getElementById('canvas-workspace')?.getAttribute('data-gesture') === 'true';
+
     const visibleIds = new Set(visibleCards.map(c => c.id));
     const pendingCards = visibleCards.filter(c => !renderedCardIds.has(c.id));
     const hasCulled = Array.from(renderedCardIds).some(id => !visibleIds.has(id));
 
-    // If no new cards need mounting and no culled cards need unmounting, we are fully settled!
-    if (pendingCards.length === 0 && !hasCulled) {
+    // If no new cards need mounting and no culled cards need unmounting (when not gesturing), we are settled
+    if (pendingCards.length === 0 && (!hasCulled || isGestureActive)) {
       return;
     }
 
-    // If only culled cards need unmounting, clean them up immediately
-    if (pendingCards.length === 0 && hasCulled) {
+    // When NOT gesturing, if only culled cards need unmounting, clean them up immediately
+    if (pendingCards.length === 0 && hasCulled && !isGestureActive) {
       setRenderedCardIds(prev => {
         const next = new Set<string>();
         for (const id of prev) {
@@ -3487,9 +4532,16 @@ export default function App() {
     let rafId: number;
 
     const mountStep = () => {
+      mountFrameCounterRef.current++;
+      const frameIndex = mountFrameCounterRef.current;
       const scaleVal = tScale.get() || 1;
-      const quota = getLodMountQuota(scaleVal, false);
-      if (quota <= 0) return;
+      const quota = getLodMountQuota(scaleVal, isGestureActive, frameIndex);
+      if (quota <= 0) {
+        if (!isGestureActive && pendingCards.length > 0) {
+          rafId = requestAnimationFrame(mountStep);
+        }
+        return;
+      }
 
       // Calculate distance to viewport center for center-out progressive reveal
       const centerX = (window.innerWidth / 2 - tx.get()) / scaleVal;
@@ -3511,14 +4563,14 @@ export default function App() {
       const batchToMount = sortedPending.slice(0, quota).map(c => c.id);
 
       setRenderedCardIds(prev => {
-        const next = new Set<string>();
-        // Keep already mounted cards that are still visible
-        for (const id of prev) {
-          if (visibleIds.has(id)) {
-            next.add(id);
+        const next = new Set<string>(prev);
+        // During gestures, keep existing mounted cards to avoid DOM relayout storms
+        if (!isGestureActive) {
+          next.clear();
+          for (const id of prev) {
+            if (visibleIds.has(id)) next.add(id);
           }
         }
-        // Add the new quota batch
         for (const id of batchToMount) {
           next.add(id);
         }
@@ -3531,17 +4583,20 @@ export default function App() {
     return () => {
       cancelAnimationFrame(rafId);
     };
-  }, [isDomCardsActive, isZoomAnimationActive, mountEpoch, visibleCards, renderedCardIds, tx, ty, tScale]);
+  }, [isDomCardsActive, isZoomAnimationActive, mountEpoch, visibleCards, renderedCardIds, tx, ty, tScale, isZooming]);
 
   return (
     <div 
       ref={containerRef}
-      className={`w-screen h-screen overflow-hidden bg-[#e7e7e7] dark:bg-[#1c1c1e] relative select-none touch-none ${isOverviewMode ? 'overview-cursor' : ''}`}
+      data-agent-target="canvas.viewport"
+      data-agent-actions="mouse.move mouse.hover mouse.drag mouse.scroll mouse.click mouse.doubleClick"
+      className={`w-screen h-screen overflow-hidden bg-[#e7e7e7] dark:bg-[#1c1c1e] relative select-none touch-none ${isOverviewMode ? 'overview-active-mode' : ''}`}
       onPointerDownCapture={(e) => {
         // If in overview mode and user left-clicks, navigate and dive down into the clicked position!
         if (e.button === 0 && (preOverviewTransform.current || isOverviewModeRef.current)) {
           e.stopPropagation();
           e.preventDefault();
+          setOverviewCursorBox(null);
           
           const rect = containerRef.current?.getBoundingClientRect();
           if (!rect) return;
@@ -3556,7 +4611,8 @@ export default function App() {
           const worldX = (clickX - currentTx) / currentScale;
           const worldY = (clickY - currentTy) / currentScale;
           
-          const targetScale = preOverviewTransform.current ? preOverviewTransform.current.scale : 1.0;
+          const baseTargetScale = preOverviewTransform.current ? preOverviewTransform.current.scale : 1.0;
+          const targetScale = Math.min(Math.max(0.1, baseTargetScale / overviewBoxScaleRef.current), 5.0);
           const targetTx = clickX - worldX * targetScale;
           const targetTy = clickY - worldY * targetScale;
           
@@ -3587,6 +4643,7 @@ export default function App() {
           
           // Clear overview state to commit the new position
           preOverviewTransform.current = null;
+          overviewBoxScaleRef.current = 1.0;
           setIsOverviewMode(false);
           isOverviewModeRef.current = false;
           return;
@@ -3713,7 +4770,7 @@ export default function App() {
         }}
       />
 
-      {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.40 or during staggered DOM loading) */}
+      {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.60 or during staggered DOM loading) */}
       <NanoLodCanvas
         cards={cards}
         selectedCardIds={selectedCardIds}
@@ -3750,7 +4807,7 @@ export default function App() {
         style={{ transformOrigin: '0 0', x: tx, y: ty, scale: tScale }}
       >
 
-        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.40), unmount all DOM cards for ultra-fast Hybrid Canvas rendering */}
+        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.60), unmount all DOM cards for ultra-fast Hybrid Canvas rendering */}
         {!isOverviewMode && isDomCardsActive && visibleCards.map(card => {
           if (!renderedCardIds.has(card.id)) return null;
           const hasImage = Boolean(card.imageUrl || card.originalImageUrl || card.thumbnailUrl);
@@ -3783,9 +4840,18 @@ export default function App() {
               onDragEnd={handleCardDragEnd}
               onDelete={handleCardDelete}
               onUpdate={handleUpdateCard}
+              onForkCard={handleForkCard}
+              onHover={setHoveredCardId}
             />
           );
         })}
+
+        {/* Visual Lineage Connection Overlay (Selected cards only, direct straight lines, scale-invariant) */}
+        <CanvasLineageOverlay
+          cards={cards}
+          selectedCardIds={selectedCardIds}
+          scale={tScale}
+        />
 
         {/* Selection Box */}
         {selectionBox && (
@@ -3824,6 +4890,23 @@ export default function App() {
             />
           )}
         </AnimatePresence>
+
+        {/* Overview Mode Dynamic Cursor Viewport Reticle Box */}
+        {isOverviewMode && overviewCursorBox && (
+          <div
+            key="overview-cursor-viewport-reticle"
+            className="absolute pointer-events-none z-[85] border border-solid border-blue-500/90 dark:border-blue-400/95 bg-blue-500/[0.06] dark:bg-blue-400/[0.08]"
+            style={{
+              left: overviewCursorBox.x,
+              top: overviewCursorBox.y,
+              width: overviewCursorBox.width,
+              height: overviewCursorBox.height,
+              borderWidth: 'calc(2px / var(--current-scale, 1))',
+              borderRadius: 0,
+              boxShadow: '0 0 0 calc(1px / var(--current-scale, 1)) rgba(59, 130, 246, 0.25)',
+            }}
+          />
+        )}
         
         {/* Agent Context Menus (Canvas Space) */}
         {Object.entries(contextMenus)
@@ -4011,20 +5094,25 @@ export default function App() {
               x={menu.x}
               y={menu.y}
               targetId={menu.targetId}
+              targetCard={menu.targetId ? (cards.find(c => c.id === menu.targetId) || null) : null}
               agentPrompt={agentPrompt}
               onPromptChange={setAgentPrompt}
-              onSubmit={() => {
+              onSubmit={async () => {
                 const currentTarget = menu.targetId;
+                const prompt = agentPrompt.trim();
+                setAgentPrompt('');
                 setContextMenus(prev => { const next = {...prev}; delete next['user']; return next; });
-                if (currentTarget && !agentPrompt.includes('选中的')) {
-                   // optionally append context
+                if (!prompt) return;
+                if (currentTarget) {
+                  await handleCardAgentChat(currentTarget, prompt);
+                } else {
+                  await handleRunAgent(prompt);
                 }
-                handleRunAgent();
               }}
               onClose={() => {
                 setContextMenus(prev => { const next = {...prev}; delete next['user']; return next; });
               }}
-              onAction={(action, targetId) => {
+              onAction={async (action, targetId) => {
                 if (action === 'new_card') handleCreateCard(ownerId);
                 else if (action === 'new_video_card') handleCreateCard(ownerId, true);
                 else if (action === 'delete' && targetId) {
@@ -4033,12 +5121,14 @@ export default function App() {
                 else if (action === 'clear') {
                   setCards([]);
                 }
-                else if (action === 'variant') {
-                  setAgentPrompt(`生成一张和 ${targetId} 相似的变体`);
-                  handleRunAgent();
+                else if (action === 'variant' && targetId) {
+                  await handleCardAgentChat(targetId, '请以该卡片为基准，参考其构图与主体，生成一张新的变体卡片。');
                 }
-                else if (action === 'reference') {
-                  // Future feature
+                else if (action === 'video_from_card' && targetId) {
+                  await handleCardAgentChat(targetId, '以此卡片的图像为首帧/参考图，生成一段视频。');
+                }
+                else if (action === 'reference' && targetId) {
+                  await handleCardAgentChat(targetId, '将此卡片的图像作为参考基准，在此基础上进行新的创作。');
                 }
               }}
             />

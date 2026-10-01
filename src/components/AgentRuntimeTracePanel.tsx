@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Braces, CheckCircle2, CircleAlert, Clock3, Eye, MousePointer2, Send, TerminalSquare, Wrench } from 'lucide-react';
+import { Braces, CheckCircle2, CircleAlert, Clock3, Cpu, Eye, MousePointer2, Send, TerminalSquare, Wrench } from 'lucide-react';
 import type { AgentRuntimeTrace, AgentTurnTrace } from '../agent/debugTrace';
 import type { RuntimeEvent } from '../agent/runtime';
 
@@ -7,7 +7,7 @@ interface AgentRuntimeTracePanelProps {
   traces: AgentRuntimeTrace[];
 }
 
-type DetailTab = 'prompt' | 'output' | 'tools' | 'task';
+type DetailTab = 'prompt' | 'output' | 'tools' | 'task' | 'stateNode';
 
 const json = (value: unknown) => JSON.stringify(value, null, 2);
 const clock = (value?: number) => value ? new Date(value).toLocaleTimeString('zh-CN', { hour12: false }) : '进行中';
@@ -87,10 +87,23 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
           {turns.map(item => {
             const active = item.id === turn?.id;
             const toolCount = item.parsedResult?.toolCalls?.length || 0;
-            return <button key={item.id} onClick={() => setSelectedTurnId(item.id)} className={`w-full rounded-xl border p-3 text-left ${active ? 'border-violet-300 bg-violet-50 dark:border-violet-500/50 dark:bg-violet-500' : 'border-slate-200 bg-gray-100 hover:border-slate-300 dark:border-white/10 dark:bg-white/[.03]'}`}>
+            return <button key={item.id} onClick={() => setSelectedTurnId(item.id)} className={`w-full rounded-xl border p-3 text-left transition ${active ? 'border-violet-400 bg-violet-50/80 dark:border-violet-500 dark:bg-violet-950/40' : 'border-slate-200 bg-gray-100 hover:border-slate-300 dark:border-white/10 dark:bg-white/[.03]'}`}>
               <div className="flex items-center justify-between gap-2"><span className="text-xs font-semibold">第 {item.turn} 轮</span><span className="text-[10px] text-slate-400">{duration(item)}</span></div>
               <p className="mt-1 text-[11px] text-slate-500">{item.requireTool ? 'Runtime 要求继续调用工具' : '正常唤醒'}</p>
-              <div className="mt-2 flex items-center gap-2 text-[10px] text-slate-400"><Wrench size={11} />{toolCount} 个工具 {item.error && <span className="text-red-500">· 请求失败</span>}</div>
+              <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] text-slate-400">
+                <span className="flex items-center gap-1"><Wrench size={11} />{toolCount} 个工具</span>
+                {item.stateNodeTrace && (
+                  <span 
+                    onClick={(e) => { e.stopPropagation(); setSelectedTurnId(item.id); setDetailTab('stateNode'); }}
+                    className="inline-flex items-center gap-1 rounded bg-violet-100 px-1.5 py-0.5 font-medium text-violet-700 hover:bg-violet-200 dark:bg-violet-900/60 dark:text-violet-300 dark:hover:bg-violet-800/80"
+                    title="点击查看此轮状态提取节点 Prompt 与输出"
+                  >
+                    <Cpu size={10} />
+                    状态节点
+                  </span>
+                )}
+                {item.error && <span className="text-red-500">· 请求失败</span>}
+              </div>
             </button>;
           })}
         </div>
@@ -102,6 +115,7 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
             ['prompt', Braces, '实际 Prompt'],
             ['output', Send, '模型输出'],
             ['tools', Wrench, '工具与组件'],
+            ['stateNode', Cpu, '认知状态提取节点'],
             ['task', CheckCircle2, '任务快照'],
           ] as const).map(([key, Icon, label]) => <button key={key} onClick={() => setDetailTab(key)} className={`flex h-8 items-center gap-1.5 rounded-lg px-3 text-xs ${detailTab === key ? 'bg-slate-100 font-medium text-slate-900 dark:bg-white/10 dark:text-white' : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}><Icon size={13} />{label}</button>)}
           <div className="ml-auto text-[10px] text-slate-400">{turn ? `${clock(turn.startedAt)} · ${duration(turn)}` : ''}</div>
@@ -126,6 +140,21 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
           {turn && detailTab === 'tools' && <div className="space-y-3">
             <TraceNotice icon={<MousePointer2 size={15} />} title="组件与鼠标动作的来源" text="工具输入的 targetId 来自本轮之前的 page.inspect；ui.actAndObserve 的输出会包含动作后的 page.inspect。展开记录可查看完整 JSON、可见组件坐标与页面状态。" />
             {turnEvents.length ? turnEvents.map(event => <ToolEventCard key={event.id} event={event} />) : <PendingBlock text="本轮尚未产生 Runtime 工具事件。" />}
+          </div>}
+          {turn && detailTab === 'stateNode' && <div className="space-y-4">
+            <TraceNotice
+              icon={<Cpu size={15} />}
+              title="认知状态提取节点（/api/agent/update-state-node）"
+              text="在每轮主循环结束后自动触发运行，解析主 Agent 输出并提取更新认知状态 JSON（标题、目标、小目标、进度、笔记与计划）。"
+            />
+            {turn.stateNodeTrace?.prompt ? (
+              <JsonBlock title="状态节点输入 Prompt" value={turn.stateNodeTrace.prompt} />
+            ) : null}
+            {turn.stateNodeTrace?.response ? (
+              <JsonBlock title="状态节点解析更新结果" value={turn.stateNodeTrace.response} />
+            ) : (
+              <PendingBlock text="本轮尚未产生状态节点更新数据。" />
+            )}
           </div>}
           {turn && detailTab === 'task' && <div className="space-y-4">
             <JsonBlock title="本轮调用前的任务快照（实际注入 task / history 的来源）" value={turn.taskBefore} />

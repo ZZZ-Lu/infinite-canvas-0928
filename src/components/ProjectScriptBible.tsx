@@ -26,7 +26,11 @@ import {
   RefreshCw,
   Cpu,
   Search,
-  Replace
+  Replace,
+  LayoutGrid,
+  Image as ImageIcon,
+  Video,
+  Layers
 } from 'lucide-react';
 
 // Git-like Content-Addressed Storage Utils
@@ -91,12 +95,14 @@ const reconstructText = (blocks: { title: string, hash: string }[]) => {
 import { ScriptProject } from '../types/script';
 import { assetExtractionService } from '../services/assetExtractionService';
 import { ScriptView } from '../agent/scriptTools';
+import { CardData } from './GenerationCard';
 
 type TocItemType = 'episode' | 'scene' | 'chapter' | 'heading' | 'segment';
 
 interface ProjectScriptBibleProps {
   currentProject: ScriptProject;
   projects: ScriptProject[];
+  cards?: CardData[];
   onSelectProject: (projectId: string) => void;
   onCreateProject: (name: string) => void;
   onRenameProject: (projectId: string, newName: string) => void;
@@ -117,12 +123,13 @@ interface ProjectScriptBibleProps {
   onRequestGenerateAsset?: (assetName: string, prompt: string) => void;
 }
 
-type TabType = 'script' | 'assets' | 'universe';
+type TabType = 'script' | 'assets' | 'universe' | 'cards';
 type AssetFilterType = 'all' | 'characters' | 'locations' | 'props';
 
 export function ProjectScriptBible({
   currentProject,
   projects,
+  cards = [],
   onSelectProject,
   onCreateProject,
   onRenameProject,
@@ -1379,6 +1386,27 @@ export function ProjectScriptBible({
                     <Palette className="w-3.5 h-3.5" />
                     画面风格
                   </button>
+
+                  <button
+                    type="button"
+                    data-agent-target="script.view.cards"
+                    data-agent-actions="mouse.move mouse.click mouse.hover"
+                    onClick={() => changeActiveTab('cards')}
+                    aria-selected={activeTab === 'cards'}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl corner-squircle text-xs font-semibold transition-all ${
+                      activeTab === 'cards'
+                        ? 'bg-white dark:bg-neutral-800 text-blue-600 dark:text-blue-400'
+                        : 'text-gray-600 dark:text-neutral-400 hover:text-gray-900 dark:hover:text-neutral-200 hover:bg-white/60 dark:hover:bg-neutral-800/50'
+                    }`}
+                  >
+                    <LayoutGrid className="w-3.5 h-3.5" />
+                    卡片管理
+                    {cards && cards.length > 0 && (
+                      <span className="px-1.5 py-0.2 rounded-full corner-squircle text-[10px] bg-blue-100 dark:bg-blue-950 text-blue-600 dark:text-blue-400 font-bold">
+                        {cards.length}
+                      </span>
+                    )}
+                  </button>
                 </div>
 
                 {/* Right action: Close button */}
@@ -2396,6 +2424,125 @@ export function ProjectScriptBible({
                       </div>
                     </div>
                   </div>
+                </div>
+              )}
+
+              {/* TAB 4: CARDS MANAGEMENT */}
+              {activeTab === 'cards' && (
+                <div className="flex flex-col gap-4">
+                  {/* Total Cards Metric Banner */}
+                  <div className="p-4 bg-white dark:bg-neutral-800 rounded-2xl corner-squircle border border-gray-200/60 dark:border-[#404040] space-y-3 shadow-2xs">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-9 h-9 rounded-xl corner-squircle bg-blue-50 dark:bg-blue-950/60 text-blue-600 dark:text-blue-400 flex items-center justify-center">
+                          <LayoutGrid className="w-5 h-5" />
+                        </div>
+                        <div>
+                          <h3 className="text-xs font-bold text-gray-900 dark:text-white">卡片总数</h3>
+                          <p className="text-[11px] text-gray-400">当前项目画布中的所有卡片统计</p>
+                        </div>
+                      </div>
+                      <div className="text-2xl font-black font-mono text-blue-600 dark:text-blue-400">
+                        {cards?.length || 0}
+                      </div>
+                    </div>
+
+                    {/* Sub-metrics breakdown */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-gray-100 dark:border-[#333333]">
+                      <div className="p-2 bg-gray-50 dark:bg-neutral-900/60 rounded-xl corner-squircle flex flex-col gap-0.5">
+                        <span className="text-[10px] text-gray-400 flex items-center gap-1">
+                          <ImageIcon className="w-3 h-3 text-emerald-500" /> 生图卡片
+                        </span>
+                        <span className="text-sm font-bold font-mono text-gray-800 dark:text-neutral-200">
+                          {cards?.filter(c => !c.isVideo).length || 0}
+                        </span>
+                      </div>
+
+                      <div className="p-2 bg-gray-50 dark:bg-neutral-900/60 rounded-xl corner-squircle flex flex-col gap-0.5">
+                        <span className="text-[10px] text-gray-400 flex items-center gap-1">
+                          <Video className="w-3 h-3 text-purple-500" /> 视频卡片
+                        </span>
+                        <span className="text-sm font-bold font-mono text-gray-800 dark:text-neutral-200">
+                          {cards?.filter(c => c.isVideo).length || 0}
+                        </span>
+                      </div>
+
+                      <div className="p-2 bg-gray-50 dark:bg-neutral-900/60 rounded-xl corner-squircle flex flex-col gap-0.5">
+                        <span className="text-[10px] text-gray-400 flex items-center gap-1">
+                          <Check className="w-3 h-3 text-blue-500" /> 已就绪
+                        </span>
+                        <span className="text-sm font-bold font-mono text-gray-800 dark:text-neutral-200">
+                          {cards?.filter(c => c.state === 'completed' || Boolean(c.imageUrl)).length || 0}
+                        </span>
+                      </div>
+
+                      <div className="p-2 bg-gray-50 dark:bg-neutral-900/60 rounded-xl corner-squircle flex flex-col gap-0.5">
+                        <span className="text-[10px] text-gray-400 flex items-center gap-1">
+                          <Sparkles className="w-3 h-3 text-amber-500" /> 草稿待生
+                        </span>
+                        <span className="text-sm font-bold font-mono text-gray-800 dark:text-neutral-200">
+                          {cards?.filter(c => c.state === 'draft' && !c.imageUrl).length || 0}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Cards Overview List */}
+                  {cards && cards.length > 0 ? (
+                    <div className="flex flex-col gap-2">
+                      <div className="text-[11px] font-semibold text-gray-400 px-1">卡片概览清单</div>
+                      <div className="flex flex-col gap-1.5 max-h-[380px] overflow-y-auto pr-1">
+                        {cards.map((card, index) => (
+                          <div
+                            key={card.id}
+                            className="p-2.5 bg-white dark:bg-neutral-800 rounded-xl corner-squircle border border-gray-200/60 dark:border-[#404040] flex items-center justify-between gap-3 shadow-2xs hover:border-blue-400/50 transition-colors"
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                              <span className="w-5 text-center text-[10px] font-mono text-gray-400">#{index + 1}</span>
+                              <div className="w-9 h-9 rounded-lg corner-squircle overflow-hidden bg-gray-100 dark:bg-neutral-900 shrink-0 border border-black/5 flex items-center justify-center">
+                                {card.thumbnailUrl || card.imageUrl ? (
+                                  <img src={card.thumbnailUrl || card.imageUrl!} alt="" className="w-full h-full object-cover" />
+                                ) : card.isVideo ? (
+                                  <Video className="w-4 h-4 text-purple-400" />
+                                ) : (
+                                  <ImageIcon className="w-4 h-4 text-gray-400" />
+                                )}
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="text-xs font-semibold text-gray-800 dark:text-neutral-200 truncate">
+                                    {card.prompt || (card.isVideo ? '未命名生视频卡片' : '未命名生图卡片')}
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-1 text-[10px] text-gray-400">
+                                  <span className="font-mono">{card.ratio || '3:4'}</span>
+                                  <span>·</span>
+                                  <span className="font-mono">{card.res || '2K'}</span>
+                                  <span>·</span>
+                                  <span>{card.isVideo ? '视频' : '图像'}</span>
+                                </div>
+                              </div>
+                            </div>
+                            <span className={`px-2 py-0.5 rounded-md text-[10px] font-medium whitespace-nowrap ${
+                              card.state === 'completed' || card.imageUrl
+                                ? 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-600 dark:text-emerald-400'
+                                : card.state === 'generating'
+                                ? 'bg-blue-50 dark:bg-blue-950/50 text-blue-600 dark:text-blue-400'
+                                : 'bg-gray-100 dark:bg-neutral-700 text-gray-500 dark:text-neutral-400'
+                            }`}>
+                              {card.state === 'completed' || card.imageUrl ? '已就绪' : card.state === 'generating' ? '生成中' : '草稿'}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="p-8 bg-white dark:bg-neutral-800 rounded-2xl corner-squircle border border-gray-200/60 dark:border-[#404040] text-center space-y-2 shadow-2xs">
+                      <LayoutGrid className="w-8 h-8 text-gray-300 dark:text-neutral-600 mx-auto" />
+                      <p className="text-xs font-medium text-gray-600 dark:text-neutral-300">当前项目暂无卡片</p>
+                      <p className="text-[11px] text-gray-400">可在画布上空白处右键新建卡片</p>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

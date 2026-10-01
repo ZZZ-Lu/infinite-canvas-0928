@@ -8,6 +8,8 @@ import {
 } from '../utils/thumbnail';
 import { calculateObjectCover, fullImageCache } from '../utils/imageTextureCache';
 import { getNanoLodThreshold } from '../utils/viewportCulling';
+import { getBottomPanelHeight, getPromptAreaHeight, calculatePromptLines } from '../utils/cardLayout';
+import { buildCardQuadTree, QuadTree, BoundingBox } from '../utils/quadTree';
 
 export interface NanoLodCanvasProps {
   cards: CardData[];
@@ -44,6 +46,70 @@ interface BakedSnapshot {
   selectedKey: string;
 }
 
+function drawCardBottomPanel(
+  ctx: CanvasRenderingContext2D,
+  card: CardData,
+  cardX: number,
+  cardY: number,
+  cardW: number,
+  cardH: number,
+  dark: boolean,
+  isSelected: boolean,
+  borderSelected: string,
+  borderNormal: string,
+  selectedLineWidth: number,
+  normalLineWidth: number
+) {
+  const panelW = 480;
+
+  const refCount = card.referenceImages?.length || 0;
+  const refRows = Math.ceil((refCount + 1) / 8);
+  const refSectionHeight = refRows * 56;
+
+  const promptAreaHeight = getPromptAreaHeight(card.prompt);
+  const displayLineCount = Math.max(1, Math.min(13, Math.round(promptAreaHeight / 22)));
+
+  // Get unified panel height matching Full Detail & MicroLOD exactly
+  const panelH = getBottomPanelHeight(card.prompt, card.referenceImages?.length);
+  const panelX = cardX + (cardW - panelW) / 2;
+  const panelY = cardY + cardH + 12; // 12px gap matching flex flex-col gap-3 in DOM
+
+  // Background fill (sharp straight edges / no border radius in Low LOD)
+  ctx.fillStyle = dark ? '#262626' : '#f3f4f6';
+  ctx.fillRect(panelX, panelY, panelW, panelH);
+
+  // Border
+  ctx.strokeStyle = isSelected ? borderSelected : borderNormal;
+  ctx.lineWidth = isSelected ? selectedLineWidth : normalLineWidth;
+  ctx.strokeRect(panelX, panelY, panelW, panelH);
+
+  // Internal skeleton color blocks (sharp straight edges / no border radius in Low LOD)
+  ctx.fillStyle = dark ? '#383838' : '#e2e8f0';
+  let curY = panelY + 17; // 1px border + 16px padding
+
+  // 1) Reference images skeleton (ALWAYS rendered, including plus button)
+  for (let r = 0; r < refRows; r++) {
+    const itemsInRow = Math.min(refCount + 1 - r * 8, 8);
+    for (let i = 0; i < itemsInRow; i++) {
+      ctx.fillRect(panelX + 16 + i * 56, curY + r * 56, 48, 48);
+    }
+  }
+  curY += refSectionHeight; // includes row height + outer gap-2 (8px)
+
+  // 2) Prompt text skeleton lines (mt-1 = 4px offset)
+  curY += 4;
+  const textTopOffset = curY + (promptAreaHeight - displayLineCount * 18) / 2;
+  for (let i = 0; i < displayLineCount; i++) {
+    const lw = (i === displayLineCount - 1 && displayLineCount > 1) ? panelW * 0.55 : panelW * 0.85;
+    ctx.fillRect(panelX + 16, textTopOffset + i * 22, lw, 14);
+  }
+
+  // 3) Controls bottom bar (mt-2 pt-2 border-t)
+  const actionBarY = panelY + panelH - 17 - 32;
+  ctx.fillRect(panelX + 16, actionBarY + 2, 140, 28);
+  ctx.fillRect(panelX + panelW - 48, actionBarY, 32, 32);
+}
+
 export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function NanoLodCanvas({
   cards,
   selectedCardIds,
@@ -63,6 +129,12 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   const rafIdRef = useRef<number | null>(null);
   const pendingThumbGenRef = useRef<Set<string>>(new Set());
   const bakedSnapshotRef = useRef<BakedSnapshot | null>(null);
+  const quadTreeRef = useRef<QuadTree<CardData> | null>(null);
+
+  // Synchronize QuadTree spatial index on cards change
+  useEffect(() => {
+    quadTreeRef.current = buildCardQuadTree(cards);
+  }, [cards]);
 
   // Store latest props in refs to avoid re-binding change listeners on every render
   const cardsRef = useRef(cards);
@@ -115,15 +187,21 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       return cached;
     }
 
-    // 1. Calculate overall world bounding box
+    // 1. Calculate overall world bounding box including bottom panels
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (let i = 0; i < currentCards.length; i++) {
       const card = currentCards[i];
       const dim = getCardSize(card);
-      if (card.x < minX) minX = card.x;
+      const isGenerationCard = !card.fileName && !card.isAsset;
+      const panelH = isGenerationCard ? getBottomPanelHeight(card.prompt, card.referenceImages?.length) + 12 : 0;
+      const panelW = 480;
+      const effectiveLeft = Math.min(card.x, isGenerationCard ? card.x + (dim.width - panelW) / 2 : card.x);
+      const effectiveRight = Math.max(card.x + dim.width, isGenerationCard ? card.x + (dim.width + panelW) / 2 : card.x + dim.width);
+
+      if (effectiveLeft < minX) minX = effectiveLeft;
       if (card.y < minY) minY = card.y;
-      if (card.x + dim.width > maxX) maxX = card.x + dim.width;
-      if (card.y + dim.height > maxY) maxY = card.y + dim.height;
+      if (effectiveRight > maxX) maxX = effectiveRight;
+      if (card.y + dim.height + panelH > maxY) maxY = card.y + dim.height + panelH;
     }
     if (minX === Infinity) return null;
 
@@ -215,6 +293,25 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       offCtx.strokeStyle = isSelected ? borderSelected : borderNormal;
       offCtx.lineWidth = isSelected ? selectedLineWidth : normalLineWidth;
       offCtx.strokeRect(card.x, card.y, dim.width, dim.height);
+
+      // 4. Bottom Panel Skeleton Color Block for Generation Cards in Overview Mode
+      const isGenerationCard = !card.fileName && !card.isAsset;
+      if (isGenerationCard) {
+        drawCardBottomPanel(
+          offCtx,
+          card,
+          card.x,
+          card.y,
+          dim.width,
+          dim.height,
+          dark,
+          isSelected,
+          borderSelected,
+          borderNormal,
+          selectedLineWidth,
+          normalLineWidth
+        );
+      }
     }
 
     offCtx.restore();
@@ -330,8 +427,18 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     const unselectedCards: CardData[] = [];
     const selectedCards: CardData[] = [];
 
-    for (let i = 0; i < currentCards.length; i++) {
-      const card = currentCards[i];
+    // Rapid QuadTree spatial query in O(log N + K) time
+    const queryMargin = 100 / currentScale;
+    const vpBounds: BoundingBox = {
+      minX: vpLeft - queryMargin,
+      minY: vpTop - queryMargin,
+      maxX: vpRight + queryMargin,
+      maxY: vpBottom + queryMargin,
+    };
+    const candidateCards = quadTreeRef.current ? quadTreeRef.current.query(vpBounds) : currentCards;
+
+    for (let i = 0; i < candidateCards.length; i++) {
+      const card = candidateCards[i];
       const dim = getCardSize(card);
 
       // Determine real-time dragging position for visibility test
@@ -521,6 +628,25 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         ctx.lineWidth = normalLineWidth;
       }
       ctx.strokeRect(cardX, cardY, dim.width, dim.height);
+
+      // 3b. Bottom Panel Skeleton Color Block for Generation Cards in 2D Canvas Mode
+      const isGenerationCard = !card.fileName && !card.isAsset;
+      if (isGenerationCard) {
+        drawCardBottomPanel(
+          ctx,
+          card,
+          cardX,
+          cardY,
+          dim.width,
+          dim.height,
+          dark,
+          isSelected,
+          borderSelected,
+          borderNormal,
+          selectedLineWidth,
+          normalLineWidth
+        );
+      }
 
       // 4. Center indicator / video play badge
       const screenW = dim.width * currentScale;

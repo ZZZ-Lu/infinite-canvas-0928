@@ -1,5 +1,7 @@
 import { Router, Request, Response } from 'express';
 import COS from 'cos-nodejs-sdk-v5';
+import fs from 'fs';
+import path from 'path';
 import {
   WORKRALLY_IMAGE_MODELS,
   WORKRALLY_IMAGE_RATIOS,
@@ -16,6 +18,45 @@ import {
 export const mcpRouter = Router();
 
 const DEFAULT_MCP_URL = 'https://workrally.qq.com/zenstudio/api/mcp';
+const MCP_CACHE_FILE = path.join(process.cwd(), '.mcp_last_known.json');
+
+function loadPersistedMcp(): { token: string; serverUrl: string; lastUpdated: number } {
+  try {
+    if (fs.existsSync(MCP_CACHE_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(MCP_CACHE_FILE, 'utf-8'));
+      if (parsed && typeof parsed.token === 'string') return parsed;
+    }
+  } catch {}
+  return { token: '', serverUrl: DEFAULT_MCP_URL, lastUpdated: 0 };
+}
+
+function persistMcpCredentials(token: string, serverUrl: string) {
+  try {
+    if (token) {
+      fs.writeFileSync(MCP_CACHE_FILE, JSON.stringify({ token, serverUrl, lastUpdated: Date.now() }));
+    }
+  } catch {}
+}
+
+// Persisted & in-memory MCP connection credentials & tools cache for ultra-fast task status checking & self-healing media proxy
+let lastKnownMcp = loadPersistedMcp();
+const toolsCache = new Map<string, { tools: any[]; expiresAt: number }>();
+
+async function getCachedTools(serverUrl: string, token: string) {
+  const cacheKey = `${serverUrl}:${token}`;
+  const now = Date.now();
+  const cached = toolsCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.tools;
+  }
+  const toolsResult = await callMcpEndpoint(serverUrl, token, 'tools/list', {});
+  const tools: Array<{ name: string; description: string; inputSchema: any }> = toolsResult?.tools || [];
+  if (tools.length > 0) {
+    toolsCache.set(cacheKey, { tools, expiresAt: now + 3600_000 });
+  }
+  return tools;
+}
+
 const PROMPT_KEYS = ['prompt', 'text', 'query', 'input', 'description'];
 const RATIO_KEYS = ['ratio', 'aspect_ratio', 'aspectRatio', 'size_ratio', 'image_ratio'];
 const RESOLUTION_KEYS = ['resolution', 'res', 'quality', 'definition', 'image_resolution'];
@@ -896,6 +937,51 @@ async function resolveAssetUrl(
   return directUrl || detailsUrl || '';
 }
 
+async function fetchCanvasTaskStatus(
+  url: string,
+  token: string,
+  taskId: string,
+  tools: Array<{ name: string; description: string; inputSchema: any }>,
+  expectedType: 'image' | 'video' = 'image'
+) {
+  const lastResult = await callMcpEndpoint(url, token, 'tools/call', {
+    name: 'canvas_get_task',
+    arguments: { task_id: taskId },
+  });
+
+  const taskText = lastResult?.content?.find((item: any) => item?.type === 'text')?.text;
+  const task = taskText ? parseMaybeJson(taskText) : (lastResult?.structuredContent || lastResult);
+  const asset = task?.output_assets?.[0] || task?.assets?.[0];
+  let mediaUrl = asset?.url || task?.video_url || extractGeneratedMediaUrl(lastResult, expectedType);
+
+  if (mediaUrl) {
+    if (/^https?:\/\/workrally\.qq\.com\/s\//i.test(mediaUrl)) {
+      const redirected = await resolveWorkRallyShareUrl(mediaUrl);
+      if (redirected && !isExpiredSignedMediaUrl(redirected)) {
+        return { completed: true, mediaUrl: redirected, result: lastResult };
+      }
+    } else if (!isExpiredSignedMediaUrl(mediaUrl)) {
+      return { completed: true, mediaUrl, result: lastResult };
+    }
+  }
+
+  const assetId = asset?.asset_id || asset?.id || extractAssetId(lastResult);
+  const status = String(task?.status || lastResult?.structuredContent?.status || '').toLowerCase();
+
+  if ((status === 'success' || status === 'completed' || status === '4' || mediaUrl || assetId) && assetId) {
+    const assetUrl = await resolveAssetUrl(url, token, assetId, tools, expectedType);
+    if (assetUrl && !isExpiredSignedMediaUrl(assetUrl)) return { completed: true, mediaUrl: assetUrl, result: lastResult };
+    const redirectedUrl = await resolveWorkRallyShareUrl(extractWorkRallyShareUrl(lastResult));
+    if (redirectedUrl && !isExpiredSignedMediaUrl(redirectedUrl)) return { completed: true, mediaUrl: redirectedUrl, result: lastResult };
+    if (mediaUrl) throw new Error(`WorkRally 视频链接已过期，未能刷新素材地址（asset_id: ${assetId}）`);
+  }
+
+  const failure = getTaskFailure(lastResult);
+  if (failure) return { failed: true, error: failure, result: lastResult };
+
+  return { pending: true, taskId, status: task?.status || 'running', result: lastResult };
+}
+
 async function pollCanvasTask(
   url: string,
   token: string,
@@ -905,46 +991,17 @@ async function pollCanvasTask(
   expectedType: 'image' | 'video' = 'image'
 ) {
   const deadline = Date.now() + timeoutMs;
-  let lastResult: any = null;
   while (Date.now() < deadline) {
-    lastResult = await callMcpEndpoint(url, token, 'tools/call', {
-      name: 'canvas_get_task',
-      arguments: { task_id: taskId },
-    });
-
-    const taskText = lastResult?.content?.find((item: any) => item?.type === 'text')?.text;
-    const task = taskText ? parseMaybeJson(taskText) : (lastResult?.structuredContent || lastResult);
-    const asset = task?.output_assets?.[0] || task?.assets?.[0];
-    let mediaUrl = asset?.url || task?.video_url || extractGeneratedMediaUrl(lastResult, expectedType);
-
-    if (mediaUrl) {
-      if (/^https?:\/\/workrally\.qq\.com\/s\//i.test(mediaUrl)) {
-        const redirected = await resolveWorkRallyShareUrl(mediaUrl);
-        if (redirected && !isExpiredSignedMediaUrl(redirected)) {
-          return { mediaUrl: redirected, result: lastResult };
-        }
-      } else if (!isExpiredSignedMediaUrl(mediaUrl)) {
-        return { mediaUrl, result: lastResult };
-      }
+    const res = await fetchCanvasTaskStatus(url, token, taskId, tools, expectedType);
+    if (res.completed && res.mediaUrl) {
+      return { mediaUrl: res.mediaUrl, result: res.result };
     }
-    
-    const assetId = asset?.asset_id || asset?.id || extractAssetId(lastResult);
-    const status = String(task?.status || lastResult?.structuredContent?.status || '').toLowerCase();
-    
-    if ((status === 'success' || mediaUrl || assetId) && assetId) {
-      const assetUrl = await resolveAssetUrl(url, token, assetId, tools, expectedType);
-      if (assetUrl && !isExpiredSignedMediaUrl(assetUrl)) return { mediaUrl: assetUrl, result: lastResult };
-      const redirectedUrl = await resolveWorkRallyShareUrl(extractWorkRallyShareUrl(lastResult));
-      if (redirectedUrl && !isExpiredSignedMediaUrl(redirectedUrl)) return { mediaUrl: redirectedUrl, result: lastResult };
-      if (mediaUrl) throw new Error(`WorkRally 视频链接已过期，未能刷新素材地址（asset_id: ${assetId}）`);
-      throw new Error(`WorkRally 已生成素材，但未能取得可访问的图片地址（asset_id: ${assetId}）`);
+    if (res.failed) {
+      throw new Error(res.error || 'WorkRally 任务执行失败');
     }
-    if (mediaUrl) throw new Error('WorkRally 媒体链接已过期，任务未提供可刷新素材 ID');
-    const failure = getTaskFailure(lastResult);
-    if (failure) throw new Error(failure);
-    await wait(3000);
+    await wait(2500);
   }
-  throw new Error(`WorkRally 生图任务等待超时（task_id: ${taskId}）`);
+  throw new Error(`WorkRally 任务等待超时（task_id: ${taskId}）`);
 }
 
 function buildGenerationArgs(targetTool: any, input: {
@@ -971,7 +1028,11 @@ function buildGenerationArgs(targetTool: any, input: {
 
   const modelKey = Object.entries(schemaProps).find(([name, schema]) => isLikelyModelField(name, schema))?.[0];
   if (modelKey) {
-    const rawModel = input.model || findFirstEnumDefault(schemaProps[modelKey]) || '';
+    let rawModel = (input.model || '').trim() || findFirstEnumDefault(schemaProps[modelKey]) || '';
+    if (!rawModel) {
+      const isVideoTool = targetTool.name.includes('video') || /(video|t2v|i2v)/i.test(targetTool.description || '');
+      rawModel = isVideoTool ? WORKRALLY_VIDEO_MODELS[0].id : WORKRALLY_IMAGE_MODELS[0].id;
+    }
     args[modelKey] = coerceModelForSchema(rawModel, schemaProps[modelKey]);
   }
 
@@ -1277,6 +1338,9 @@ mcpRouter.post('/generate', async (req: Request, res: Response) => {
     });
   }
 
+  lastKnownMcp = { token, serverUrl, lastUpdated: Date.now() };
+  persistMcpCredentials(token, serverUrl);
+
   if (!prompt || typeof prompt !== 'string') {
     return res.status(400).json({
       success: false,
@@ -1373,27 +1437,70 @@ mcpRouter.post('/task', async (req: Request, res: Response) => {
   const serverUrl = req.body?.serverUrl || DEFAULT_MCP_URL;
   const taskId = String(req.body?.taskId || '');
   const isVideo = Boolean(req.body?.isVideo);
+  const shouldBlock = Boolean(req.body?.blocking);
 
   if (!token || !taskId) {
     return res.status(400).json({ success: false, error: '缺少 WorkRally Token 或任务 ID' });
   }
 
+  // Keep lastKnownMcp updated
+  lastKnownMcp = { token, serverUrl, lastUpdated: Date.now() };
+  persistMcpCredentials(token, serverUrl);
+
   try {
-    const toolsResult = await callMcpEndpoint(serverUrl, token, 'tools/list', {});
-    const tools: Array<{ name: string; description: string; inputSchema: any }> = toolsResult?.tools || [];
-    const completed = await pollCanvasTask(
+    const tools = await getCachedTools(serverUrl, token);
+
+    if (shouldBlock) {
+      const completed = await pollCanvasTask(
+        serverUrl,
+        token,
+        taskId,
+        tools,
+        isVideo ? 30_000 : 20_000,
+        isVideo ? 'video' : 'image'
+      );
+      return res.json({
+        success: true,
+        completed: true,
+        taskId,
+        mediaUrl: completed.mediaUrl,
+        isVideo,
+      });
+    }
+
+    const taskStatus = await fetchCanvasTaskStatus(
       serverUrl,
       token,
       taskId,
       tools,
-      isVideo ? 600_000 : 120_000,
       isVideo ? 'video' : 'image'
     );
+
+    if (taskStatus.completed && taskStatus.mediaUrl) {
+      return res.json({
+        success: true,
+        completed: true,
+        taskId,
+        mediaUrl: taskStatus.mediaUrl,
+        isVideo,
+      });
+    }
+
+    if (taskStatus.failed) {
+      return res.json({
+        success: false,
+        failed: true,
+        taskId,
+        error: taskStatus.error || '任务生成失败',
+      });
+    }
+
     return res.json({
       success: true,
+      pending: true,
       taskId,
-      mediaUrl: completed.mediaUrl,
       isVideo,
+      status: taskStatus.status,
     });
   } catch (error: any) {
     return res.status(toSafeStatus(error.statusCode)).json({
@@ -1405,28 +1512,128 @@ mcpRouter.post('/task', async (req: Request, res: Response) => {
 });
 
 /**
- * 6. Media proxy endpoint with CORS enabled for client-side canvas/video thumbnail extraction
+ * 6. Media proxy endpoint with CORS enabled for client-side canvas/video streaming & thumbnail extraction
  */
-mcpRouter.get('/proxy-media', async (req: Request, res: Response) => {
-  const targetUrl = String(req.query.url || '');
+mcpRouter.all('/proxy-media', async (req: Request, res: Response) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
+  let targetUrl = String(req.query.url || '');
   if (!targetUrl || !/^https?:\/\//i.test(targetUrl)) {
     return res.status(400).send('Invalid url');
   }
 
+  const taskId = String(req.query.taskId || '') ||
+    targetUrl.match(/(2k[a-z0-9]{6,16})/i)?.[1] ||
+    targetUrl.match(/\/(2k[a-z0-9]+)_MAIN_/i)?.[1] || '';
+
+  const token = String(req.query.token || '') ||
+    (req.headers.authorization ? req.headers.authorization.replace(/^Bearer\s+/i, '') : '') ||
+    lastKnownMcp.token;
+
+  const serverUrl = String(req.query.serverUrl || '') || lastKnownMcp.serverUrl || DEFAULT_MCP_URL;
+
+  if (token) {
+    lastKnownMcp = { token, serverUrl, lastUpdated: Date.now() };
+    persistMcpCredentials(token, serverUrl);
+  }
+
+  const tryRefreshUrl = async (): Promise<string | null> => {
+    if (!taskId || !token) return null;
+    try {
+      const tools = await getCachedTools(serverUrl, token);
+      const taskStatus = await fetchCanvasTaskStatus(serverUrl, token, taskId, tools, 'video');
+      if (taskStatus.completed && taskStatus.mediaUrl && !isExpiredSignedMediaUrl(taskStatus.mediaUrl)) {
+        console.log(`[MCP proxy-media] Successfully auto-healed video URL for task ${taskId}`);
+        return taskStatus.mediaUrl;
+      }
+    } catch (e: any) {
+      console.warn('[MCP proxy-media auto-refresh notice]:', e?.message || e);
+    }
+    return null;
+  };
+
+  // If already known to be expired before fetching, proactively refresh
+  if (isExpiredSignedMediaUrl(targetUrl)) {
+    const refreshed = await tryRefreshUrl();
+    if (refreshed) {
+      targetUrl = refreshed;
+    }
+  }
+
   try {
-    const headers: Record<string, string> = {};
+    // If targetUrl is a WorkRally short-link (/s/...), resolve it first
+    if (/^https?:\/\/workrally\.qq\.com\/s\//i.test(targetUrl)) {
+      const resolved = await resolveWorkRallyShareUrl(targetUrl);
+      if (resolved) targetUrl = resolved;
+    }
+
+    const headers: Record<string, string> = {
+      'Referer': 'https://workrally.qq.com/',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    };
     if (req.headers.range) {
       headers['Range'] = String(req.headers.range);
     }
-    const fetchRes = await fetch(targetUrl, {
+
+    if (req.method === 'HEAD') {
+      let headRes = await fetch(targetUrl, {
+        method: 'HEAD',
+        headers,
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      if ((headRes.status === 403 || headRes.status === 404) && taskId && token) {
+        const refreshed = await tryRefreshUrl();
+        if (refreshed && refreshed !== targetUrl) {
+          targetUrl = refreshed;
+          headRes = await fetch(targetUrl, {
+            method: 'HEAD',
+            headers,
+            signal: AbortSignal.timeout(15_000),
+          });
+        }
+      }
+
+      const ct = headRes.headers.get('content-type') || 'video/mp4';
+      res.setHeader('Content-Type', ct);
+      const cl = headRes.headers.get('content-length');
+      if (cl) res.setHeader('Content-Length', cl);
+      const cr = headRes.headers.get('content-range');
+      if (cr) res.setHeader('Content-Range', cr);
+      const ar = headRes.headers.get('accept-ranges') || 'bytes';
+      res.setHeader('Accept-Ranges', ar);
+      return res.status(headRes.status).end();
+    }
+
+    let fetchRes = await fetch(targetUrl, {
+      method: 'GET',
       headers,
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(600_000),
     });
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', '*');
+    if ((fetchRes.status === 403 || fetchRes.status === 404) && taskId && token) {
+      console.log(`[MCP proxy-media] Received HTTP ${fetchRes.status}, auto-healing media URL for task ${taskId}...`);
+      const refreshed = await tryRefreshUrl();
+      if (refreshed && refreshed !== targetUrl) {
+        targetUrl = refreshed;
+        fetchRes = await fetch(targetUrl, {
+          method: 'GET',
+          headers,
+          signal: AbortSignal.timeout(600_000),
+        });
+      }
+    }
+
     res.setHeader('Cache-Control', 'public, max-age=3600');
+    if (targetUrl) {
+      res.setHeader('X-Refreshed-Media-Url', targetUrl);
+    }
 
     const contentType = fetchRes.headers.get('content-type') || 'video/mp4';
     res.setHeader('Content-Type', contentType);
@@ -1437,8 +1644,8 @@ mcpRouter.get('/proxy-media', async (req: Request, res: Response) => {
     const contentRange = fetchRes.headers.get('content-range');
     if (contentRange) res.setHeader('Content-Range', contentRange);
 
-    const acceptRanges = fetchRes.headers.get('accept-ranges');
-    if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges);
+    const acceptRanges = fetchRes.headers.get('accept-ranges') || 'bytes';
+    res.setHeader('Accept-Ranges', acceptRanges);
 
     res.status(fetchRes.status);
     if (!fetchRes.body) {
@@ -1446,12 +1653,24 @@ mcpRouter.get('/proxy-media', async (req: Request, res: Response) => {
     }
 
     const reader = fetchRes.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(value);
+    req.on('close', () => {
+      reader.cancel().catch(() => {});
+    });
+
+    try {
+      while (true) {
+        if (req.destroyed || res.writableEnded) break;
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(value);
+      }
+    } catch {
+      // client aborted or sought to a different timestamp
+    } finally {
+      if (!res.writableEnded) {
+        res.end();
+      }
     }
-    res.end();
   } catch (err: any) {
     if (!res.headersSent) {
       res.status(500).send(err.message || 'Failed to proxy media');

@@ -116,12 +116,15 @@ export async function generateImageThumbnail(
     if (imageSource instanceof Blob) {
       tempUrl = URL.createObjectURL(imageSource);
       img.src = tempUrl;
-    } else {
+    } else if (typeof imageSource === 'string' && imageSource.trim()) {
       // Allow cross-origin images to be drawn to canvas without tainting
       if (!imageSource.startsWith('data:') && !imageSource.startsWith('blob:')) {
         img.crossOrigin = 'anonymous';
       }
       img.src = imageSource;
+    } else {
+      resolve('');
+      return;
     }
 
     let timeoutId: ReturnType<typeof setTimeout>;
@@ -197,30 +200,36 @@ export async function generateVideoThumbnail(
       resolve('');
       return;
     }
-    const video = document.createElement('video');
-    (video as any).referrerPolicy = 'no-referrer';
-    let tempUrl: string | null = null;
 
-    if (videoSource instanceof Blob) {
-      tempUrl = URL.createObjectURL(videoSource);
-      video.src = tempUrl;
-    } else {
-      let resolvedSrc = videoSource;
-      if (/^https?:\/\//i.test(videoSource) && !videoSource.startsWith(window.location.origin)) {
-        resolvedSrc = `/api/mcp/workrally/proxy-media?url=${encodeURIComponent(videoSource)}`;
+    // Check memory cache first
+    if (typeof videoSource === 'string') {
+      const cached = thumbCache.get(videoSource);
+      if (cached) {
+        resolve(cached);
+        return;
       }
-      if (!resolvedSrc.startsWith('data:') && !resolvedSrc.startsWith('blob:')) {
-        video.crossOrigin = 'anonymous';
-      }
-      video.src = resolvedSrc;
     }
 
+    const video = document.createElement('video');
+    video.style.position = 'fixed';
+    video.style.top = '-9999px';
+    video.style.left = '-9999px';
+    video.style.width = '1px';
+    video.style.height = '1px';
+    video.style.opacity = '0';
+    video.style.pointerEvents = 'none';
+    video.setAttribute('playsinline', '');
+    video.setAttribute('webkit-playsinline', '');
     video.muted = true;
     video.playsInline = true;
     video.preload = 'auto';
+    (video as any).referrerPolicy = 'no-referrer';
 
+    let tempUrl: string | null = null;
+    let isAttached = false;
     let timeoutId: ReturnType<typeof setTimeout>;
     let hasCaptured = false;
+    let seekAttempts = 0;
 
     const cleanup = () => {
       clearTimeout(timeoutId);
@@ -230,22 +239,22 @@ export async function generateVideoThumbnail(
       video.onseeked = null;
       video.ontimeupdate = null;
       video.onerror = null;
-      video.pause();
+      try {
+        video.pause();
+      } catch {}
       video.src = '';
+      if (isAttached && video.parentNode) {
+        video.parentNode.removeChild(video);
+      }
       if (tempUrl) {
         URL.revokeObjectURL(tempUrl);
       }
     };
 
-    timeoutId = setTimeout(() => {
-      cleanup();
-      reject(new Error('Video thumbnail capture timed out'));
-    }, 8000);
-
     const capture = () => {
       if (hasCaptured) return;
       if (!video.videoWidth || !video.videoHeight) return;
-      hasCaptured = true;
+
       try {
         const origW = video.videoWidth || 640;
         const origH = video.videoHeight || 360;
@@ -261,6 +270,35 @@ export async function generateVideoThumbnail(
         }
 
         drawImageHighQuality(ctx, video, tw, th);
+
+        // Black frame detection: check if the frame is completely black (e.g. video starting with black fade)
+        try {
+          const sampleW = Math.min(tw, 20);
+          const sampleH = Math.min(th, 20);
+          const sampleData = ctx.getImageData(
+            Math.floor((tw - sampleW) / 2),
+            Math.floor((th - sampleH) / 2),
+            sampleW,
+            sampleH
+          ).data;
+          let isAllBlack = true;
+          for (let i = 0; i < sampleData.length; i += 4) {
+            if (sampleData[i] > 18 || sampleData[i + 1] > 18 || sampleData[i + 2] > 18) {
+              isAllBlack = false;
+              break;
+            }
+          }
+          // If the sampled center is completely black and the video has enough duration, try seeking to 0.25s
+          if (isAllBlack && seekAttempts < 2 && video.duration && video.duration > 0.3) {
+            seekAttempts++;
+            video.currentTime = 0.25;
+            return;
+          }
+        } catch {
+          // If getImageData has cross-origin or security restriction, continue with toDataURL
+        }
+
+        hasCaptured = true;
         let dataUrl = '';
         try {
           dataUrl = canvas.toDataURL('image/webp', quality);
@@ -271,6 +309,9 @@ export async function generateVideoThumbnail(
           dataUrl = canvas.toDataURL('image/jpeg', quality);
         }
         cleanup();
+        if (typeof videoSource === 'string' && dataUrl) {
+          thumbCache.set(videoSource, dataUrl);
+        }
         resolve(dataUrl);
       } catch (err) {
         cleanup();
@@ -278,27 +319,52 @@ export async function generateVideoThumbnail(
       }
     };
 
-    const trySeek = () => {
-      if (video.duration && video.duration > 0.05 && video.currentTime < 0.04) {
+    timeoutId = setTimeout(() => {
+      if (!hasCaptured && video.videoWidth && video.videoHeight) {
+        hasCaptured = true;
         try {
-          video.currentTime = 0.05;
-        } catch {
-          capture();
-        }
-      } else {
+          const { width: tw, height: th } = getThumbnailDimensions(video.videoWidth, video.videoHeight, maxEdge);
+          const canvas = document.createElement('canvas');
+          canvas.width = tw;
+          canvas.height = th;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            drawImageHighQuality(ctx, video, tw, th);
+            const dataUrl = canvas.toDataURL('image/jpeg', quality);
+            cleanup();
+            if (typeof videoSource === 'string' && dataUrl) {
+              thumbCache.set(videoSource, dataUrl);
+            }
+            resolve(dataUrl);
+            return;
+          }
+        } catch {}
+      }
+      cleanup();
+      reject(new Error('Video thumbnail capture timed out'));
+    }, 8000);
+
+    const triggerSeek = () => {
+      if (hasCaptured) return;
+      if (video.currentTime < 0.04) {
+        try {
+          video.currentTime = 0.08;
+        } catch {}
+      }
+    };
+
+    video.onloadedmetadata = triggerSeek;
+    video.onloadeddata = triggerSeek;
+    video.oncanplay = triggerSeek;
+    video.onseeked = capture;
+    video.ontimeupdate = () => {
+      if (video.currentTime >= 0.05) {
         capture();
       }
     };
 
-    video.onloadedmetadata = trySeek;
-    video.onloadeddata = trySeek;
-    video.oncanplay = trySeek;
-    video.onseeked = capture;
-    video.ontimeupdate = capture;
-
     video.onerror = () => {
       if (video.crossOrigin === 'anonymous' && typeof videoSource === 'string') {
-        // Retry without crossOrigin
         video.removeAttribute('crossOrigin');
         video.src = videoSource;
         video.load();
@@ -307,6 +373,35 @@ export async function generateVideoThumbnail(
       cleanup();
       reject(new Error('Video load failed for thumbnail capture'));
     };
+
+    if (videoSource instanceof Blob) {
+      tempUrl = URL.createObjectURL(videoSource);
+      video.src = tempUrl;
+    } else if (typeof videoSource === 'string' && videoSource.trim()) {
+      let resolvedSrc = videoSource;
+      if (/^https?:\/\//i.test(videoSource) && !videoSource.startsWith(window.location.origin)) {
+        resolvedSrc = `/api/mcp/workrally/proxy-media?url=${encodeURIComponent(videoSource)}`;
+      }
+      if (!resolvedSrc.startsWith('data:') && !resolvedSrc.startsWith('blob:')) {
+        video.crossOrigin = 'anonymous';
+      }
+      video.src = resolvedSrc;
+    } else {
+      resolve('');
+      return;
+    }
+
+    if (typeof document !== 'undefined' && document.body) {
+      document.body.appendChild(video);
+      isAttached = true;
+    }
+
+    video.load();
+
+    const playPromise = video.play();
+    if (playPromise !== undefined) {
+      playPromise.catch(() => {});
+    }
   });
 }
 
