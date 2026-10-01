@@ -1,5 +1,5 @@
-import React, { useEffect, useRef } from 'react';
-import { Sparkles, Image as ImageIcon, Trash2, Wand2, ArrowUp, Video } from 'lucide-react';
+import React, { useEffect } from 'react';
+import { Sparkles, Image as ImageIcon, Trash2, Wand2, Video } from 'lucide-react';
 import { motion } from 'motion/react';
 import type { CardData } from './GenerationCard';
 
@@ -10,23 +10,22 @@ interface AgentContextMenuProps {
   y: number;
   targetId: string | null;
   targetCard?: CardData | null;
-  agentPrompt: string;
-  onPromptChange: (val: string) => void;
-  onSubmit: () => void;
+  agentPrompt?: string;
+  onPromptChange?: (val: string) => void;
+  onSubmit?: () => void;
   onClose: () => void;
   onAction: (actionType: string, targetId: string | null) => void;
 }
 
 export function AgentContextMenu({
-  isOpen, x, y, targetId, targetCard, agentPrompt, onPromptChange, onSubmit, onClose, onAction
+  isOpen,
+  x,
+  y,
+  targetId,
+  targetCard: _targetCard,
+  onClose,
+  onAction,
 }: AgentContextMenuProps) {
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    if (isOpen) {
-      setTimeout(() => inputRef.current?.focus(), 50);
-    }
-  }, [isOpen]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -38,26 +37,18 @@ export function AgentContextMenu({
 
   if (!isOpen) return null;
 
+  // Viewport clamping
+  const menuWidth = 260;
+  const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(x, window.innerWidth - menuWidth - 20)) : x;
+  const clampedY = typeof window !== 'undefined' ? Math.max(12, Math.min(y, window.innerHeight - 240)) : y;
+
   return (
     <div
-      className="fixed z-[100] flex flex-col gap-2 pointer-events-auto"
-      style={{ top: y, left: x }}
+      className="fixed z-[100] flex flex-col gap-2 pointer-events-auto select-none"
+      style={{ top: clampedY, left: clampedX }}
       onPointerDown={e => e.stopPropagation()} // Prevent canvas drag
       onContextMenu={e => e.preventDefault()} // Prevent another context menu inside
     >
-      {/* Agent Avatar / Bubble */}
-      <motion.div 
-        initial={{ opacity: 0, y: 10, scale: 0.9 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
-        exit={{ opacity: 0, scale: 0.9 }}
-        transition={{ duration: 0.25, delay: 0.2, type: 'spring' }}
-        className="flex items-center gap-2 mb-1"
-      >
-        <div className="bg-purple-600 text-white dark:bg-purple-900 dark:text-purple-100 text-[13px] px-3.5 py-1.5 rounded-2xl corner-squircle shadow-md font-medium whitespace-nowrap ml-1 origin-bottom-left border border-purple-500/30 dark:border-purple-700/50">
-          {targetId ? "选中了这组内容，要调整什么？" : "我能帮什么忙？"}
-        </div>
-      </motion.div>
-
       {/* Main Menu Panel */}
       <motion.div
         initial={{ opacity: 0, y: 5 }}
@@ -66,64 +57,6 @@ export function AgentContextMenu({
         transition={{ duration: 0.15 }}
         className="bg-gray-100 dark:bg-neutral-800 border border-gray-200/80 dark:border-[#404040]/80 shadow-[0_12px_40px_rgb(0,0,0,0.12)] rounded-2xl corner-squircle w-[260px] overflow-hidden"
       >
-        {/* Linked Card Preview Header */}
-        {targetCard && (
-          <div className="px-2.5 py-1.5 bg-purple-50 dark:bg-purple-950/40 border-b border-purple-100 dark:border-purple-900/40 flex items-center gap-2">
-            {(targetCard.thumbnailUrl || targetCard.imageUrl) ? (
-              <img 
-                src={targetCard.thumbnailUrl || targetCard.imageUrl!} 
-                alt="" 
-                className="w-7 h-7 rounded object-cover border border-purple-300 dark:border-purple-700 shrink-0"
-              />
-            ) : (
-              <div className="w-7 h-7 rounded bg-purple-200 dark:bg-purple-800 flex items-center justify-center text-purple-700 dark:text-purple-300 text-[10px] shrink-0 font-medium">
-                {targetCard.isVideo ? '视频' : '卡片'}
-              </div>
-            )}
-            <div className="min-w-0 flex-1">
-              <div className="text-[12px] font-semibold text-purple-900 dark:text-purple-200 truncate leading-tight">
-                {targetCard.fileName || `卡片 #${targetCard.id.slice(-6)}`}
-              </div>
-              <div className="text-[10px] text-purple-600 dark:text-purple-400 truncate leading-tight mt-0.5">
-                {targetCard.prompt ? targetCard.prompt : `${targetCard.ratio || '9:16'} · ${targetCard.res || '2K'}`}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Input Area */}
-        <div className="p-2 flex items-center gap-1 border-b border-gray-100 dark:border-[#404040]">
-          <input
-            ref={inputRef}
-            value={agentPrompt}
-            onChange={e => onPromptChange(e.target.value)}
-            onKeyDown={e => {
-              if (e.key === 'Enter' && agentPrompt.trim()) {
-                onSubmit();
-                onClose();
-              }
-            }}
-            placeholder="输入指令..."
-            className="flex-1 min-w-0 px-2 py-1 bg-transparent text-[14px] text-gray-800 dark:text-neutral-200 placeholder-gray-400 dark:placeholder-neutral-500 outline-none font-medium"
-          />
-          <button
-            onClick={() => {
-              if (agentPrompt.trim()) {
-                onSubmit();
-                onClose();
-              }
-            }}
-            disabled={!agentPrompt.trim()}
-            className={`shrink-0 p-1.5 rounded-lg transition-colors ${
-              agentPrompt.trim()
-                ? 'bg-purple-600 text-white hover:bg-purple-700 dark:bg-purple-600 dark:hover:bg-purple-500'
-                : 'bg-gray-100 text-gray-400 dark:bg-neutral-800 dark:text-neutral-500 cursor-not-allowed'
-            }`}
-          >
-            <ArrowUp size={15} strokeWidth={2.5} />
-          </button>
-        </div>
-
         {/* Quick Actions */}
         <div className="p-1.5 flex flex-col">
           {targetId ? (
@@ -146,14 +79,14 @@ export function AgentContextMenu({
   );
 }
 
-function ActionButton({ icon, label, onClick, destructive = false }: { icon: React.ReactNode, label: string, onClick: () => void, destructive?: boolean }) {
+function ActionButton({ icon, label, onClick, destructive = false }: { icon: React.ReactNode; label: string; onClick: () => void; destructive?: boolean }) {
   return (
     <button
       onClick={onClick}
-      className={`flex items-center gap-2.5 px-3 py-2 rounded-xl text-[13px] font-medium transition-colors text-left ${
+      className={`flex items-center gap-2.5 px-3 py-2 rounded-xl text-[13px] font-medium transition-colors text-left cursor-pointer ${
         destructive 
-          ? 'text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950' 
-          : 'text-gray-700 dark:text-neutral-300 hover:bg-gray-200 dark:hover:bg-neutral-800'
+          ? 'text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/60' 
+          : 'text-gray-700 dark:text-neutral-300 hover:bg-gray-200 dark:hover:bg-neutral-700/60'
       }`}
     >
       {icon}

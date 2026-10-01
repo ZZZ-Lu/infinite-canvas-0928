@@ -11,9 +11,10 @@ import { fastGetImageDimensions } from './utils/imageHeader';
 import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold } from './utils/viewportCulling';
 import { buildCardQuadTree, QuadTree, BoundingBox } from './utils/quadTree';
 import { getBottomPanelHeight } from './utils/cardLayout';
-import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video } from 'lucide-react';
+import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp } from 'lucide-react';
 import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
 import { SettingsPage } from './components/SettingsPage';
+import { getDrafts, saveDraft, deleteDraft } from './utils/draftDb';
 import { McpKeyButton } from './components/McpKeyButton';
 import { ProjectScriptBible } from './components/ProjectScriptBible';
 import { ScriptProject, DEFAULT_PROJECT } from './types/script';
@@ -129,6 +130,7 @@ type AgentTaskLog = {
   title: string;
   status: 'running' | 'completed' | 'failed' | 'waiting_user' | 'paused' | 'cancelled';
   events: Array<{ id: string; text: string; kind: 'work' | 'tool' | 'answer' }>;
+  cardContext?: Record<string, any>;
 };
 
 type ScriptSelection = {
@@ -684,6 +686,13 @@ export default function App() {
     initialSelectedIds: string[];
   } | null>(null);
 
+  const [agentSelectionBox, setAgentSelectionBox] = useState<{
+    startX: number;
+    startY: number;
+    currentX: number;
+    currentY: number;
+  } | null>(null);
+
   // Agent State
   const [agentState, setAgentState] = useState<{
     x: number;
@@ -703,10 +712,33 @@ export default function App() {
   const [agentPrompt, setAgentPrompt] = useState("");
   const [agentQuestion, setAgentQuestion] = useState<{ question: string, resolve: (val: string) => void } | null>(null);
   const [isAgentThinking, setIsAgentThinking] = useState(false);
+  const [agentQuickInput, setAgentQuickInput] = useState<{
+    isOpen: boolean;
+    x?: number;
+    y?: number;
+    canvasX?: number;
+    canvasY?: number;
+    targetId: string | null;
+    targetIds?: string[];
+    lastReply?: string;
+    focusTrigger?: number;
+  } | null>(null);
+  const [cardDrafts, setCardDrafts] = useState<Record<string, string>>({});
+
+  // Load drafts from IndexedDB on startup
+  useEffect(() => {
+    getDrafts().then(drafts => {
+      if (drafts) {
+        setCardDrafts(drafts);
+      }
+    });
+  }, []);
 
   const isUserPointerDownRef = useRef(false);
   const runtimeRef = useRef<AgentRuntime | null>(null);
   const activeTaskIdRef = useRef<string | null>(null);
+  const agentSpeakTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const spaceLongPressTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     const onDown = () => { isUserPointerDownRef.current = true; };
@@ -719,6 +751,94 @@ export default function App() {
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onUp);
     };
+  }, []);
+
+  const parseAgentCommunication = useCallback((rawText: string) => {
+    let shortText = '';
+    let fullText = '';
+
+    const lines = rawText.split('\n');
+    let activeMode: 'none' | 'short' | 'full' = 'none';
+    const shortBuffer: string[] = [];
+    const fullBuffer: string[] = [];
+
+    const shortStartRegex = /(?:简版|对用户说的话\s*[\(（]简版[\)）])\s*[:：]\s*(.*)/i;
+    const fullStartRegex = /(?:完整版|对用户说的话\s*[\(（]完整版[\)）])\s*[:：]\s*(.*)/i;
+
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+
+      // Check if this line starts a new section
+      const isShortStart = shortStartRegex.test(line);
+      const isFullStart = fullStartRegex.test(line);
+      
+      // Stop collecting if we hit a block ending indicator on a new line
+      const isBlockEnd = trimmedLine === '}' || trimmedLine === ']' || trimmedLine.startsWith('{{') || trimmedLine.startsWith('调用');
+
+      if (isShortStart) {
+        activeMode = 'short';
+        const match = line.match(shortStartRegex);
+        if (match) {
+          shortBuffer.push(match[1]);
+        }
+        continue;
+      } else if (isFullStart) {
+        activeMode = 'full';
+        const match = line.match(fullStartRegex);
+        if (match) {
+          fullBuffer.push(match[1]);
+        }
+        continue;
+      } else if (isBlockEnd || (trimmedLine.startsWith('-') && (trimmedLine.includes('对用户') || trimmedLine.includes('简版') || trimmedLine.includes('完整版')))) {
+        activeMode = 'none';
+      }
+
+      if (activeMode === 'short') {
+        shortBuffer.push(line);
+      } else if (activeMode === 'full') {
+        fullBuffer.push(line);
+      }
+    }
+
+    if (shortBuffer.length > 0) {
+      // Join lines and clean up quotes/braces at the very ends of the gathered block
+      shortText = shortBuffer.join('\n').trim();
+      shortText = shortText.replace(/^[“"「‘]/, '').replace(/[”"」’]$/, '').trim();
+    }
+    if (fullBuffer.length > 0) {
+      fullText = fullBuffer.join('\n').trim();
+      fullText = fullText.replace(/^[“"「‘]/, '').replace(/[”"」’]$/, '').trim();
+    }
+
+    // --- FALLBACKS ---
+    // 1. Regex fallback just in case lines are joined or on a single line
+    if (!shortText) {
+      const shortMatch = rawText.match(/(?:简版|对用户说的话\s*[\(（]简版[\)）])\s*[:：]\s*[“"「]?([^"\r\n”」]+)/i);
+      if (shortMatch) {
+        shortText = shortMatch[1].trim().replace(/^[“"「‘]/, '').replace(/[”"」’]$/, '').trim();
+      }
+    }
+    if (!fullText) {
+      const fullMatch = rawText.match(/(?:完整版|对用户说的话\s*[\(（]完整版[\)）])\s*[:：]\s*[“"「]?([^”」｝}]+)/i);
+      if (fullMatch) {
+        fullText = fullMatch[1].trim().replace(/^[“"「‘]/, '').replace(/[”"」’]$/, '').trim();
+      }
+    }
+
+    // 2. Heuristic fallback
+    if (!shortText) {
+      const cleanPara = rawText.trim();
+      const firstSentence = cleanPara.split(/[。！？\n]/)[0] || cleanPara;
+      shortText = firstSentence.replace(/^[“"'「‘(（\-*\s]+/, '').replace(/[”"'」｝}）)；;\s]+$/, '').trim();
+      if (shortText.length > 40) {
+        shortText = shortText.slice(0, 38) + '...';
+      }
+    }
+    if (!fullText) {
+      fullText = rawText;
+    }
+
+    return { shortText, fullText };
   }, []);
 
   const panToCanvasPos = (canvasX: number, canvasY: number) => {
@@ -762,6 +882,218 @@ export default function App() {
   const cardsRef = useRef<CardData[]>(cards);
   cardsRef.current = cards;
   const clipboardRef = useRef<CardData[]>([]);
+
+  const handleStartAgentBoxSelect = useCallback((startX: number, startY: number) => {
+    setAgentSelectionBox({
+      startX,
+      startY,
+      currentX: startX,
+      currentY: startY
+    });
+  }, []);
+
+  const handleUpdateAgentBoxSelect = useCallback((currentX: number, currentY: number) => {
+    setAgentSelectionBox(prev => {
+      if (!prev) return null;
+      const next = { ...prev, currentX, currentY };
+      
+      const minX = Math.min(next.startX, next.currentX);
+      const maxX = Math.max(next.startX, next.currentX);
+      const minY = Math.min(next.startY, next.currentY);
+      const maxY = Math.max(next.startY, next.currentY);
+
+      // Simple box intersection math against all cards
+      const newlySelectedIds = cardsRef.current.filter(card => {
+        const dim = getCardSize(card);
+        return (
+          card.x < maxX && 
+          card.x + dim.width > minX && 
+          card.y < maxY && 
+          card.y + dim.height > minY
+        );
+      }).map(c => c.id);
+
+      // Calculate screen position of the prompt bubble
+      const screenX = next.startX * tScale.get() + tx.get();
+      const screenY = next.startY * tScale.get() + ty.get();
+
+      // Dynamically target these cards under the Agent!
+      setAgentQuickInput(prevQuick => {
+        const targetId = newlySelectedIds[0] || null;
+        const promptText = newlySelectedIds.length > 0 ? "选中了这组内容，要调整什么？" : "我能帮什么忙？";
+        
+        setAgentState(prevAgent => ({
+          ...prevAgent,
+          speak: promptText
+        }));
+
+        if (!prevQuick) {
+          return {
+            isOpen: true,
+            x: screenX,
+            y: screenY,
+            canvasX: next.startX,
+            canvasY: next.startY,
+            targetId,
+            targetIds: newlySelectedIds,
+            focusTrigger: Date.now()
+          };
+        }
+        return {
+          ...prevQuick,
+          targetId,
+          targetIds: newlySelectedIds,
+        };
+      });
+
+      return next;
+    });
+  }, [tScale, tx, ty]);
+
+  const handleEndAgentBoxSelect = useCallback(() => {
+    setAgentSelectionBox(null);
+  }, []);
+
+  const handleDragAgentEnd = useCallback((finalCanvasX: number, finalCanvasY: number, screenX: number, screenY: number) => {
+    // Perform hit test on cards using pure data layer (reverse order for top-most z-index)
+    const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+    let hitCard: CardData | null = null;
+    for (let i = allCards.length - 1; i >= 0; i--) {
+      const c = allCards[i];
+      const dim = getCardSize(c);
+      if (finalCanvasX >= c.x && finalCanvasX <= c.x + dim.width && finalCanvasY >= c.y && finalCanvasY <= c.y + dim.height) {
+        hitCard = c;
+        break;
+      }
+    }
+
+    // Dismiss any standard context menu
+    setContextMenus(prev => { const next = {...prev}; delete next['user']; return next; });
+
+    if (hitCard) {
+      setSelectedCardIds([hitCard.id]);
+      const promptText = "选中了这组内容，要调整什么？";
+      const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
+        ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant')
+        : undefined;
+      const lastReply = lastReplyObj ? (lastReplyObj.shortText || lastReplyObj.text) : undefined;
+
+      setAgentState(prev => ({
+        ...prev,
+        x: finalCanvasX,
+        y: finalCanvasY,
+        speak: promptText,
+        isMoving: false,
+        visible: true
+      }));
+      setAgentQuickInput({
+        isOpen: true,
+        x: screenX,
+        y: screenY,
+        canvasX: finalCanvasX,
+        canvasY: finalCanvasY,
+        targetId: hitCard.id,
+        lastReply,
+        focusTrigger: Date.now()
+      });
+    } else {
+      setSelectedCardIds([]);
+      const promptText = "我能帮什么忙？";
+      setAgentState(prev => ({
+        ...prev,
+        x: finalCanvasX,
+        y: finalCanvasY,
+        speak: promptText,
+        isMoving: false,
+        visible: true
+      }));
+      setAgentQuickInput({
+        isOpen: true,
+        x: screenX,
+        y: screenY,
+        canvasX: finalCanvasX,
+        canvasY: finalCanvasY,
+        targetId: null,
+        lastReply: undefined,
+        focusTrigger: Date.now()
+      });
+    }
+  }, [cards]);
+
+  // Click on Agent pointer to toggle hide/show
+  const handleClickAgentPointer = useCallback(() => {
+    // If HUD is open/visible (has speak or quickInput), clicking hides it
+    if (agentState.speak || agentQuickInput?.isOpen) {
+      if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
+      setAgentState(prev => ({ ...prev, speak: undefined }));
+      
+      // Clear the current active card draft and persist delete to IndexedDB on close
+      const currentTarget = agentQuickInput?.targetId || 'global';
+      setCardDrafts(prev => ({ ...prev, [currentTarget]: '' }));
+      deleteDraft(currentTarget);
+
+      setAgentQuickInput(null);
+    } else {
+      // If HUD is hidden, clicking restores it
+      const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+      let hitCard: CardData | null = null;
+      for (let i = allCards.length - 1; i >= 0; i--) {
+        const c = allCards[i];
+        const dim = getCardSize(c);
+        if (agentState.x >= c.x && agentState.x <= c.x + dim.width && agentState.y >= c.y && agentState.y <= c.y + dim.height) {
+          hitCard = c;
+          break;
+        }
+      }
+
+      const screenX = agentState.x * tScale.get() + tx.get();
+      const screenY = agentState.y * tScale.get() + ty.get();
+
+      if (hitCard) {
+        setSelectedCardIds([hitCard.id]);
+        const promptText = "选中了这组内容，要调整什么？";
+        const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
+          ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant')
+          : undefined;
+        const lastReply = lastReplyObj ? (lastReplyObj.shortText || lastReplyObj.text) : undefined;
+
+        setAgentState(prev => ({
+          ...prev,
+          speak: promptText,
+          isMoving: false,
+          visible: true
+        }));
+        setAgentQuickInput({
+          isOpen: true,
+          x: screenX,
+          y: screenY,
+          canvasX: agentState.x,
+          canvasY: agentState.y,
+          targetId: hitCard.id,
+          lastReply,
+          focusTrigger: Date.now()
+        });
+      } else {
+        const promptText = "我能帮什么忙？";
+        setAgentState(prev => ({
+          ...prev,
+          speak: promptText,
+          isMoving: false,
+          visible: true
+        }));
+        setAgentQuickInput({
+          isOpen: true,
+          x: screenX,
+          y: screenY,
+          canvasX: agentState.x,
+          canvasY: agentState.y,
+          targetId: null,
+          lastReply: undefined,
+          focusTrigger: Date.now()
+        });
+      }
+    }
+  }, [agentState.speak, agentState.x, agentState.y, agentQuickInput?.isOpen, cards, tScale, tx, ty]);
 
   // Canvas Reference Picker Session State
   const [pickerSession, setPickerSession] = useState<{
@@ -2251,14 +2583,39 @@ export default function App() {
       const isInputActive = activeTag === 'TEXTAREA' || activeTag === 'INPUT' || document.activeElement?.hasAttribute('contenteditable');
       const isSpaceKey = e.code === 'Space' || e.key === ' ' || e.keyCode === 32;
 
-      if (isSpaceKey && !isInputActive) {
-        if (isSpacePressedRef.current || isOverviewModeRef.current) {
+      if (isSpaceKey) {
+        if (!isInputActive) {
+          if (isSpacePressedRef.current || isOverviewModeRef.current) {
+            e.preventDefault();
+            return;
+          }
           e.preventDefault();
-          return;
+          isSpacePressedRef.current = true;
+          enterOverviewModeRef.current();
+        } else {
+          // If the user is currently composing text using an IME (e.g. Chinese input method),
+          // pressing Space selects the text candidate, so we must let it proceed natively!
+          const isComposing = e.isComposing || e.keyCode === 229;
+          if (isComposing) {
+            return;
+          }
+
+          // Scheme A (Improved): Prevent default character input immediately so no space is typed!
+          e.preventDefault();
+
+          if (!spaceLongPressTimerRef.current && !e.repeat) {
+            const activeEl = document.activeElement as HTMLInputElement | HTMLTextAreaElement | null;
+            spaceLongPressTimerRef.current = setTimeout(() => {
+              if (activeEl) {
+                activeEl.blur(); // Release focus to unfetter keyboard events
+              }
+
+              isSpacePressedRef.current = true;
+              enterOverviewModeRef.current(); // Enter Pan/Overview Mode
+              spaceLongPressTimerRef.current = null;
+            }, 250); // Natural 250ms hold threshold
+          }
         }
-        e.preventDefault();
-        isSpacePressedRef.current = true;
-        enterOverviewModeRef.current();
       }
 
       if ((e.ctrlKey || e.metaKey) && !isInputActive) {
@@ -2325,6 +2682,30 @@ export default function App() {
       const isSpaceKey = e.code === 'Space' || e.key === ' ' || e.keyCode === 32;
 
       if (isSpaceKey) {
+        // Stop and clean up long-press timer if space is released before timeout
+        if (spaceLongPressTimerRef.current) {
+          clearTimeout(spaceLongPressTimerRef.current);
+          spaceLongPressTimerRef.current = null;
+
+          // Since the timer was still active, this is a short press / normal typing!
+          // We manually insert the space character at the cursor position.
+          if (isInputActive) {
+            const activeEl = document.activeElement as HTMLInputElement | HTMLTextAreaElement | null;
+            if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')) {
+              const val = activeEl.value;
+              const start = activeEl.selectionStart ?? val.length;
+              const end = activeEl.selectionEnd ?? val.length;
+
+              activeEl.value = val.slice(0, start) + ' ' + val.slice(end);
+              activeEl.setSelectionRange(start + 1, start + 1);
+
+              // Dispatch native input event to synchronize with React state and save drafts
+              const event = new Event('input', { bubbles: true });
+              activeEl.dispatchEvent(event);
+            }
+          }
+        }
+
         isSpacePressedRef.current = false;
         if (!isInputActive && (preOverviewTransform.current || isOverviewModeRef.current)) {
           exitOverviewToOriginalRef.current();
@@ -2333,6 +2714,10 @@ export default function App() {
     };
 
     const handleBlur = () => {
+      if (spaceLongPressTimerRef.current) {
+        clearTimeout(spaceLongPressTimerRef.current);
+        spaceLongPressTimerRef.current = null;
+      }
       isSpacePressedRef.current = false;
       if (preOverviewTransform.current || isOverviewModeRef.current) {
         exitOverviewToOriginalRef.current();
@@ -2376,30 +2761,73 @@ export default function App() {
       }
     }
     
-    if (targetId && !selectedCardIds.includes(targetId)) {
-      setSelectedCardIds([targetId]);
-    } else if (!targetId) {
+    // Determine the target IDs for the Agent.
+    // If the right-clicked card is part of the user's active multi-selection, 
+    // we inherit the multi-selection, so all of them are targeted!
+    let targetIds: string[] = [];
+    if (targetId) {
+      if (selectedCardIds.includes(targetId)) {
+        targetIds = [...selectedCardIds];
+      } else {
+        targetIds = [targetId];
+        setSelectedCardIds([targetId]);
+      }
+    } else {
       setSelectedCardIds([]);
     }
 
     const ownerId = e.nativeEvent.isTrusted ? 'user' : 'agent';
+    if (ownerId === 'user' && !isAgentRunning) {
+      const hitCard = targetId ? cardsRef.current.find(c => c.id === targetId) : undefined;
+      const lastReplyObj = hitCard && hitCard.chatHistory && hitCard.chatHistory.length > 0
+        ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant')
+        : undefined;
+      const lastReply = lastReplyObj ? (lastReplyObj.shortText || lastReplyObj.text) : undefined;
+
+      setAgentQuickInput({
+        isOpen: true,
+        targetId,
+        targetIds,
+        lastReply,
+        focusTrigger: Date.now()
+      });
+    } else {
+      setAgentQuickInput(null);
+    }
+
+    const menuWidth = 260;
+    const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(e.clientX, window.innerWidth - menuWidth - 20)) : e.clientX;
+    const clampedY = typeof window !== 'undefined' ? Math.max(50, Math.min(e.clientY, window.innerHeight - 340)) : e.clientY;
+    const clampedCanvasX = (clampedX - tx.get()) / tScale.get();
+    const clampedCanvasY = (clampedY - ty.get()) / tScale.get();
     
-    setContextMenus(prev => ({
-      ...prev,
-      [ownerId]: {
-        x: e.clientX,
-        y: e.clientY,
-        canvasX,
-        canvasY,
-        targetId
-      }
-    }));
+    if (!targetId) {
+      setContextMenus(prev => ({
+        ...prev,
+        [ownerId]: {
+          x: clampedX,
+          y: clampedY,
+          canvasX: clampedCanvasX,
+          canvasY: clampedCanvasY,
+          targetId
+        }
+      }));
+    } else {
+      setContextMenus(prev => {
+        const next = { ...prev };
+        delete next[ownerId];
+        return next;
+      });
+    }
 
     if (ownerId === 'user' && !isAgentRunning) {
+      const promptText = targetId ? "选中了这组内容，要调整什么？" : "我能帮什么忙？";
+      const yOffset = targetId ? 40 : 82;
       setAgentState(prev => ({
         ...prev,
-        x: canvasX - 15 / tScale.get(), // Fly to the left of the speech bubble
-        y: canvasY - 25 / tScale.get(), // Fly slightly above the menu
+        x: clampedCanvasX - 8 / tScale.get(), // Aligned to the top-left of the menu
+        y: clampedCanvasY - yOffset / tScale.get(), // Comfortably lifted based on whether context menu is present
+        speak: promptText,
         isMoving: true,
         visible: true
       }));
@@ -3321,10 +3749,10 @@ export default function App() {
                 negotiationLog: task.negotiationLog,
                 lastGoalUpdatedAt: task.lastGoalUpdatedAt,
                 lastUserInputAt: task.lastUserInputAt,
-                cardContext: task.cardContext || cardContext,
+                cardContext: task.cardContext || effectiveCardContext,
               },
               images: task.images || overrideImages,
-              cardContext: task.cardContext || cardContext,
+              cardContext: task.cardContext || effectiveCardContext,
               apiKey: savedKey, modelType: agentModel, enabledTools, requireTool,
             };
             updateAgentRuntimeTrace(task, trace => ({
@@ -3472,12 +3900,68 @@ export default function App() {
               id: task.id,
               title: task.title,
               status,
+              cardContext: task.cardContext,
               events: task.events.slice(-16).map(event => ({
                 id: event.id,
-                text: event.text,
+                text: event.type === 'answer' ? parseAgentCommunication(event.text || '').fullText : event.text,
                 kind: event.type === 'tool' ? 'tool' : event.type === 'answer' ? 'answer' : 'work',
               })),
             });
+
+            // Live speech synchronization for Agent Pointer HUD
+            const latestAnswer = [...task.events].reverse().find(e => e.type === 'answer' && e.text && e.text.trim());
+            if (latestAnswer) {
+              if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
+              setAgentState(prev => ({
+                ...prev,
+                speak: parseAgentCommunication(latestAnswer.text).shortText,
+                visible: true,
+              }));
+            } else if (status === 'planning' || status === 'waiting_tools') {
+              const latestTool = [...task.events].reverse().find(e => e.type === 'tool' && e.text && e.text.trim());
+              if (latestTool) {
+                if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
+                setAgentState(prev => ({
+                  ...prev,
+                  speak: latestTool.text.trim(),
+                  visible: true,
+                }));
+              }
+            }
+
+            if (status === 'completed' || status === 'cancelled' || status === 'failed') {
+              if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
+            }
+
+            // If task is bound to a specific card context, sync answer events to that card's chat history
+            const cardId = task.cardContext?.cardId || task.cardContext?.targetId;
+            if (cardId) {
+              const answers = task.events.filter(e => e.type === 'answer' && e.text && e.text.trim());
+              if (answers.length > 0) {
+                setCards(prevCards => prevCards.map(c => {
+                  if (c.id !== cardId) return c;
+                  const currentHistory = c.chatHistory || [];
+                  const newAnswers = answers.filter(a => !currentHistory.some(m => m.id === a.id));
+                  if (newAnswers.length === 0) return c;
+                  return {
+                    ...c,
+                    chatHistory: [
+                      ...currentHistory,
+                      ...newAnswers.map(a => {
+                        const parsed = parseAgentCommunication(a.text);
+                        return {
+                          id: a.id,
+                          role: 'assistant' as const,
+                          text: parsed.fullText,
+                          shortText: parsed.shortText,
+                          timestamp: a.createdAt || Date.now(),
+                        };
+                      })
+                    ]
+                  };
+                }));
+              }
+            }
           },
         });
         runtimeRef.current = runtime;
@@ -3490,7 +3974,7 @@ export default function App() {
           sessionId: currentProject.id,
           goal: userMessage,
           images: overrideImages,
-          cardContext: cardContext,
+          cardContext: effectiveCardContext,
         });
         updateAgentRuntimeTrace(task);
         // Auto inspect if enabled
@@ -3524,7 +4008,7 @@ export default function App() {
           }
         }
       } else {
-        runtime.addUserInput(taskId!, userMessage, overrideImages, cardContext);
+        runtime.addUserInput(taskId!, userMessage, overrideImages, effectiveCardContext);
         task = runtime.requireTask(taskId!);
       }
 
@@ -3539,9 +4023,6 @@ export default function App() {
     } finally {
       setIsAgentThinking(false);
       setIsAgentRunning(false);
-      setTimeout(() => {
-        setAgentState(prev => ({ ...prev, speak: undefined }));
-      }, 5000); // Clear speak text 5 seconds after the agent stops
     }
   };
 
@@ -3552,6 +4033,25 @@ export default function App() {
       await handleRunAgent(promptText);
       return;
     }
+
+    // Immediately record the user message in the target card's chatHistory
+    const userMsgId = `msg_user_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    setCards(prev => prev.map(c => {
+      if (c.id !== targetCardId) return c;
+      const history = c.chatHistory || [];
+      return {
+        ...c,
+        chatHistory: [
+          ...history,
+          {
+            id: userMsgId,
+            role: 'user',
+            text: promptText,
+            timestamp: Date.now(),
+          }
+        ]
+      };
+    }));
 
     try {
       const autoCtx = await buildAutoInjectedCardContext(targetCard, allCards, extractCardImageBase64);
@@ -3621,22 +4121,31 @@ export default function App() {
   // Close user context menu on any pointer down
   useEffect(() => {
     const closeMenu = (e: PointerEvent) => {
+      const clickerId = e.isTrusted ? 'user' : 'agent';
       setContextMenus(prev => {
-        const clickerId = e.isTrusted ? 'user' : 'agent';
-        
-        // Only the clicker can close their own menu by clicking outside
         if (prev[clickerId]) {
           const next = { ...prev };
           delete next[clickerId];
           return next;
         }
-        
         return prev;
       });
+      if (clickerId === 'user') {
+        setAgentState(prev => {
+          // 🛡️ Intelligent state lock: If the agent's quick input overlay is open, DO NOT dismiss its speaking bubbles on click-away!
+          if (agentQuickInput?.isOpen) {
+            return prev;
+          }
+          if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
+            return { ...prev, speak: undefined };
+          }
+          return prev;
+        });
+      }
     };
     document.addEventListener('pointerdown', closeMenu);
     return () => document.removeEventListener('pointerdown', closeMenu);
-  }, []);
+  }, [agentQuickInput]);
 
   const isDraggingCanvasRef = useRef(false);
 
@@ -4775,6 +5284,13 @@ export default function App() {
         cards={cards}
         selectedCardIds={selectedCardIds}
         renderedCardIds={renderedCardIds}
+        agentTargetCardId={
+          agentQuickInput?.isOpen && agentQuickInput.targetId
+            ? agentQuickInput.targetId
+            : (Object.values(contextMenus) as any[]).find(m => m?.targetId)?.targetId || 
+              (agentTask && !['completed', 'cancelled', 'failed'].includes(agentTask.status) && ((agentTask as any).cardContext?.cardId || (agentTask as any).cardContext?.targetId)) || 
+              null
+        }
         pickerSession={pickerSession}
         scale={tScale}
         tx={tx}
@@ -4819,6 +5335,11 @@ export default function App() {
               )
             : -1;
           const pickerSelectionIndex = pickerIndex !== -1 ? pickerIndex + 1 : undefined;
+          const isAgentTarget = Boolean(
+            (agentQuickInput?.isOpen && (agentQuickInput.targetIds?.includes(card.id) || agentQuickInput.targetId === card.id)) ||
+            Object.values(contextMenus).some((m: any) => m?.targetId === card.id) ||
+            (agentTask && !['completed', 'cancelled', 'failed'].includes(agentTask.status) && ((agentTask as any).cardContext?.cardId === card.id || (agentTask as any).cardContext?.targetId === card.id))
+          );
 
           return (
             <GenerationCard 
@@ -4832,6 +5353,7 @@ export default function App() {
               pickerSelectionIndex={pickerSelectionIndex}
               onStartCanvasPicker={handleStartCanvasPicker}
               isSelected={selectedCardIds.includes(card.id)}
+              isAgentTarget={isAgentTarget}
               isZooming={isZooming}
               allCards={cards}
               currentProject={currentProject}
@@ -4864,6 +5386,21 @@ export default function App() {
               height: Math.abs(selectionBox.currentY - selectionBox.startY),
               borderWidth: `2px`, // Scale border is tricky without re-rendering, 2px is fine
               borderStyle: 'solid'
+            }}
+          />
+        )}
+
+        {/* Agent Marquee Selection Box */}
+        {agentSelectionBox && (
+          <div
+            className="absolute border-[#a855f7]/60 bg-[#a855f7]/12 pointer-events-none z-[200] rounded-xl shadow-[0_0_15px_rgba(168,85,247,0.15)]"
+            style={{
+              left: Math.min(agentSelectionBox.startX, agentSelectionBox.currentX),
+              top: Math.min(agentSelectionBox.startY, agentSelectionBox.currentY),
+              width: Math.abs(agentSelectionBox.currentX - agentSelectionBox.startX),
+              height: Math.abs(agentSelectionBox.currentY - agentSelectionBox.startY),
+              borderWidth: `2.5px`,
+              borderStyle: 'dashed'
             }}
           />
         )}
@@ -4965,6 +5502,56 @@ export default function App() {
         transform={transformValues}
         isIdle={true}
         isZooming={isZooming}
+        isDarkMode={isDarkMode}
+        quickInput={
+          agentQuickInput?.isOpen
+            ? {
+                isOpen: true,
+                targetId: agentQuickInput.targetId,
+                placeholder: "输入你的想法...",
+                lastReply: agentQuickInput.lastReply,
+                focusTrigger: agentQuickInput.focusTrigger,
+                value: cardDrafts[agentQuickInput.targetId || 'global'] || '',
+                onChange: (text: string) => {
+                  const target = agentQuickInput.targetId || 'global';
+                  setCardDrafts(prev => ({ ...prev, [target]: text }));
+                  saveDraft(target, text); // Persist draft to IndexedDB
+                },
+                onSubmit: async (prompt: string) => {
+                  const currentTarget = agentQuickInput.targetId;
+                  const currentKey = currentTarget || 'global';
+                  setCardDrafts(prev => ({ ...prev, [currentKey]: '' }));
+                  deleteDraft(currentKey); // Delete draft from IndexedDB on submit
+                  setAgentQuickInput(null);
+                  if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
+                  setAgentState(prev => ({
+                    ...prev,
+                    speak: "正在思考...",
+                    visible: true
+                  }));
+                  if (!prompt) return;
+                  if (currentTarget) {
+                    await handleCardAgentChat(currentTarget, prompt);
+                  } else {
+                    await handleRunAgent(prompt);
+                  }
+                },
+                onClose: () => {
+                  const currentTarget = agentQuickInput.targetId || 'global';
+                  setCardDrafts(prev => ({ ...prev, [currentTarget]: '' }));
+                  deleteDraft(currentTarget); // Delete draft from IndexedDB on close
+                  setAgentQuickInput(null);
+                  setAgentState(prev => {
+                    if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
+                      return { ...prev, speak: undefined };
+                    }
+                    return prev;
+                  });
+                },
+              }
+            : null
+        }
+        onClickPointer={handleClickAgentPointer}
         onDragAgent={(newCanvasX, newCanvasY) => {
           setAgentState(prev => ({
             ...prev,
@@ -4973,21 +5560,33 @@ export default function App() {
             isMoving: false
           }));
         }}
+        onDragAgentEnd={handleDragAgentEnd}
+        onDismissSpeak={() => {
+          setAgentState(prev => ({ ...prev, speak: undefined }));
+        }}
+        onStartAgentBoxSelect={handleStartAgentBoxSelect}
+        onUpdateAgentBoxSelect={handleUpdateAgentBoxSelect}
+        onEndAgentBoxSelect={handleEndAgentBoxSelect}
       />
 
       {agentTask && (
-        <aside className="fixed bottom-5 right-5 z-[90] w-[320px] rounded-[24px] corner-squircle border border-violet-100 bg-gray-100 p-4 shadow-xl dark:border-violet-400/20 dark:bg-neutral-800">
-          <div className="mb-3 flex items-center justify-between gap-3">
-            <div>
-              <p className="text-xs font-semibold text-violet-600">Mira · 当前任务</p>
-              <p className="mt-0.5 text-sm font-medium text-slate-800 dark:text-slate-100">{agentTask.title}</p>
+        <aside className="fixed bottom-5 right-5 z-[90] w-[330px] rounded-[22px] corner-squircle border border-gray-200/90 bg-white p-3.5 shadow-[0_16px_48px_rgba(0,0,0,0.18)] dark:border-[#3a3a3a] dark:bg-neutral-800/95 flex flex-col gap-2.5 backdrop-blur-md">
+          {/* Header */}
+          <div className="flex items-center justify-between gap-2">
+            <div className="min-w-0 flex-1">
+              <p className="text-[12px] font-semibold text-purple-600 dark:text-purple-400 tracking-wide">
+                Mira · 当前任务
+              </p>
+              <p className="mt-0.5 text-[13px] font-medium text-slate-800 dark:text-slate-100 truncate">
+                {agentTask.title}
+              </p>
             </div>
-            <div className="flex items-center gap-1.5">
-              <span className={`rounded-full px-2 py-1 text-[11px] whitespace-nowrap ${
-                ['planning', 'waiting_tools'].includes(agentTask.status) ? 'bg-violet-100 text-violet-700' :
-                agentTask.status === 'completed' ? 'bg-emerald-100 text-emerald-700' :
-                agentTask.status === 'paused' || agentTask.status === 'waiting_user' ? 'bg-amber-100 text-amber-700' :
-                'bg-red-100 text-red-700'
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium whitespace-nowrap ${
+                ['planning', 'waiting_tools'].includes(agentTask.status) ? 'bg-purple-100 text-purple-700 dark:bg-purple-950/60 dark:text-purple-300' :
+                agentTask.status === 'completed' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300' :
+                agentTask.status === 'paused' || agentTask.status === 'waiting_user' ? 'bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300' :
+                'bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300'
               }`}>
                 {['planning', 'waiting_tools'].includes(agentTask.status) ? '执行中' :
                  agentTask.status === 'completed' ? '已完成' :
@@ -4995,91 +5594,110 @@ export default function App() {
                  agentTask.status === 'waiting_user' ? '等待用户' :
                  agentTask.status === 'cancelled' ? '已取消' : '失败'}
               </span>
-              {['completed', 'cancelled', 'failed'].includes(agentTask.status) && (
-                <button 
-                  onClick={() => setAgentTask(null)}
-                  className="p-1 rounded-md text-slate-400 hover:text-slate-600 hover:bg-gray-200 dark:hover:bg-neutral-800 dark:hover:text-slate-200 transition-colors"
-                  title="关闭任务窗"
-                >
-                  <X size={14} />
-                </button>
-              )}
+              <button 
+                onClick={() => setAgentTask(null)}
+                className="p-1 rounded-full bg-gray-100 hover:bg-gray-200 dark:bg-neutral-700/60 dark:hover:bg-neutral-700 text-gray-500 dark:text-neutral-300 transition-colors cursor-pointer"
+                title="关闭任务窗"
+              >
+                <X size={13} strokeWidth={2.5} />
+              </button>
             </div>
           </div>
-          <div ref={agentTaskScrollRef} className="max-h-44 space-y-2 overflow-y-auto pr-1 text-xs leading-5">
-            {agentTask.events.map(event => (
-              <p key={event.id} className={event.kind === 'answer' ? 'font-medium text-slate-800 dark:text-white' : event.kind === 'tool' ? 'text-slate-400 dark:text-slate-500' : 'text-slate-600 dark:text-slate-300'}>{event.text}</p>
-            ))}
+
+          {/* Messages / Events Stream */}
+          <div ref={agentTaskScrollRef} className="max-h-[220px] min-h-[50px] overflow-y-auto space-y-2.5 pr-1 text-xs no-scrollbar flex flex-col">
+            {agentTask.events.map(event => {
+              if (event.kind === 'answer') {
+                return (
+                  <div key={event.id} className="flex justify-start">
+                    <div className="bg-gray-100 dark:bg-neutral-700/70 text-slate-800 dark:text-slate-100 rounded-2xl corner-squircle px-3.5 py-2 text-[13px] leading-relaxed max-w-[95%] break-words whitespace-pre-wrap shadow-sm">
+                      {event.text}
+                    </div>
+                  </div>
+                );
+              }
+              if (event.kind === 'tool') {
+                return (
+                  <div key={event.id} className="flex justify-start">
+                    <div className="text-[11px] text-slate-500 dark:text-slate-400 px-2.5 py-1 bg-gray-50 dark:bg-neutral-900/40 rounded-xl border border-gray-100 dark:border-neutral-800 truncate max-w-[95%]">
+                      {event.text}
+                    </div>
+                  </div>
+                );
+              }
+              return (
+                <p key={event.id} className="text-slate-600 dark:text-slate-300 px-1 text-[12px] leading-relaxed">
+                  {event.text}
+                </p>
+              );
+            })}
+
+            {isAgentRunning && (
+              <div className="flex items-center gap-1.5 py-1 px-1 text-purple-600 dark:text-purple-400 text-xs">
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-purple-500 animate-bounce" />
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-purple-500 animate-bounce [animation-delay:0.2s]" />
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-purple-500 animate-bounce [animation-delay:0.4s]" />
+                <span className="ml-1 text-[11px] font-medium text-slate-500 dark:text-slate-400">Mira 正在执行...</span>
+              </div>
+            )}
           </div>
 
-          {isTaskChatOpen && (
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                handleSendTaskChat();
-              }}
-              className="mt-3 flex items-center gap-1.5 pt-2.5 border-t border-gray-200 dark:border-[#404040]"
-            >
-              <input
-                ref={taskChatInputRef}
-                type="text"
-                value={taskChatMessage}
-                onChange={(e) => setTaskChatMessage(e.target.value)}
-                placeholder="输入对话或新指令，向 Mira 发送..."
-                className="flex-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-800 placeholder-slate-400 outline-none focus:border-violet-500 focus:ring-1 focus:ring-violet-500 dark:border-[#404040] dark:bg-neutral-800 dark:text-slate-100 dark:placeholder-neutral-500"
-                autoFocus
-              />
-              <button
-                type="submit"
-                disabled={!taskChatMessage.trim() || isAgentRunning}
-                className="rounded-lg bg-violet-600 px-2.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-violet-700 disabled:opacity-40"
-                title="发送"
-              >
-                <Send size={12} />
-              </button>
-            </form>
-          )}
-          
-          <div className="mt-3 flex items-center gap-2 pt-3 border-t border-gray-200 dark:border-[#404040]">
-            <button 
-              onClick={() => {
-                setIsTaskChatOpen(prev => !prev);
-                setTimeout(() => {
-                  taskChatInputRef.current?.focus();
-                }, 50);
-              }}
-              className={`flex-1 py-1.5 px-3 text-xs font-medium rounded-lg transition-colors corner-squircle ${
-                isTaskChatOpen
-                  ? 'bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300'
-                  : 'bg-white dark:bg-neutral-800 text-slate-700 dark:text-slate-200 hover:bg-gray-50 dark:hover:bg-neutral-700'
+          {/* Bottom Chat Input inside Task Card */}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleSendTaskChat();
+            }}
+            className="flex items-center gap-1.5 bg-gray-50 dark:bg-neutral-900/70 border border-gray-200/90 dark:border-neutral-700 rounded-xl px-2.5 py-1.5 mt-0.5"
+          >
+            <input
+              ref={taskChatInputRef}
+              type="text"
+              value={taskChatMessage}
+              onChange={(e) => setTaskChatMessage(e.target.value)}
+              placeholder="输入你的想法..."
+              className="flex-1 min-w-0 bg-transparent text-[13px] text-gray-800 dark:text-neutral-100 placeholder-gray-400 dark:placeholder-neutral-500 outline-none font-medium"
+            />
+            <button
+              type="submit"
+              disabled={!taskChatMessage.trim() || isAgentRunning}
+              className={`shrink-0 p-1.5 rounded-lg transition-colors cursor-pointer ${
+                taskChatMessage.trim() && !isAgentRunning
+                  ? 'bg-purple-600 text-white hover:bg-purple-700 dark:bg-purple-600 dark:hover:bg-purple-500'
+                  : 'bg-gray-200/80 text-gray-400 dark:bg-neutral-800 dark:text-neutral-500 cursor-not-allowed opacity-50'
               }`}
+              title="发送"
             >
-              对话
+              <ArrowUp size={14} strokeWidth={2.5} />
             </button>
-            {agentTask.status === 'paused' ? (
+          </form>
+          
+          {/* Action Controls (Pause / Resume / Stop) */}
+          {agentTask.status !== 'completed' && agentTask.status !== 'cancelled' && agentTask.status !== 'failed' && (
+            <div className="flex items-center gap-1.5 pt-1">
+              {agentTask.status === 'paused' ? (
+                <button 
+                  onClick={handleResumeTask}
+                  className="flex-1 py-1 px-2.5 text-xs font-medium rounded-lg bg-emerald-100 text-emerald-700 hover:bg-emerald-200 transition-colors corner-squircle dark:bg-emerald-950/40 dark:text-emerald-400 cursor-pointer"
+                >
+                  继续
+                </button>
+              ) : (
+                <button 
+                  onClick={handlePauseTask}
+                  className="flex-1 py-1 px-2.5 text-xs font-medium rounded-lg bg-amber-100 text-amber-700 hover:bg-amber-200 transition-colors corner-squircle dark:bg-amber-900/30 dark:text-amber-400 cursor-pointer"
+                >
+                  暂停
+                </button>
+              )}
               <button 
-                onClick={handleResumeTask}
-                className="flex-1 py-1.5 px-3 text-xs font-medium rounded-lg bg-emerald-100 text-emerald-700 hover:bg-emerald-200 transition-colors corner-squircle dark:bg-emerald-950/40 dark:text-emerald-400"
+                onClick={handleCancelTask}
+                className="flex-1 py-1 px-2.5 text-xs font-medium rounded-lg bg-red-100 text-red-700 hover:bg-red-200 transition-colors corner-squircle dark:bg-red-900/30 dark:text-red-400 cursor-pointer"
               >
-                继续
+                停止
               </button>
-            ) : (
-              <button 
-                onClick={handlePauseTask}
-                disabled={['completed', 'cancelled', 'failed'].includes(agentTask.status)}
-                className="flex-1 py-1.5 px-3 text-xs font-medium rounded-lg bg-amber-100 text-amber-700 hover:bg-amber-200 transition-colors corner-squircle dark:bg-amber-900/30 dark:text-amber-400 disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                暂停
-              </button>
-            )}
-            <button 
-              onClick={handleCancelTask}
-              disabled={['completed', 'cancelled', 'failed'].includes(agentTask.status)}
-              className="flex-1 py-1.5 px-3 text-xs font-medium rounded-lg bg-red-100 text-red-700 hover:bg-red-200 transition-colors corner-squircle dark:bg-red-900/30 dark:text-red-400 disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              停止
-            </button>
-          </div>
+            </div>
+          )}
         </aside>
       )}
 
@@ -5102,6 +5720,12 @@ export default function App() {
                 const prompt = agentPrompt.trim();
                 setAgentPrompt('');
                 setContextMenus(prev => { const next = {...prev}; delete next['user']; return next; });
+                setAgentState(prev => {
+                  if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
+                    return { ...prev, speak: undefined };
+                  }
+                  return prev;
+                });
                 if (!prompt) return;
                 if (currentTarget) {
                   await handleCardAgentChat(currentTarget, prompt);
@@ -5111,8 +5735,21 @@ export default function App() {
               }}
               onClose={() => {
                 setContextMenus(prev => { const next = {...prev}; delete next['user']; return next; });
+                setAgentQuickInput(null);
+                setAgentState(prev => {
+                  if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
+                    return { ...prev, speak: undefined };
+                  }
+                  return prev;
+                });
               }}
               onAction={async (action, targetId) => {
+                setAgentState(prev => {
+                  if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
+                    return { ...prev, speak: undefined };
+                  }
+                  return prev;
+                });
                 if (action === 'new_card') handleCreateCard(ownerId);
                 else if (action === 'new_video_card') handleCreateCard(ownerId, true);
                 else if (action === 'delete' && targetId) {

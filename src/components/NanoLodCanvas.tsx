@@ -15,6 +15,7 @@ export interface NanoLodCanvasProps {
   cards: CardData[];
   selectedCardIds: string[];
   renderedCardIds?: Set<string>;
+  agentTargetCardId?: string | null;
   pickerSession?: {
     targetCardId: string;
     selectedReferences?: Array<{
@@ -114,6 +115,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   cards,
   selectedCardIds,
   renderedCardIds,
+  agentTargetCardId,
   pickerSession,
   scale,
   tx,
@@ -145,6 +147,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
   const renderedIdsRef = useRef(renderedCardIds);
   renderedIdsRef.current = renderedCardIds;
+
+  const agentTargetCardIdRef = useRef(agentTargetCardId);
+  agentTargetCardIdRef.current = agentTargetCardId;
 
   const pickerSessionRef = useRef(pickerSession);
   pickerSessionRef.current = pickerSession;
@@ -411,6 +416,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
     const borderNormal = dark ? 'rgba(64, 64, 64, 0.85)' : 'rgba(212, 212, 216, 0.85)';
     const borderSelected = '#3b82f6';
+    const borderAgentTarget = '#9333ea';
     const borderPickerTarget = '#3b82f6';
     const borderPickerSelected = '#2563eb';
 
@@ -613,10 +619,17 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         }
       }
 
+      const isAgentTarget = Boolean(
+        agentTargetCardIdRef.current && agentTargetCardIdRef.current === card.id
+      );
+
       // 3. Border (sharp straight rectangle stroke)
       if (isPickerSelected) {
         ctx.strokeStyle = borderPickerSelected;
         ctx.lineWidth = pickerSelectedLineWidth;
+      } else if (isAgentTarget) {
+        ctx.strokeStyle = borderAgentTarget;
+        ctx.lineWidth = selectedLineWidth;
       } else if (isPickerTarget) {
         ctx.strokeStyle = borderPickerTarget;
         ctx.lineWidth = selectedLineWidth;

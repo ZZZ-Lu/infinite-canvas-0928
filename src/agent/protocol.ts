@@ -15,6 +15,7 @@ export interface AgentToolCall {
 export interface AgentTurnResult {
   narration: string[];
   speak?: string;
+  fullAnswer?: string;
   taskTitle?: string;
   goal?: string;
   progress?: string;

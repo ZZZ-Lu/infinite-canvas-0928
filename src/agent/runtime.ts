@@ -157,8 +157,9 @@ export class AgentRuntime {
         // Results are delivered once. Only explicit failure lessons persist.
         task.observations = [];
         result.narration.forEach(text => this.addEvent(task, { turnId, type: 'thought', text }));
-        if (result.speak) {
-          this.addEvent(task, { turnId, type: 'answer', text: result.speak });
+        const fullAnswer = result.fullAnswer || result.response || result.speak;
+        if (fullAnswer) {
+          this.addEvent(task, { turnId, type: 'answer', text: fullAnswer });
         }
 
         // Dedicated State Node: Automatically extract and update cognitive state after every turn's output
@@ -314,11 +315,17 @@ export class AgentRuntime {
     if (call.name === 'sys.endTask') {
       if (typeof call.arguments.waitForUser === 'string' && call.arguments.waitForUser) {
         task.status = 'waiting_user';
-        this.addEvent(task, { turnId, type: 'answer', text: call.arguments.waitForUser });
+        const hasAnswer = task.events.some(e => e.turnId === turnId && e.type === 'answer');
+        if (!hasAnswer) {
+          this.addEvent(task, { turnId, type: 'answer', text: call.arguments.waitForUser });
+        }
       } else {
         task.status = 'completed';
         const response = typeof call.arguments.finalResponse === 'string' ? call.arguments.finalResponse : '任务完成。';
-        this.addEvent(task, { turnId, type: 'answer', text: response });
+        const hasAnswer = task.events.some(e => e.turnId === turnId && e.type === 'answer');
+        if (!hasAnswer) {
+          this.addEvent(task, { turnId, type: 'answer', text: response });
+        }
         task.summary = response || task.summary;
       }
       this.updateLastTool(task, call.id, 'succeeded', `已完成：${call.name}`, { output: '任务已结束' });

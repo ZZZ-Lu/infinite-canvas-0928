@@ -113,23 +113,7 @@
   transition: none !important;
 }
 
-#canvas-workspace[data-zooming="true"] .asset-card,
-#canvas-workspace[data-panning="true"] .asset-card,
-#canvas-workspace[data-gesture="true"] .asset-card,
-#canvas-workspace[data-zooming="true"] .generation-card,
-#canvas-workspace[data-panning="true"] .generation-card,
-#canvas-workspace[data-gesture="true"] .generation-card,
-#canvas-workspace[data-zooming="true"] .generation-card-body,
-#canvas-workspace[data-panning="true"] .generation-card-body,
-#canvas-workspace[data-gesture="true"] .generation-card-body,
-#canvas-workspace[data-zooming="true"] .generation-card-bottom-panel,
-#canvas-workspace[data-panning="true"] .generation-card-bottom-panel,
-#canvas-workspace[data-gesture="true"] .generation-card-bottom-panel {
-  box-shadow: none !important;
-  filter: none !important;
-  backdrop-filter: none !important;
-  transition: none !important;
-}
+/* 4K Performance & Intent-Driven Lazy Degradation: Keep cards visible but strip heavy effects */
 
 #canvas-workspace[data-zooming="true"] .asset-card .squircle,
 #canvas-workspace[data-panning="true"] .asset-card .squircle,

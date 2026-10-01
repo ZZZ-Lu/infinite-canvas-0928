@@ -336,6 +336,12 @@ export interface CardData {
   generationError?: string;
   lastGeneratedPrompt?: string;
   baselineConfig?: CardBaselineConfig;
+  chatHistory?: Array<{
+    id: string;
+    role: 'user' | 'assistant';
+    text: string;
+    timestamp?: number;
+  }>;
 }
 
 const refDimensionsCache = new Map<string, { width: number; height: number }>();
@@ -557,6 +563,7 @@ export interface GenerationCardProps {
   tx: MotionValue<number>;
   ty: MotionValue<number>;
   isSelected?: boolean;
+  isAgentTarget?: boolean;
   isZooming?: boolean;
   allCards?: CardData[];
   currentProject?: ScriptProject;
@@ -579,6 +586,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   tx, 
   ty, 
   isSelected, 
+  isAgentTarget,
   isZooming,
   allCards,
   currentProject,
@@ -2621,37 +2629,45 @@ export const GenerationCard = React.memo(function GenerationCard({
           className={`generation-card-body pointer-events-auto relative shrink-0 overflow-hidden cursor-grab active:cursor-grabbing bg-gray-100 dark:bg-neutral-800 squircle self-start ease-out [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
             pickerSelectionIndex && pickerSelectionIndex > 0
               ? 'outline outline-[4px] outline-[#2563eb] shadow-[0_0_25px_rgba(37,99,235,0.7)] scale-[1.015]'
-              : isPickerTarget
-                ? 'outline outline-[#3b82f6]'
-                : isSelected
+              : isAgentTarget
+                ? 'outline outline-[#a855f7]'
+                : isPickerTarget
                   ? 'outline outline-[#3b82f6]'
-                  : 'outline-none'
+                  : isSelected
+                    ? 'outline outline-[#3b82f6]'
+                    : 'outline-none'
           } ${
             pickerSelectionIndex && pickerSelectionIndex > 0
               ? 'translate-y-0'
-              : isSelected 
-                ? 'border-transparent shadow-[0_20px_40px_-8px_rgba(0,0,0,0.2),0_12px_24px_-6px_rgba(0,0,0,0.12)] dark:shadow-[0_24px_48px_-8px_rgba(0,0,0,0.6)] translate-y-0' 
-                : isPickerTarget
-                  ? 'border-transparent shadow-[0_20px_40px_-8px_rgba(0,0,0,0.2),0_12px_24px_-6px_rgba(0,0,0,0.12)] dark:shadow-[0_24px_48px_-8px_rgba(0,0,0,0.6)]'
-                  : isPickerSelectable
-                    ? 'border border-gray-300 dark:border-neutral-600 shadow-[0_1px_3px_rgba(0,0,0,0.1)] translate-y-0 hover:shadow-[0_8px_16px_rgba(59,130,246,0.25)] hover:border-blue-400 dark:hover:border-blue-400/80 hover:outline hover:outline-2 hover:outline-blue-400/50 cursor-pointer'
-                    : 'border border-gray-200/90 dark:border-[#404040]/90 shadow-[0_1px_2px_rgba(0,0,0,0.06),0_0_1px_rgba(0,0,0,0.08)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)] translate-y-0 hover:shadow-[0_3px_8px_rgba(0,0,0,0.08)] hover:border-gray-300 dark:hover:border-neutral-600'
+              : isAgentTarget
+                ? 'border-transparent shadow-[0_0_25px_rgba(168,85,247,0.45),0_20px_40px_-8px_rgba(0,0,0,0.18)] dark:shadow-[0_0_30px_rgba(168,85,247,0.55),0_24px_48px_-8px_rgba(0,0,0,0.65)] translate-y-0'
+                : isSelected 
+                  ? 'border-transparent shadow-[0_20px_40px_-8px_rgba(0,0,0,0.2),0_12px_24px_-6px_rgba(0,0,0,0.12)] dark:shadow-[0_24px_48px_-8px_rgba(0,0,0,0.6)] translate-y-0' 
+                  : isPickerTarget
+                    ? 'border-transparent shadow-[0_20px_40px_-8px_rgba(0,0,0,0.2),0_12px_24px_-6px_rgba(0,0,0,0.12)] dark:shadow-[0_24px_48px_-8px_rgba(0,0,0,0.6)]'
+                    : isPickerSelectable
+                      ? 'border border-gray-300 dark:border-neutral-600 shadow-[0_1px_3px_rgba(0,0,0,0.1)] translate-y-0 hover:shadow-[0_8px_16px_rgba(59,130,246,0.25)] hover:border-blue-400 dark:hover:border-blue-400/80 hover:outline hover:outline-2 hover:outline-blue-400/50 cursor-pointer'
+                      : 'border border-gray-200/90 dark:border-[#404040]/90 shadow-[0_1px_2px_rgba(0,0,0,0.06),0_0_1px_rgba(0,0,0,0.08)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)] translate-y-0 hover:shadow-[0_3px_8px_rgba(0,0,0,0.08)] hover:border-gray-300 dark:hover:border-neutral-600'
           }`}
           style={{ 
             width: w, 
             height: h,
             outlineWidth: pickerSelectionIndex && pickerSelectionIndex > 0 
               ? 'calc(4px / var(--current-scale, 1))' 
-              : isPickerTarget
-                ? 'calc(2px / var(--current-scale, 1))'
-                : isSelected 
-                  ? 'calc(2px / var(--current-scale, 1))' 
-                  : '0px',
+              : isAgentTarget
+                ? 'calc(2.5px / var(--current-scale, 1))'
+                : isPickerTarget
+                  ? 'calc(2px / var(--current-scale, 1))'
+                  : isSelected 
+                    ? 'calc(2px / var(--current-scale, 1))' 
+                    : '0px',
             boxShadow: pickerSelectionIndex && pickerSelectionIndex > 0
               ? '0 12px 30px rgba(37, 99, 235, 0.45)'
-              : isSelected 
-                ? '0 20px 40px -8px rgba(0, 0, 0, 0.22)' 
-                : undefined,
+              : isAgentTarget
+                ? undefined // Allow beautiful classes with fluorescent glows in className to take precedence!
+                : isSelected 
+                  ? '0 20px 40px -8px rgba(0, 0, 0, 0.22)' 
+                  : undefined,
             transitionProperty: 'box-shadow, border-color, width, height, outline-color, outline-width',
             transitionDuration: '180ms',
             transitionTimingFunction: 'ease-out'

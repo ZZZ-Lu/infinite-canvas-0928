@@ -82,9 +82,19 @@ export const CanvasLineageOverlay: React.FC<CanvasLineageOverlayProps> = React.m
 
   useEffect(() => {
     if (!scale) return;
-    return scale.on('change', (s) => {
-      setCurrentScale(s);
+    let rafId: number | null = null;
+    const unsub = scale.on('change', (s) => {
+      if (rafId === null) {
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          setCurrentScale(s);
+        });
+      }
     });
+    return () => {
+      unsub();
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
   }, [scale]);
 
   // ONLY render when cards are actively selected

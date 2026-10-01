@@ -14,13 +14,23 @@ const customStatePromptFilePath = path.join(customPromptDir, "stateNodePrompt.tx
 
 function getPrompt(type: 'main' | 'state' = 'main') {
   try {
+    const isProd = process.env.NODE_ENV === 'production';
     const customPath = type === 'state' ? customStatePromptFilePath : customPromptFilePath;
     const defaultPath = type === 'state' ? defaultStatePromptFilePath : defaultPromptFilePath;
-    if (fs.existsSync(customPath)) {
-      return fs.readFileSync(customPath, "utf-8");
-    }
-    if (fs.existsSync(defaultPath)) {
-      return fs.readFileSync(defaultPath, "utf-8");
+    if (isProd) {
+      if (fs.existsSync(customPath)) {
+        return fs.readFileSync(customPath, "utf-8");
+      }
+      if (fs.existsSync(defaultPath)) {
+        return fs.readFileSync(defaultPath, "utf-8");
+      }
+    } else {
+      if (fs.existsSync(defaultPath)) {
+        return fs.readFileSync(defaultPath, "utf-8");
+      }
+      if (fs.existsSync(customPath)) {
+        return fs.readFileSync(customPath, "utf-8");
+      }
     }
     return "";
   } catch (e) {
@@ -802,25 +812,65 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       
       const narration: string[] = [];
       let speakText = '';
+      let fullAnswerText = '';
+
       if (message.reasoning_content && message.reasoning_content.trim()) {
         narration.push(message.reasoning_content.trim());
       }
       if (typeof message.content === 'string' && message.content.trim()) {
         const fullContent = message.content;
-        const speakMatch = fullContent.match(/对用户说的话：([\s\S]*?)(?=\{\{|$)/);
-        if (speakMatch && speakMatch[1]) {
-          speakText = speakMatch[1].trim();
+
+        // 1. Match short version: 对用户说的话（简版） or 对用户说的话(简版)
+        const shortMatch = fullContent.match(/(?:-|\*|\+)?\s*对用户说的话\s*[（(]\s*简版\s*[）)]\s*[:：]\s*[“"']?([\s\S]*?)[”"']?(?=(?:(?:-|\*|\+)?\s*对用户说的话\s*[（(]\s*完整版\s*[）)]|\{\{|$))/i);
+        if (shortMatch && shortMatch[1]) {
+          speakText = shortMatch[1].replace(/^[“"'\s]+|[”"'\s]+$/g, '').trim();
         }
-        
-        let cleanContent = fullContent.replace(/对用户说的话：[\s\S]*?(?=\{\{|$)/, '').replace(/\{\{[\s\S]*?\}\}/g, '').trim();
-        cleanContent = cleanContent.replace(/<thought>[\s\S]*?<\/thought>/gi, '').trim();
-        cleanContent = cleanContent.replace(/<thought>/g, '').replace(/<\/thought>/g, '').trim();
+
+        // 2. Match full version: 对用户说的话（完整版） or 对用户说的话(完整版)
+        const fullMatch = fullContent.match(/(?:-|\*|\+)?\s*对用户说的话\s*[（(]\s*完整版\s*[）)]\s*[:：]\s*[“"']?([\s\S]*?)[”"']?(?=(?:(?:-|\*|\+)?\s*对用户说的话\s*[（(]\s*简版\s*[）)]|\{\{|$))/i);
+        if (fullMatch && fullMatch[1]) {
+          fullAnswerText = fullMatch[1].replace(/^[“"'\s]+|[”"'\s]+$/g, '').trim();
+        }
+
+        // 3. Fallback for legacy format: 对用户说的话：...
+        if (!speakText && !fullAnswerText) {
+          const legacyMatch = fullContent.match(/(?:-|\*|\+)?\s*对用户说的话\s*[:：]\s*[“"']?([\s\S]*?)[”"']?(?=\{\{|$)/i);
+          if (legacyMatch && legacyMatch[1]) {
+            const raw = legacyMatch[1].replace(/^[“"'\s]+|[”"'\s]+$/g, '').trim();
+            if (raw.length <= 40) {
+              speakText = raw;
+              fullAnswerText = raw;
+            } else {
+              speakText = raw.slice(0, 30) + '...';
+              fullAnswerText = raw;
+            }
+          }
+        }
+
+        // If only full version exists, extract first sentence for speakText
+        if (!speakText && fullAnswerText) {
+          const firstSentence = fullAnswerText.split(/[。！？\n]/)[0] || fullAnswerText;
+          speakText = firstSentence.length > 30 ? firstSentence.slice(0, 28) + '...' : firstSentence;
+        }
+        // If only short version exists, fullAnswerText defaults to speakText
+        if (!fullAnswerText && speakText) {
+          fullAnswerText = speakText;
+        }
+
+        let cleanContent = fullContent
+          .replace(/(?:-|\*|\+)?\s*对用户说的话\s*[（(][^）)]*[）)]\s*[:：][\s\S]*?(?=(?:(?:-|\*|\+)?\s*对用户说的话|\{\{|$))/gi, '')
+          .replace(/(?:-|\*|\+)?\s*对用户说的话\s*[:：][\s\S]*?(?=\{\{|$)/gi, '')
+          .replace(/\{\{[\s\S]*?\}\}/g, '')
+          .replace(/<thought>[\s\S]*?<\/thought>/gi, '')
+          .replace(/<thought>/g, '').replace(/<\/thought>/g, '')
+          .trim();
+
         if (cleanContent) {
           narration.push(cleanContent);
         }
       }
       
-      let parsed: any = { narration, speak: speakText };
+      let parsed: any = { narration, speak: speakText, response: fullAnswerText, fullAnswer: message.content || '' };
       const allowedTools = enabledToolIds;
       const toolNameByFunction = new Map(AGENT_TOOL_REGISTRY.map((tool) => [functionNameForTool(tool.id), tool.id]));
       
@@ -906,6 +956,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       res.json({
         narration: Array.isArray(parsed.narration) ? parsed.narration.filter((item: unknown) => typeof item === 'string') : [],
         speak: typeof parsed.speak === 'string' ? parsed.speak : undefined,
+        fullAnswer: typeof parsed.fullAnswer === 'string' ? parsed.fullAnswer : undefined,
         taskTitle: typeof parsed.taskTitle === 'string' ? parsed.taskTitle : undefined,
         goal: typeof parsed.goal === 'string' ? parsed.goal : undefined,
         progress: typeof parsed.progress === 'string' ? parsed.progress : undefined,

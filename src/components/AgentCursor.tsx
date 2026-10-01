@@ -1,5 +1,18 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion, MotionValue, useTransform, useMotionValue, animate, AnimatePresence } from 'motion/react';
+import { ArrowUp } from 'lucide-react';
+
+export interface QuickInputConfig {
+  isOpen: boolean;
+  targetId: string | null;
+  placeholder?: string;
+  lastReply?: string;
+  onSubmit: (text: string) => void;
+  onClose: () => void;
+  focusTrigger?: number;
+  value: string;
+  onChange: (text: string) => void;
+}
 
 interface AgentCursorProps {
   agentState: {
@@ -17,7 +30,15 @@ interface AgentCursorProps {
   };
   isIdle?: boolean;
   isZooming?: boolean;
+  quickInput?: QuickInputConfig | null;
+  onClickPointer?: () => void;
   onDragAgent?: (newCanvasX: number, newCanvasY: number) => void;
+  onDragAgentEnd?: (finalCanvasX: number, finalCanvasY: number, screenX: number, screenY: number) => void;
+  onDismissSpeak?: () => void;
+  isDarkMode?: boolean;
+  onStartAgentBoxSelect?: (canvasX: number, canvasY: number) => void;
+  onUpdateAgentBoxSelect?: (canvasX: number, canvasY: number) => void;
+  onEndAgentBoxSelect?: () => void;
 }
 
 const CURSOR_FLOAT_VARIANTS = {
@@ -39,9 +60,171 @@ const CURSOR_FLOAT_VARIANTS = {
   },
 };
 
-export function AgentCursor({ agentState, transform, isIdle = true, isZooming = false, onDragAgent }: AgentCursorProps) {
+function SingleLineMarquee({ text, isDarkMode }: { text: string; isDarkMode?: boolean }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const textRef = useRef<HTMLSpanElement>(null);
+  const [overflow, setOverflow] = useState(0);
+
+  const isThinking = text.includes('思考') || 
+                     text.includes('处理') || 
+                     text.includes('分析') || 
+                     text.includes('执行') || 
+                     text.includes('inspect') || 
+                     text.includes('tool') || 
+                     text.includes('正在') ||
+                     text.includes('mira');
+
+  useEffect(() => {
+    if (containerRef.current && textRef.current) {
+      const containerWidth = containerRef.current.clientWidth;
+      const textWidth = textRef.current.scrollWidth;
+      if (textWidth > containerWidth) {
+        setOverflow(textWidth - containerWidth + 24);
+      } else {
+        setOverflow(0);
+      }
+    }
+  }, [text]);
+
+  const textStyleClass = isDarkMode 
+    ? "inline-block text-[13px] font-semibold leading-none text-[#a855f7] tracking-wide"
+    : "inline-block text-[13px] font-semibold leading-none text-purple-600 tracking-wide";
+
+  const dotColorClass = isDarkMode ? 'bg-[#a855f7]' : 'bg-purple-600';
+
+  return (
+    <div
+      ref={containerRef}
+      className="overflow-hidden whitespace-nowrap max-w-[420px] min-w-[30px] flex items-center justify-center gap-1.5"
+    >
+      {isThinking ? (
+        <span className="flex items-center gap-1 px-1 py-1 shrink-0">
+          <motion.span 
+            className={`inline-block w-1.5 h-1.5 rounded-full ${dotColorClass}`}
+            animate={{ y: [0, -3.5, 0] }}
+            transition={{ duration: 0.8, repeat: Infinity, ease: 'easeInOut', delay: 0 }}
+          />
+          <motion.span 
+            className={`inline-block w-1.5 h-1.5 rounded-full ${dotColorClass}`}
+            animate={{ y: [0, -3.5, 0] }}
+            transition={{ duration: 0.8, repeat: Infinity, ease: 'easeInOut', delay: 0.15 }}
+          />
+          <motion.span 
+            className={`inline-block w-1.5 h-1.5 rounded-full ${dotColorClass}`}
+            animate={{ y: [0, -3.5, 0] }}
+            transition={{ duration: 0.8, repeat: Infinity, ease: 'easeInOut', delay: 0.3 }}
+          />
+        </span>
+      ) : overflow > 0 ? (
+        <motion.span
+          ref={textRef}
+          key={text}
+          className={textStyleClass}
+          animate={{ x: [0, -overflow, -overflow, 0, 0] }}
+          transition={{
+            duration: Math.max(5, overflow / 24),
+            repeat: Infinity,
+            repeatDelay: 1.5,
+            times: [0, 0.45, 0.6, 0.95, 1],
+            ease: 'easeInOut',
+          }}
+        >
+          {text}
+        </motion.span>
+      ) : (
+        <span
+          ref={textRef}
+          key={text}
+          className={textStyleClass}
+        >
+          {text}
+        </span>
+      )}
+    </div>
+  );
+}
+
+export function AgentCursor({ 
+  agentState, 
+  transform, 
+  isIdle = true, 
+  isZooming = false, 
+  quickInput, 
+  onClickPointer, 
+  onDragAgent, 
+  onDragAgentEnd, 
+  isDarkMode = false,
+  onStartAgentBoxSelect,
+  onUpdateAgentBoxSelect,
+  onEndAgentBoxSelect
+}: AgentCursorProps) {
   const [isDragging, setIsDragging] = useState(false);
-  const dragStartRef = useRef<{ pointerX: number; pointerY: number; startCanvasX: number; startCanvasY: number } | null>(null);
+  const [isAgentBoxSelecting, setIsAgentBoxSelecting] = useState(false);
+  const isAgentBoxSelectingRef = useRef(false);
+  const longPressTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const dragStartRef = useRef<{ pointerX: number; pointerY: number; startCanvasX: number; startCanvasY: number; hasMoved: boolean } | null>(null);
+
+  const quickInputRef = useRef<HTMLInputElement>(null);
+
+  // Swapped: Light/Dark Mode Agent Pointer Styles Interchanged!
+  const pointerFill = isDarkMode ? '#1c1c1e' : '#ffffff';
+  const bubbleBgClass = isDarkMode ? 'bg-neutral-900/92 border border-neutral-800/15' : 'bg-white/92 border border-neutral-100/10';
+  const textClass = isDarkMode ? 'text-[#a855f7] font-semibold' : 'text-purple-600 font-semibold';
+  const placeholderClass = isDarkMode ? 'placeholder-[#a855f7]/45' : 'placeholder-purple-500/45';
+  const inputClass = isDarkMode ? 'text-[#a855f7]' : 'text-purple-600';
+  const buttonClassActive = isDarkMode ? 'bg-[#a855f7]/15 hover:bg-[#a855f7]/25 text-[#a855f7]' : 'bg-purple-500/10 hover:bg-purple-500/20 text-purple-600';
+  const buttonClassInactive = isDarkMode ? 'text-[#a855f7]/30' : 'text-purple-500/35';
+
+  const isOpen = quickInput?.isOpen;
+  const focusTrigger = quickInput?.focusTrigger;
+
+  useEffect(() => {
+    if (isOpen) {
+      // Resilient multi-stage focus strategy to bypass browser context menu and right-click focus-stealing cycles:
+      // Stage 1: Immediate focus attempt
+      quickInputRef.current?.focus();
+      
+      // Stage 2: Animation frame focus attempt
+      const rId = requestAnimationFrame(() => {
+        quickInputRef.current?.focus();
+      });
+
+      // Stage 3: Bulletproof timeout focus attempt (fires after browser mouse/selection events settle)
+      const timer = setTimeout(() => {
+        if (quickInputRef.current) {
+          quickInputRef.current.focus();
+          const len = quickInputRef.current.value.length;
+          quickInputRef.current.setSelectionRange(len, len);
+        }
+      }, 120);
+
+      return () => {
+        cancelAnimationFrame(rId);
+        clearTimeout(timer);
+      };
+    }
+  }, [isOpen, focusTrigger]);
+
+  // Auto-blur quick input when clicking elsewhere to release focus (without closing the agent dialogue)
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const handleDocumentClick = (e: PointerEvent) => {
+      const formEl = quickInputRef.current?.form;
+      const target = e.target as HTMLElement;
+      
+      // If the target is NOT inside the form, blur the input to cancel focus, but KEEP the dialogue open!
+      if (formEl && !formEl.contains(target)) {
+        quickInputRef.current?.blur();
+      }
+    };
+
+    // Listen with capture on pointerdown to intercept click-away gestures across the application
+    document.addEventListener('pointerdown', handleDocumentClick, true);
+    return () => {
+      document.removeEventListener('pointerdown', handleDocumentClick, true);
+    };
+  }, [isOpen]);
 
   // Animate the agent's canvas position smoothly when moved programmatically
   const agentCanvasX = useMotionValue(agentState.x);
@@ -79,42 +262,103 @@ export function AgentCursor({ agentState, transform, isIdle = true, isZooming = 
     e.preventDefault();
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
 
-    setIsDragging(true);
+    isAgentBoxSelectingRef.current = false;
+    setIsAgentBoxSelecting(false);
+
     dragStartRef.current = {
       pointerX: e.clientX,
       pointerY: e.clientY,
       startCanvasX: agentState.x,
-      startCanvasY: agentState.y
+      startCanvasY: agentState.y,
+      hasMoved: false
     };
+
+    // Start a 350ms long-press timer for Agent box-selection mode!
+    longPressTimerRef.current = setTimeout(() => {
+      if (dragStartRef.current && !dragStartRef.current.hasMoved) {
+        isAgentBoxSelectingRef.current = true;
+        setIsAgentBoxSelecting(true);
+        onStartAgentBoxSelect?.(agentState.x, agentState.y);
+      }
+    }, 350);
   };
 
   const handlePointerMove = (e: React.PointerEvent) => {
-    if (!isDragging || !dragStartRef.current) return;
+    if (!dragStartRef.current) return;
     e.stopPropagation();
     e.preventDefault();
 
-    const dx = (e.clientX - dragStartRef.current.pointerX) / transform.tScale.get();
-    const dy = (e.clientY - dragStartRef.current.pointerY) / transform.tScale.get();
+    const dist = Math.hypot(e.clientX - dragStartRef.current.pointerX, e.clientY - dragStartRef.current.pointerY);
+    if (!dragStartRef.current.hasMoved && dist > 3) {
+      dragStartRef.current.hasMoved = true;
+      if (!isAgentBoxSelectingRef.current) {
+        if (longPressTimerRef.current) {
+          clearTimeout(longPressTimerRef.current);
+          longPressTimerRef.current = null;
+        }
+        setIsDragging(true);
+      }
+    }
 
-    const newX = dragStartRef.current.startCanvasX + dx;
-    const newY = dragStartRef.current.startCanvasY + dy;
+    if (isAgentBoxSelectingRef.current) {
+      const currentCanvasX = dragStartRef.current.startCanvasX + (e.clientX - dragStartRef.current.pointerX) / transform.tScale.get();
+      const currentCanvasY = dragStartRef.current.startCanvasY + (e.clientY - dragStartRef.current.pointerY) / transform.tScale.get();
+      onUpdateAgentBoxSelect?.(currentCanvasX, currentCanvasY);
+    } else if (dragStartRef.current.hasMoved) {
+      const dx = (e.clientX - dragStartRef.current.pointerX) / transform.tScale.get();
+      const dy = (e.clientY - dragStartRef.current.pointerY) / transform.tScale.get();
 
-    onDragAgent?.(newX, newY);
+      const newX = dragStartRef.current.startCanvasX + dx;
+      const newY = dragStartRef.current.startCanvasY + dy;
+
+      onDragAgent?.(newX, newY);
+    }
   };
 
   const handlePointerUp = (e: React.PointerEvent) => {
-    if (!isDragging) return;
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+
+    if (!dragStartRef.current) return;
     e.stopPropagation();
     try {
       (e.target as HTMLElement).releasePointerCapture(e.pointerId);
     } catch {}
+
+    const wasBoxSelecting = isAgentBoxSelectingRef.current;
+    const wasMoved = dragStartRef.current.hasMoved;
+    const dx = (e.clientX - dragStartRef.current.pointerX) / transform.tScale.get();
+    const dy = (e.clientY - dragStartRef.current.pointerY) / transform.tScale.get();
+    const finalX = dragStartRef.current.startCanvasX + dx;
+    const finalY = dragStartRef.current.startCanvasY + dy;
+
     setIsDragging(false);
+    setIsAgentBoxSelecting(false);
+    isAgentBoxSelectingRef.current = false;
     dragStartRef.current = null;
+
+    if (wasBoxSelecting) {
+      onEndAgentBoxSelect?.();
+    } else if (!wasMoved) {
+      onClickPointer?.();
+    } else {
+      onDragAgentEnd?.(finalX, finalY, e.clientX, e.clientY);
+      // 🚀 Bulletproof delayed focus on drag release to bypass browser mouseup focus-clearing cycles
+      setTimeout(() => {
+        if (quickInputRef.current) {
+          quickInputRef.current.focus();
+          const len = quickInputRef.current.value.length;
+          quickInputRef.current.setSelectionRange(len, len);
+        }
+      }, 150);
+    }
   };
 
   return (
     <motion.div
-      className="fixed top-0 left-0 z-[9999] flex items-start select-none"
+      className="fixed top-0 left-0 z-[9999] flex items-center select-none pointer-events-none"
       style={{ x: targetScreenX, y: targetScreenY }}
       initial={false}
       animate={{ 
@@ -126,56 +370,157 @@ export function AgentCursor({ agentState, transform, isIdle = true, isZooming = 
         scale: { type: 'spring', damping: 15, stiffness: 200 }
       }}
     >
+      {/* Floating Wrapper that animates both the Cursor and Speech Bubble together */}
       <motion.div
-        className="relative group cursor-grab active:cursor-grabbing p-2 -m-2 touch-none pointer-events-auto"
+        className="relative flex items-center"
         variants={CURSOR_FLOAT_VARIANTS}
         animate={!isDragging && isIdle ? 'floating' : 'still'}
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerUp}
       >
-        <svg
-          width="36"
-          height="36"
-          viewBox="0 0 24 24"
-          fill="none"
-          xmlns="http://www.w3.org/2000/svg"
-          className="drop-shadow-lg relative z-10 transition-transform group-hover:scale-110 active:scale-95"
-          style={{ marginLeft: '-4.5px', marginTop: '-3.5px' }}
+        {/* Agent Pointer Cursor */}
+        <div
+          className="relative group cursor-grab active:cursor-grabbing p-2 -m-2 touch-none pointer-events-auto shrink-0"
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
         >
-          <path
-            d="M4.5 3.5L19.5 11.5L12 13L10.5 20.5L4.5 3.5Z"
-            fill="#8b5cf6" 
-            stroke="white"
-            strokeWidth="1.5"
-            strokeLinejoin="round"
-          />
-        </svg>
-      </motion.div>
-      
-      {/* Speaking Text UI without bubble */}
-      <AnimatePresence mode="wait">
-        {agentState.speak && (
-          <motion.div
-            initial={{ opacity: 0, width: 0 }}
-            animate={{ opacity: 1, width: 'auto' }}
-            exit={{ opacity: 0 }}
-            className="absolute left-8 top-8 z-0 pointer-events-none whitespace-nowrap overflow-hidden"
+          <svg
+            width="36"
+            height="36"
+            viewBox="0 0 24 24"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+            className="drop-shadow-lg relative z-10 transition-transform group-hover:scale-110 active:scale-95 cursor-pointer"
+            style={{ marginLeft: '-4.5px', marginTop: '-3.5px' }}
           >
-            <motion.p
-              initial={{ display: 'none' }}
-              animate={{ display: 'block' }}
-              className="text-[13px] font-medium text-slate-700 dark:text-slate-200 drop-shadow-md tracking-wide"
-              style={{ textShadow: '0 1px 2px rgba(0,0,0,0.1), 0 0 8px rgba(255,255,255,0.8)' }}
-            >
-              {agentState.speak}
-            </motion.p>
-          </motion.div>
-        )}
-      </AnimatePresence>
+            <path
+              d="M4.5 3.5L19.5 11.5L12 13L10.5 20.5L4.5 3.5Z"
+              fill={pointerFill} 
+              stroke="#a855f7"
+              strokeWidth="1.5"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </div>
+        
+        {/* Stacked Agent HUD beside Cursor */}
+        <div className="absolute left-7.5 top-0.5 flex flex-col gap-1.5 items-start pointer-events-none">
+          {/* Row 1 (If exists): Last round's assistant reply - Positioned absolutely above the main bubble */}
+          <AnimatePresence>
+            {quickInput?.isOpen && quickInput.lastReply && (
+              <motion.div
+                key={quickInput.lastReply}
+                initial={{ opacity: 0, y: 4, scale: 0.95 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: -4, scale: 0.95 }}
+                transition={{ duration: 0.25, ease: 'easeOut' }}
+                className="absolute bottom-full mb-1.5 left-0 pointer-events-none select-none shrink-0 z-20"
+              >
+                <div className="relative px-3.5 py-1.5 flex items-center">
+                  <div 
+                    className={`absolute inset-0 rounded-full filter blur-[6px] opacity-90 ${bubbleBgClass}`} 
+                    style={{
+                      willChange: 'transform',
+                      transform: 'translate3d(0,0,0)'
+                    }}
+                  />
+                  <div className="relative z-10 flex items-center max-w-[360px]">
+                    <SingleLineMarquee text={quickInput.lastReply} isDarkMode={isDarkMode} />
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+ 
+          {/* Row 2: Speaking Text UI: Ethereal Feathered Purple Aura Pill - This is the top flow element, aligned with pointer */}
+          <AnimatePresence mode="wait">
+            {agentState.speak && (
+              <motion.div
+                key={agentState.speak}
+                initial={{ opacity: 0, x: -6, y: 2, scale: 0.95 }}
+                animate={{ opacity: 1, x: 0, y: 0, scale: 1 }}
+                exit={{ opacity: 0, x: -4, y: -2, scale: 0.95 }}
+                transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
+                className="pointer-events-none select-none shrink-0"
+              >
+                <div className="relative px-3.5 py-1.5 flex items-center">
+                  <div 
+                    className={`absolute inset-0 rounded-full filter blur-[6px] opacity-95 ${bubbleBgClass}`} 
+                    style={{
+                      willChange: 'transform',
+                      transform: 'translate3d(0,0,0)'
+                    }}
+                  />
+                  <div className="relative z-10 flex items-center">
+                    <SingleLineMarquee text={agentState.speak} isDarkMode={isDarkMode} />
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+ 
+          {/* Row 3: Quick Input Box - Spaced naturally below the speaking bubble */}
+          <AnimatePresence>
+            {quickInput?.isOpen && (
+              <motion.div
+                initial={{ opacity: 0, y: -2, scale: 0.96 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: -8, scale: 0.92, transition: { duration: 0.2, ease: 'easeIn' } }}
+                transition={{ duration: 0.24, ease: [0.16, 1, 0.3, 1] }}
+                className="pointer-events-auto select-none shrink-0"
+                onPointerDown={(e) => e.stopPropagation()}
+              >
+                <div className="relative flex items-center w-[290px]">
+                  <div 
+                    className={`absolute inset-0 rounded-full filter blur-[6px] opacity-95 ${bubbleBgClass}`} 
+                    style={{
+                      willChange: 'transform',
+                      transform: 'translate3d(0,0,0)'
+                    }}
+                  />
+                  
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      const val = quickInput?.value || '';
+                      const clean = val.trim();
+                      if (clean) {
+                        quickInput.onSubmit(clean);
+                      }
+                    }}
+                    className="relative z-10 flex items-center w-full px-3 py-1 gap-1.5"
+                  >
+                    <input
+                      ref={quickInputRef}
+                      type="text"
+                      value={quickInput?.value || ''}
+                      onChange={(e) => quickInput?.onChange(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Escape') {
+                          quickInput.onClose();
+                        }
+                      }}
+                      placeholder={quickInput.placeholder || "输入你的想法..."}
+                      className={`flex-1 min-w-0 bg-transparent text-[13px] font-medium outline-none leading-none py-1 caret-[#a855f7] ${inputClass} ${placeholderClass}`}
+                    />
+                    <button
+                      type="submit"
+                      disabled={!(quickInput?.value || '').trim()}
+                      className={`w-6 h-6 rounded-full flex items-center justify-center transition-all shrink-0 ${
+                        (quickInput?.value || '').trim()
+                          ? buttonClassActive + ' cursor-pointer active:scale-95'
+                          : buttonClassInactive + ' cursor-not-allowed'
+                      }`}
+                    >
+                      <ArrowUp size={13} strokeWidth={2.5} />
+                    </button>
+                  </form>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+      </motion.div>
     </motion.div>
   );
 }
-
-
