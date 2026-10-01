@@ -313,12 +313,32 @@ export class AgentRuntime {
     }
 
     if (call.name === 'sys.endTask') {
+      const isPaused = Boolean(
+        call.arguments.paused ||
+        call.arguments.isPaused ||
+        call.arguments.status === 'paused' ||
+        (typeof call.arguments.finalResponse === 'string' && (
+          call.arguments.finalResponse.includes('后台') ||
+          call.arguments.finalResponse.includes('渲染') ||
+          call.arguments.finalResponse.includes('排队') ||
+          call.arguments.finalResponse.includes('稍候')
+        ))
+      );
+
       if (typeof call.arguments.waitForUser === 'string' && call.arguments.waitForUser) {
         task.status = 'waiting_user';
         const hasAnswer = task.events.some(e => e.turnId === turnId && e.type === 'answer');
         if (!hasAnswer) {
           this.addEvent(task, { turnId, type: 'answer', text: call.arguments.waitForUser });
         }
+      } else if (isPaused) {
+        task.status = 'paused';
+        const response = typeof call.arguments.finalResponse === 'string' ? call.arguments.finalResponse : '任务已挂起暂停，等待后台事件唤醒。';
+        const hasAnswer = task.events.some(e => e.turnId === turnId && e.type === 'answer');
+        if (!hasAnswer) {
+          this.addEvent(task, { turnId, type: 'answer', text: response });
+        }
+        task.summary = response || task.summary;
       } else {
         task.status = 'completed';
         const response = typeof call.arguments.finalResponse === 'string' ? call.arguments.finalResponse : '任务完成。';

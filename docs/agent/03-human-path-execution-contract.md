@@ -69,12 +69,27 @@ type DirectorySpatialMap = {
 
 此对象只发送给动作系统。当前未显示的剧集没有有效屏幕坐标；如果 Agent 未从 `page.inspect` 看见“第 5 集”，目录工具不得用后台索引给鼠标提供“第 5 集”的隐藏位置。Agent 只能先决定滚动，等新的页面观察显示第 5 集，再决定点击它。
 
+## 人机链路 100% 归一规范 (Single Execution Pipeline Contract)
+
+> 规则：Agent 工具不得重新发明或单独实现一套后台生图、复刻、删除或更新逻辑。所有 Agent 工具的底层必须 100% 归一复用 UI 组件在人类用户点击按钮时执行的同一个 Handler 函数！
+
+1. **生图与复刻归一**：
+   - 当 Agent 调用 `card.generate` targeting 一张已出图卡片 (`completed`) 时，不得手工构造拼装新卡片或重写 Img2Img 逻辑；
+   - 必须直接复用人类 UI 点击卡片 `↑` 生成按钮时执行的同一个 `handleForkCard(sourceCard.id, config)` 函数；
+   - 继承源卡片的画幅 (`ratio`)、分辨率 (`res`)、模型 (`mcpModel`) 以及已有参考图集合，建立完全一致的父子血缘关系 (`derivedFromId`)；
+   - 绝不强行将源卡片自身图片塞为 Img2Img 参考图（除非显式传入 `referenceCardIds`）。
+
+2. **状态与属性更新归一**：
+   - 任何卡片更新或删除直接调用 UI 唯一的 `handleUpdateCard` 和 `handleDeleteCard`；
+   - Agent 能做的操作与人类用户在 UI 组件上能做的严格等价，绝无两套逻辑标准。
+
 ## 每次方案或实现前的检查
 
 1. 页面语义是否只经 `page.inspect` 进入 Agent 上下文？
 2. 位置数据是否只流向鼠标动作系统？
 3. 每次动作后是否重新观察页面才开始下一轮 Agent 决策？
 4. Runtime、工具是否保持执行职责，而没有代替 Agent 选择下一步？
+5. Agent 工具是否 100% 复用了人类 UI 对应的同一套执行 Handler，而非单独造了第二套逻辑？
 
 任何答案为“否”时，先修订方案，不能继续实现。
 

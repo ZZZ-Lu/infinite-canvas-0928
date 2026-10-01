@@ -95,6 +95,14 @@ const NODE_DEFINITIONS: NodeDefinition[] = [
     modelKey: 'agentModel',
   },
   {
+    key: 'json_adapter',
+    name: '工具 JSON 转译节点',
+    shortName: 'JSON Adapter',
+    description: '重构非标 JSON/伪代码/自然语言为符合 Schema 的标准工具参数',
+    promptKey: 'jsonAdapterPrompt',
+    modelKey: 'jsonAdapterModel',
+  },
+  {
     key: 'data_viewer',
     name: '项目数据看板',
     shortName: 'Data Viewer',
@@ -199,6 +207,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
         speak: "正在为你分析画面中的复古奢侈质感..."
       }
     }, null, 2),
+    json_adapter: '{{调用 card.generate, { referenceCardIds: ["rshuewfmu", "yow33r73x"], targetCardId: "new", prompt: "A stunning blonde woman with a glamorous silver fringe necklace, wearing a sheer deep-V evening gown, lying on a luxurious bed in a sensual pose.", aspectRatio: "9:16" }}}',
     data_viewer: '',
   }));
   const [completeInputEdits, setCompleteInputEdits] = useState<Partial<Record<NodeKey, string>>>({});
@@ -219,7 +228,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
     [selectedNode]
   );
   const activePromptKey = activeDefinition.promptKey;
-  const input = nodeInputs[selectedNode];
+  const input = nodeInputs[selectedNode] || '';
   const activeModel = activeDefinition.modelKey ? nodeModels[activeDefinition.modelKey] : 'auto';
   const result = nodeResults[selectedNode] || null;
   const setResult = (nextResult: any) => {

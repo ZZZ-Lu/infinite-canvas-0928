@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Braces, CheckCircle2, CircleAlert, Clock3, Cpu, Eye, MousePointer2, Send, TerminalSquare, Wrench } from 'lucide-react';
+import { Braces, CheckCircle2, CircleAlert, Clock3, Cpu, Eye, MousePointer2, Send, TerminalSquare, Wrench, Zap } from 'lucide-react';
 import type { AgentRuntimeTrace, AgentTurnTrace } from '../agent/debugTrace';
 import type { RuntimeEvent } from '../agent/runtime';
 
@@ -7,14 +7,14 @@ interface AgentRuntimeTracePanelProps {
   traces: AgentRuntimeTrace[];
 }
 
-type DetailTab = 'prompt' | 'output' | 'tools' | 'task' | 'stateNode';
+type DetailTab = 'prompt' | 'output' | 'tools' | 'task' | 'stateNode' | 'jsonAdapter';
 
 const json = (value: unknown) => JSON.stringify(value, null, 2);
 const clock = (value?: number) => value ? new Date(value).toLocaleTimeString('zh-CN', { hour12: false }) : '进行中';
 const duration = (turn: AgentTurnTrace) => turn.completedAt ? `${turn.completedAt - turn.startedAt} ms` : '进行中';
 
 const statusLabel = (status: string) => ({
-  planning: '规划中', waiting_tools: '等待工具', waiting_user: '等待用户', completed: '已完成', failed: '失败', cancelled: '已取消',
+  planning: '规划中', waiting_tools: '等待工具', waiting_user: '等待用户', completed: '已完成', failed: '失败', cancelled: '已取消', paused: '已暂停',
 }[status] || status);
 
 const eventIcon = (event: RuntimeEvent) => {
@@ -102,6 +102,16 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
                     状态节点
                   </span>
                 )}
+                {item.parsedResult?.jsonAdapterTrace && (
+                  <span 
+                    onClick={(e) => { e.stopPropagation(); setSelectedTurnId(item.id); setDetailTab('jsonAdapter'); }}
+                    className="inline-flex items-center gap-1 rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-700 hover:bg-amber-200 dark:bg-amber-900/60 dark:text-amber-300 dark:hover:bg-amber-800/80"
+                    title="点击查看此轮工具 JSON 转译节点记录"
+                  >
+                    <Zap size={10} />
+                    JSON转译
+                  </span>
+                )}
                 {item.error && <span className="text-red-500">· 请求失败</span>}
               </div>
             </button>;
@@ -116,6 +126,7 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
             ['output', Send, '模型输出'],
             ['tools', Wrench, '工具与组件'],
             ['stateNode', Cpu, '认知状态提取节点'],
+            ['jsonAdapter', Zap, 'JSON 转译节点'],
             ['task', CheckCircle2, '任务快照'],
           ] as const).map(([key, Icon, label]) => <button key={key} onClick={() => setDetailTab(key)} className={`flex h-8 items-center gap-1.5 rounded-lg px-3 text-xs ${detailTab === key ? 'bg-slate-100 font-medium text-slate-900 dark:bg-white/10 dark:text-white' : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}><Icon size={13} />{label}</button>)}
           <div className="ml-auto text-[10px] text-slate-400">{turn ? `${clock(turn.startedAt)} · ${duration(turn)}` : ''}</div>
@@ -154,6 +165,18 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
               <JsonBlock title="状态节点解析更新结果" value={turn.stateNodeTrace.response} />
             ) : (
               <PendingBlock text="本轮尚未产生状态节点更新数据。" />
+            )}
+          </div>}
+          {turn && detailTab === 'jsonAdapter' && <div className="space-y-4">
+            <TraceNotice
+              icon={<Zap size={15} />}
+              title="工具 JSON 转译节点（/api/agent/turn）"
+              text="当主模型输出非标 JSON、JS 对象语法或自然语言时触发。0毫秒极速模式优先修复语法，若不符合规范则唤醒转译 LLM 节点重构标准参数。"
+            />
+            {turn.parsedResult?.jsonAdapterTrace ? (
+              <JsonBlock title="转译节点运行模式与数据追踪" value={turn.parsedResult.jsonAdapterTrace} />
+            ) : (
+              <PendingBlock text="本轮主模型已直接输出标准 JSON，无需唤醒转译节点。" />
             )}
           </div>}
           {turn && detailTab === 'task' && <div className="space-y-4">

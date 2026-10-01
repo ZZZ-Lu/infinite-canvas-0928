@@ -1,6 +1,8 @@
 export type AgentToolName =
   | 'guide.lookup'
   | 'page.inspect'
+  | 'card.inspect'
+  | 'card.generate'
   | 'ui.actAndObserve'
   | 'sys.updateState'
   | 'sys.endTask'

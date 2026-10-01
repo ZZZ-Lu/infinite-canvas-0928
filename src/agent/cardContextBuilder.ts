@@ -65,8 +65,8 @@ export function isCardReferencedBy(parentCard: CardData, childCard: CardData): b
   // Check @Mentions in prompt
   const mentions = extractPromptMentions(childCard.prompt || '');
   if (mentions.length > 0 && parentCard.fileName) {
-    const parentCleanName = parentCard.fileName.replace(/\.[^/.]+$/, "").trim().toLowerCase();
-    if (mentions.some(m => m.toLowerCase() === parentCleanName || m.toLowerCase() === parentCard.id.toLowerCase())) {
+    const parentCleanName = (parentCard.fileName || '').replace(/\.[^/.]+$/, "").trim().toLowerCase();
+    if (mentions.some(m => m.toLowerCase() === parentCleanName || m.toLowerCase() === (parentCard.id || '').toLowerCase())) {
       return true;
     }
   }

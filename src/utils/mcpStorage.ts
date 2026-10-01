@@ -297,4 +297,12 @@ export async function deleteMcpKey(id: string): Promise<void> {
   });
 }
 
+export function getMcpConfig(): { token: string; serverUrl: string } {
+  const activeKey = getActiveMcpKeySync();
+  return {
+    token: activeKey?.token || getActiveMcpTokenSync(),
+    serverUrl: activeKey?.serverUrl || DEFAULT_SERVER_URL,
+  };
+}
+
 export { DEFAULT_SERVER_URL };

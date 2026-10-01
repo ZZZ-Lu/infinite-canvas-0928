@@ -66,18 +66,21 @@ export interface NodeModelConfig {
   agentModel: ExtractionModelType;
   tocInferModel: ExtractionModelType;
   changeAssessModel: ExtractionModelType;
+  jsonAdapterModel?: ExtractionModelType;
 }
 
 export const DEFAULT_NODE_MODELS: NodeModelConfig = {
   agentModel: 'deepseek-v4-flash',
   tocInferModel: 'deepseek-v4-flash',
-  changeAssessModel: 'deepseek-v4-flash'
+  changeAssessModel: 'deepseek-v4-flash',
+  jsonAdapterModel: 'deepseek-v4-flash'
 };
 
 export interface NodePromptConfig {
   tocInferSystemPrompt: string;
   changeAssessSystemPrompt: string;
   stateNodePrompt?: string;
+  jsonAdapterPrompt?: string;
 }
 
 export { CODE_PIPELINE_PROMPTS as DEFAULT_NODE_PROMPTS } from '../constants/prompts';

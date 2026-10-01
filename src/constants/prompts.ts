@@ -53,5 +53,18 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = {
   "notes": "提取关键笔记文本",
   "notesMode": "append 或 overwrite",
   "plan": [{"id": "1", "title": "步骤标题", "status": "pending | completed"}]
-}`
+}`,
+  jsonAdapterPrompt: `你是一个极其精准的工具 JSON 转换与转译节点。你的任务是将 Agent 主循环输出的不标准 JSON、JS 对象结构、伪代码或自然语言动作指令，严格转译为符合对应工具 Schema 的标准 JSON 参数。
+
+【转换与纠错规则】
+1. 提取参数与 ID：对于 card.generate，精确提取参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！
+2. 修复非标格式：遇到未加双引号的 Key（如 cardId: "xxx"）或单引号文本，一律重写纠正为标准合法 JSON。
+3. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 像素数值。
+4. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, notes, notesMode 等）。
+
+可用工具的 JSON Schema：
+{{adapterToolPrompt}}
+
+请输出严格的 JSON 格式，格式如下：
+{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }`
 };

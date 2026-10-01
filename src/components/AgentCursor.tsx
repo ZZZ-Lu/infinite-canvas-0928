@@ -65,14 +65,8 @@ function SingleLineMarquee({ text, isDarkMode }: { text: string; isDarkMode?: bo
   const textRef = useRef<HTMLSpanElement>(null);
   const [overflow, setOverflow] = useState(0);
 
-  const isThinking = text.includes('思考') || 
-                     text.includes('处理') || 
-                     text.includes('分析') || 
-                     text.includes('执行') || 
-                     text.includes('inspect') || 
-                     text.includes('tool') || 
-                     text.includes('正在') ||
-                     text.includes('mira');
+  const cleanText = (text || '').trim();
+  const isThinking = !cleanText || cleanText === '...' || cleanText === 'thinking' || cleanText === 'loading';
 
   useEffect(() => {
     if (containerRef.current && textRef.current) {

@@ -3154,6 +3154,30 @@ export const GenerationCard = React.memo(function GenerationCard({
               </span>
             </motion.div>
           )}
+          {(state === 'error' || data.generationError) && (
+            <motion.div 
+              initial={{ opacity: 0 }} 
+              animate={{ opacity: 1 }} 
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 flex flex-col items-center justify-center p-6 bg-neutral-900/90 backdrop-blur-md z-20 text-center pointer-events-auto rounded-lg shadow-2xl"
+            >
+              <AlertCircle className="w-8 h-8 text-amber-400 mb-2 animate-bounce" />
+              <span className="text-white text-xs font-bold mb-1">生图提示</span>
+              <p className="text-white/80 text-[11px] leading-relaxed max-w-[320px] break-words line-clamp-3 mb-3">
+                {data.generationError || '生成服务响应异常，请检查配置'}
+              </p>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onUpdate(id, { state: 'idle', generationError: undefined }, true);
+                }}
+                className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 text-[11px] font-medium transition-colors cursor-pointer"
+              >
+                重试 / 恢复卡片
+              </button>
+            </motion.div>
+          )}
         </AnimatePresence>
       </div>
 
@@ -3222,7 +3246,7 @@ export const GenerationCard = React.memo(function GenerationCard({
           <div className="relative flex items-center gap-2 flex-wrap w-full">
             {refList.map((item, idx) => (
               <ReferenceThumbItem
-                key={item.url || idx}
+                key={`${item.sourceCardId || item.url || 'ref'}_${idx}`}
                 item={item}
                 idx={idx}
                 currentScale={currentScale}
@@ -3426,7 +3450,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                 {filteredMentionCandidates.length > 0 ? (
                   filteredMentionCandidates.map((c, idx) => (
                     <button
-                      key={c.id}
+                      key={`${c.id}_${idx}`}
                       type="button"
                       onMouseDown={(e) => {
                         e.preventDefault();
@@ -3583,9 +3607,9 @@ export const GenerationCard = React.memo(function GenerationCard({
                         <RefreshCw className={`w-3 h-3 ${isMcpModelsLoading ? 'animate-spin text-blue-500' : ''}`} />
                       </button>
                     </div>
-                    {mcpModels.map(model => (
+                    {mcpModels.map((model, idx) => (
                         <button
-                          key={model.id || model.name}
+                          key={`${model.id || model.name}_${idx}`}
                           type="button"
                           data-agent-target={`model-option-${id}-${model.id || model.name}`}
                           onClick={() => {
@@ -3861,9 +3885,9 @@ export const GenerationCard = React.memo(function GenerationCard({
             {/* Asset Items Grid */}
             <div className="flex-1 overflow-y-auto p-6 grid grid-cols-1 sm:grid-cols-2 gap-3">
               {filteredAssets.length > 0 ? (
-                filteredAssets.map(item => (
+                filteredAssets.map((item, idx) => (
                   <button
-                    key={item.id}
+                    key={`${item.id}_${idx}`}
                     type="button"
                     onClick={() => handleSelectAsset({ name: item.name, referenceImage: item.referenceImage, description: item.description })}
                     className="flex items-start gap-3 p-3 rounded-xl border border-neutral-200/80 dark:border-neutral-800 hover:border-amber-500/60 dark:hover:border-amber-500/60 hover:bg-amber-50/30 dark:hover:bg-amber-950/20 text-left transition-all group cursor-pointer"

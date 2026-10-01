@@ -23,7 +23,7 @@ import type { AgentToolCall, AgentTurnResult } from './agent/protocol';
 import { AgentRuntime, type RuntimeTask } from './agent/runtime';
 import { snapshotRuntimeTask, type AgentRuntimeTrace } from './agent/debugTrace';
 import { assetExtractionService } from './services/assetExtractionService';
-import { getActiveMcpKey, getActiveMcpTokenSync } from './utils/mcpStorage';
+import { getActiveMcpKey, getActiveMcpTokenSync, getMcpConfig } from './utils/mcpStorage';
 import { CanvasLineageOverlay } from './components/CanvasLineageOverlay';
 import { AGENT_TOOL_REGISTRY, getAgentToolConfig } from './agent/toolRegistry';
 import { getPageComponentDefinition, type MouseActionName } from './agent/pageComponentRegistry';
@@ -50,6 +50,17 @@ const safeCreateObjectURL = (data: any): string | null => {
   }
   return null;
 };
+
+export function dedupeReferenceImages(refs: any[]): any[] {
+  if (!Array.isArray(refs)) return [];
+  const seen = new Set<string>();
+  return refs.filter(r => {
+    const key = r.sourceCardId || r.url || r.name;
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
 /**
  * Reads only the portion of a textarea that is currently rendered in its
@@ -756,6 +767,9 @@ export default function App() {
   const parseAgentCommunication = useCallback((rawText: string) => {
     let shortText = '';
     let fullText = '';
+    if (!rawText || typeof rawText !== 'string') {
+      return { shortText: '', fullText: '' };
+    }
 
     const lines = rawText.split('\n');
     let activeMode: 'none' | 'short' | 'full' = 'none';
@@ -1198,6 +1212,40 @@ export default function App() {
                     }
                   : current
               ), false);
+
+              // 🔔 Event-Driven Agent Re-awakening: Notify agent runtime if active task exists!
+              if (runtimeRef.current && activeTaskIdRef.current) {
+                const activeTaskId = activeTaskIdRef.current;
+                const updatedCard: CardData = {
+                  ...card,
+                  imageUrl: result.mediaUrl,
+                  state: 'completed',
+                };
+                void (async () => {
+                  try {
+                    const imgBase64 = await extractCardImageBase64(updatedCard);
+                    const reawakeMsg = `[系统通知] 生图卡片【${card.id}】已在后台成功完成 AI 图像渲染！最新高清画面已自动同步注入多模态视觉上下文。请对此生成结果进行审视并向用户汇报。`;
+                    runtimeRef.current?.addUserInput(
+                      activeTaskId,
+                      reawakeMsg,
+                      imgBase64 ? [imgBase64] : undefined,
+                      {
+                        cardId: card.id,
+                        title: card.fileName || card.name || '生图卡片',
+                        prompt: card.prompt,
+                        aspectRatio: card.ratio,
+                        resolution: card.res,
+                        imageUrl: imgBase64,
+                        markdownSummary: `卡片【${card.id}】AI 生图渲染完成。画面 URL: ${result.mediaUrl}`
+                      }
+                    );
+                    await runtimeRef.current?.wake(activeTaskId);
+                  } catch (e) {
+                    console.warn('[App] Agent re-awakening failed:', e);
+                  }
+                })();
+              }
+
               break;
             }
 
@@ -1933,20 +1981,22 @@ export default function App() {
       ? customConfig.mcpParameters
       : (sourceCard.mcpParameters ? { ...sourceCard.mcpParameters } : undefined);
 
-    const effectiveReferenceImages = (customConfig.referenceImages !== undefined ? customConfig.referenceImages : sourceCard.referenceImages) ? (
-      (customConfig.referenceImages || sourceCard.referenceImages)!.map(r => {
-        let fileData = r.fileData instanceof Blob ? r.fileData : undefined;
-        if (!fileData && r.sourceCardId) {
-          const src = cardsRef.current.find(c => c.id === r.sourceCardId);
-          const srcBlob = src?.trueOriginalFileData || src?.originalFileData || src?.fileData;
-          if (srcBlob instanceof Blob) fileData = srcBlob;
-        }
-        return {
-          ...r,
-          fileData,
-        };
-      })
-    ) : [];
+    const rawRefList = customConfig.referenceImages !== undefined
+      ? customConfig.referenceImages
+      : (sourceCard.referenceImages || []);
+
+    const effectiveReferenceImages = dedupeReferenceImages(rawRefList ? rawRefList.map(r => {
+      let fileData = r.fileData instanceof Blob ? r.fileData : undefined;
+      if (!fileData && r.sourceCardId) {
+        const src = cardsRef.current.find(c => c.id === r.sourceCardId);
+        const srcBlob = src?.trueOriginalFileData || src?.originalFileData || src?.fileData;
+        if (srcBlob instanceof Blob) fileData = srcBlob;
+      }
+      return {
+        ...r,
+        fileData,
+      };
+    }) : []);
 
     const effectiveReferenceImageUrl = customConfig.referenceImageUrl !== undefined ? customConfig.referenceImageUrl : sourceCard.referenceImageUrl;
     const effectiveReferenceImageName = customConfig.referenceImageName !== undefined ? customConfig.referenceImageName : sourceCard.referenceImageName;
@@ -2125,6 +2175,8 @@ export default function App() {
         handleUpdateCard(newId, { state: 'draft', generationError: userFacingError }, true);
       }
     }
+
+    return forkedCard;
   }, [handleUpdateCard]);
 
   // Start Canvas Reference Picker Session
@@ -2919,10 +2971,10 @@ export default function App() {
       const placeholder = isInput ? (element as HTMLInputElement | HTMLTextAreaElement).placeholder : undefined;
 
       let label = id.startsWith('script.toc.item.')
-        ? element.textContent?.trim().replace(/\s+/g, ' ') || id
+        ? (element.textContent?.trim() || '').replace(/\s+/g, ' ') || id
         : (id === 'script.toc.open' && badge
             ? `${definition?.label || '目录按钮'} (${badge})`
-            : definition?.label || element.getAttribute('aria-label') || element.textContent?.trim().slice(0, 40) || id);
+            : definition?.label || element.getAttribute('aria-label') || (element.textContent?.trim() || '').slice(0, 40) || id);
 
       if (id.startsWith('canvas.card.')) {
         const rawCardId = id.replace('canvas.card.', '');
@@ -3014,7 +3066,7 @@ export default function App() {
       status: scope === 'overview' || (scopeElement && isVisible(scopeElement)) ? 'visible' : 'not_visible',
       pagination: { offset, returned: components.length, truncated: offset + components.length < scopedComponents.length, nextOffset: offset + components.length < scopedComponents.length ? offset + components.length : null },
       actionSets,
-      notices: Array.from(document.querySelectorAll<HTMLElement>('[role="alert"], [role="status"], [role="dialog"]')).filter(isVisible).map(element => ({ role: element.getAttribute('role'), label: element.getAttribute('aria-label') || element.textContent?.trim().slice(0, 200) })),
+      notices: Array.from(document.querySelectorAll<HTMLElement>('[role="alert"], [role="status"], [role="dialog"]')).filter(isVisible).map(element => ({ role: element.getAttribute('role'), label: element.getAttribute('aria-label') || (element.textContent?.trim() || '').slice(0, 200) })),
       project: { id: currentProject.id, name: currentProject.name },
       canvas: {
         scale: tScale.get(),
@@ -3444,6 +3496,344 @@ export default function App() {
 
       return { action, targetId, page: rememberObservation(await inspectPage(observePayload)) };
     }
+    if (call.name === 'card.inspect') {
+      const cardId = String(call.arguments.cardId || '');
+      const includeImage = Boolean(call.arguments.includeImage);
+      const includePrompt = Boolean(call.arguments.includePrompt);
+      const includeReference = Boolean(call.arguments.includeReference);
+      const includeParameters = Boolean(call.arguments.includeParameters);
+
+      // Support stripping 'canvas.card.' prefix if used by the Agent
+      const cleanCardId = cardId.startsWith('canvas.card.') ? cardId.replace('canvas.card.', '') : cardId;
+
+      const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+      const card = allCards.find(c => c.id === cleanCardId);
+
+      if (!card) {
+        throw new Error(`未找到 ID 为 ${cardId} 的卡片。请核对当前页面观察可见卡片。`);
+      }
+
+      const response: Record<string, any> = {
+        cardId: card.id,
+        name: card.name || '未命名卡片'
+      };
+
+      if (includePrompt) {
+        response.prompt = card.prompt || '该卡片目前暂无提示词';
+      }
+
+      if (includeReference) {
+        const refList = card.referenceImages || card.references || [];
+        response.references = refList.map(r => ({
+          name: r.name || r.sourceCardId || '参考图',
+          url: r.url || r.originalUrl || '',
+          sourceCardId: r.sourceCardId
+        }));
+      }
+
+      if (includeParameters) {
+        response.parameters = {
+          aspectRatio: card.ratio || card.aspectRatio || '1:1',
+          style: card.style || 'None',
+          status: card.state || card.status || 'completed',
+          mcpModel: card.mcpModel,
+          res: card.res || '2K',
+          type: card.isVideo ? 'video' : 'image',
+          createdAt: card.createdAt || Date.now()
+        };
+      }
+
+      if (includeImage) {
+        try {
+          const imgBase64 = await extractCardImageBase64(card);
+          if (imgBase64) {
+            if (!task.images) task.images = [];
+            if (!task.images.includes(imgBase64)) {
+              task.images.push(imgBase64);
+            }
+            response.imageObservation = '[已注入高清卡片图像到您的多模态视觉上下文。您在当前轮次中已可真实看清并仔细分析此图片内容。]';
+          } else {
+            response.imageObservation = '[该卡片尚未成功生成可用画面，或画面正在排队/渲染中。]';
+          }
+        } catch (e) {
+          response.imageObservation = `[提取高清卡片图像Base64失败: ${(e as Error).message}]`;
+        }
+      }
+
+      if (includeReference) {
+        const refList = card.referenceImages || card.references || [];
+        for (const ref of refList) {
+          const refUrl = ref.url || ref.originalUrl;
+          if (refUrl && refUrl.startsWith('data:image/')) {
+            if (!task.images) task.images = [];
+            if (!task.images.includes(refUrl)) {
+              task.images.push(refUrl);
+            }
+          }
+        }
+      }
+
+      return response;
+    }
+    if (call.name === 'card.generate') {
+      const rawTargetCardId = String(call.arguments.targetCardId || call.arguments.cardId || '');
+      const prompt = typeof call.arguments.prompt === 'string' ? call.arguments.prompt.trim() : '';
+      const aspectRatio = typeof call.arguments.aspectRatio === 'string' ? call.arguments.aspectRatio : undefined;
+      const autoStart = call.arguments.autoStart !== false; // Defaults to true unless explicitly set to false
+
+      // Extract referenceCardIds array from tool arguments
+      let rawRefIds: string[] = [];
+      if (Array.isArray(call.arguments.referenceCardIds)) {
+        rawRefIds = call.arguments.referenceCardIds.map(String);
+      } else if (typeof call.arguments.referenceCardIds === 'string' && call.arguments.referenceCardIds.trim()) {
+        rawRefIds = [call.arguments.referenceCardIds.trim()];
+      } else if (typeof call.arguments.referenceCardId === 'string' && call.arguments.referenceCardId.trim()) {
+        rawRefIds = [call.arguments.referenceCardId.trim()];
+      }
+
+      const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+
+      const forceOverwrite = call.arguments.forceOverwrite === true;
+
+      // Clean target card ID
+      const cleanTargetId = rawTargetCardId.startsWith('canvas.card.') ? rawTargetCardId.replace('canvas.card.', '') : rawTargetCardId;
+      const targetCard = allCards.find(c => c.id === cleanTargetId);
+
+      const targetIsAsset = Boolean(targetCard?.fileName || targetCard?.isAsset);
+      const targetIsCompleted = Boolean(targetCard && (targetCard.state === 'completed' || Boolean(targetCard.imageUrl)));
+
+      // 🛡️ Human UI Unified Rule:
+      // Asset cards are always automatically added to referenceCardIds.
+      // Completed generation cards are FORKED (衍生新卡片保留历史)，
+      // but their rendered image is NOT forcibly turned into a reference image unless explicitly passed in referenceCardIds!
+      if (targetCard && targetIsAsset && !rawRefIds.includes(targetCard.id)) {
+        rawRefIds.push(targetCard.id);
+      }
+
+      // Collect all reference image items & source IDs
+      const collectedRefImages: any[] = [];
+      const collectedRefSourceIds: string[] = [];
+
+      rawRefIds.forEach(id => {
+        const cleanId = id.startsWith('canvas.card.') ? id.replace('canvas.card.', '') : id;
+        const refCard = allCards.find(c => c.id === cleanId);
+        if (refCard) {
+          collectedRefSourceIds.push(refCard.id);
+          collectedRefImages.push({
+            url: refCard.imageUrl || refCard.originalImageUrl || '',
+            name: refCard.fileName || refCard.id,
+            sourceCardId: refCard.id,
+            fileData: refCard.trueOriginalFileData || refCard.originalFileData || refCard.fileData,
+          });
+        }
+      });
+
+      let activeCard: CardData | undefined = undefined;
+
+      // 🛡️ Human UI Unified Fork Philosophy:
+      // If target is missing, "new", Asset Card, or ALREADY COMPLETED (and forceOverwrite is false),
+      // we AUTOMATICALLY Fork (复刻) to create a new card next to it, protecting historical results!
+      const isNewTarget = !cleanTargetId || cleanTargetId === 'new' || targetIsAsset || (targetIsCompleted && !forceOverwrite);
+      const isForked = isNewTarget;
+
+      if (isNewTarget) {
+        // Create a brand new generation card next to the reference card or target
+        const sourceForPos = targetCard || (rawRefIds.length > 0 ? allCards.find(c => c.id === rawRefIds[0]) : undefined);
+        if (sourceForPos) {
+          // 🛡️ Single Source of Truth: Reuse exact human UI Forking pipeline
+          // Inherit sourceForPos parameters (prompt, ratio, res, mcpModel, referenceImages)
+          // UNLESS Agent explicitly provided custom overrides in arguments!
+          const forkConfig: Partial<CardData> = {
+            prompt: prompt || sourceForPos.prompt || '基于参考素材创作的生图卡片',
+            ratio: aspectRatio || sourceForPos.ratio || '16:9',
+            res: sourceForPos.res || '2K',
+            mcpModel: sourceForPos.mcpModel || WORKRALLY_IMAGE_MODELS[0].id,
+            mcpToolName: sourceForPos.mcpToolName,
+            mcpParameters: sourceForPos.mcpParameters ? { ...sourceForPos.mcpParameters } : undefined,
+          };
+
+          // If Agent explicitly provided referenceCardIds, use them.
+          // Otherwise leave referenceImages undefined so handleForkCard inherits sourceForPos's reference assets!
+          if (rawRefIds.length > 0) {
+            forkConfig.referenceSourceIds = collectedRefSourceIds;
+            forkConfig.referenceImages = collectedRefImages;
+          }
+
+          activeCard = (await handleForkCard(sourceForPos.id, forkConfig, autoStart)) || undefined;
+        } else {
+          const newId = `card_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+          const newCardObj: CardData = {
+            id: newId,
+            x: 200,
+            y: 200,
+            prompt: prompt || '基于参考素材创作的生图卡片',
+            ratio: aspectRatio || '1:1',
+            res: '2K',
+            state: 'draft',
+            referenceSourceIds: collectedRefSourceIds,
+            referenceImages: collectedRefImages,
+            mcpModel: WORKRALLY_IMAGE_MODELS[0].id,
+          };
+          handleCreateCard(newCardObj);
+          activeCard = newCardObj;
+        }
+      } else {
+        // Target is a draft or failed card, or forceOverwrite === true (in-place update)
+        activeCard = targetCard;
+        if (activeCard && (collectedRefImages.length > 0 || collectedRefSourceIds.length > 0)) {
+          handleUpdateCard(activeCard.id, {
+            referenceSourceIds: Array.from(new Set([...(activeCard.referenceSourceIds || []), ...collectedRefSourceIds])),
+            referenceImages: dedupeReferenceImages([...(activeCard.referenceImages || []), ...collectedRefImages]),
+          }, false);
+        }
+      }
+
+      const activeCardId = activeCard?.id || cleanTargetId || `card_${Date.now()}`;
+      const effectivePrompt = prompt || activeCard?.prompt || '美观生动的画面';
+      const effectiveRatio = aspectRatio || activeCard?.ratio || '16:9';
+
+      if (activeCard) {
+        handleUpdateCard(activeCard.id, {
+          prompt: effectivePrompt,
+          ratio: effectiveRatio,
+        }, false);
+      }
+
+      // 🛡️ Mode A: autoStart === false -> Draft Configuration Only
+      if (!autoStart) {
+        if (activeCard) {
+          handleUpdateCard(activeCard.id, { state: 'draft' }, false);
+        }
+        return {
+          success: true,
+          cardId: activeCardId,
+          cardState: 'draft',
+          isForked,
+          autoStarted: false,
+          prompt: effectivePrompt,
+          referenceCount: collectedRefImages.length,
+          message: isForked
+            ? `从卡片【${cleanTargetId || '源卡片'}】复刻衍生出生图卡片【${activeCardId}】，参考图与新提示词已就位（处于草稿待生成状态）。`
+            : `生图卡片【${activeCardId}】已配置完成，参考图与提示词已就位（处于草稿待生成状态）。`
+        };
+      }
+
+      // 🛡️ Mode B: autoStart === true -> Real Background Submission
+      if (activeCard) {
+        handleUpdateCard(activeCard.id, {
+          state: 'generating',
+          prompt: effectivePrompt,
+          ratio: effectiveRatio,
+        }, true);
+      }
+
+      try {
+        const savedApiKey = localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key') || '';
+        const activeMcp = getMcpConfig();
+
+        // 🛡️ Resolve reference image items into valid Base64 / proxy URLs for WorkRally MCP
+        const rawRefList = dedupeReferenceImages(activeCard?.referenceImages || collectedRefImages || []);
+        const resolvedRefPayloads: string[] = [];
+        for (const ref of rawRefList) {
+          const payload = await resolveReferenceToPayload(ref, allCards);
+          if (payload) {
+            resolvedRefPayloads.push(payload);
+          }
+        }
+
+        const resResult = await fetch('/api/mcp/workrally/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            token: activeMcp.token,
+            serverUrl: activeMcp.serverUrl,
+            prompt: effectivePrompt,
+            ratio: effectiveRatio,
+            res: activeCard?.res || '2K',
+            isVideo: false,
+            referenceImages: resolvedRefPayloads,
+            toolName: WORKRALLY_IMAGE_TOOL,
+            model: activeCard?.mcpModel || WORKRALLY_IMAGE_MODELS[0].id,
+            defer: true,
+          })
+        });
+
+        const parsed = await safeParseJsonResponse(resResult);
+
+        // Async Pending Return Handler
+        if (parsed.data?.pending && parsed.data?.taskIds?.[0]) {
+          const taskId = parsed.data.taskIds[0];
+          if (activeCard) {
+            handleUpdateCard(activeCard.id, {
+              state: 'generating',
+              mcpTaskId: taskId,
+              lastGeneratedPrompt: effectivePrompt,
+            }, true);
+          }
+
+          return {
+            success: true,
+            status: 'pending',
+            cardId: activeCardId,
+            cardState: 'generating',
+            isForked,
+            autoStarted: true,
+            mcpTaskId: taskId,
+            prompt: effectivePrompt,
+            message: isForked
+              ? `已从【${cleanTargetId || '源卡片'}】复刻衍生新卡片【${activeCardId}】并在界面启动排队渲染，任务句柄 [${taskId}]。`
+              : `生图卡片【${activeCardId}】已在界面启动加载渲染，任务句柄 [${taskId}] 正在排队中。`
+          };
+        }
+
+        let newMediaUrl = parsed.data?.mediaUrl;
+
+        if (!parsed.success || !parsed.data?.success || !newMediaUrl) {
+          const fallbackRes = await fetch('/api/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              prompt: effectivePrompt,
+              aspectRatio: effectiveRatio,
+              apiKey: savedApiKey
+            })
+          });
+          const fallbackJson = await fallbackRes.json().catch(() => ({}));
+          if (fallbackRes.ok && (fallbackJson.imageUrl || fallbackJson.data?.[0]?.url)) {
+            newMediaUrl = fallbackJson.imageUrl || fallbackJson.data[0].url;
+          } else {
+            let rawErrMsg = parsed.error || fallbackJson.error || '生成服务响应失败，请检查 API Key / MCP 密钥额度与网络连接';
+            if (rawErrMsg.includes('积分额度已用完')) {
+              rawErrMsg = 'WorkRally MCP 积分额度已用完，请点击顶部「密钥设置」切换额度充足的 MCP 密钥，或在设置页面配置 API Key。';
+            }
+            throw new Error(rawErrMsg);
+          }
+        }
+
+        handleUpdateCard(activeCard.id, {
+          imageUrl: newMediaUrl,
+          state: 'idle',
+          lastGeneratedPrompt: effectivePrompt,
+        }, true);
+
+        return {
+          success: true,
+          cardId: activeCard.id,
+          cardState: 'completed',
+          imageUrl: newMediaUrl,
+          prompt: effectivePrompt,
+          message: isNewTarget
+            ? `已自动新建独立生图卡片【${activeCard.id}】并绑定 ${collectedRefImages.length} 张参考图素材，画面已成功渲染发布！`
+            : '画面已成功生成并实时更新挂载到画布卡片上！'
+        };
+      } catch (err) {
+        handleUpdateCard(activeCard.id, {
+          state: 'error',
+          generationError: (err as Error).message,
+        }, true);
+        throw err;
+      }
+    }
     if (call.name === 'user.ask') {
       const question = String(call.arguments.question || '需要您的确认或输入：');
       task.negotiationLog.push({ role: 'agent', content: question, timestamp: Date.now() });
@@ -3766,6 +4156,7 @@ export default function App() {
               }],
             }));
             try {
+              setAgentState(prev => ({ ...prev, speak: '...', visible: true }));
               const res = await fetch('/api/agent/turn', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -3786,7 +4177,8 @@ export default function App() {
               }));
               
               if (result.speak) {
-                setAgentState(prev => ({ ...prev, speak: result.speak }));
+                const parsedShort = parseAgentCommunication(result.speak).shortText || result.speak;
+                setAgentState(prev => ({ ...prev, speak: parsedShort, visible: true }));
               }
               
               return result;
@@ -3794,12 +4186,19 @@ export default function App() {
               if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) {
                 return { narration: [], toolCalls: [], complete: false };
               }
-              const message = error instanceof Error ? error.message : 'Agent 轮次失败';
+              const rawMsg = error instanceof Error ? error.message : 'Agent 轮次失败';
+              const isBalanceError = /insufficient\s*balance|quota|402|out\s*of\s*credit|余额不足|欠费/i.test(rawMsg);
+              const displayMsg = isBalanceError
+                ? '⚠️ API Key 余额不足，请在设置中更新 Key'
+                : rawMsg;
+
+              setAgentState(prev => ({ ...prev, speak: displayMsg, visible: true }));
+
               updateAgentRuntimeTrace(task, trace => ({
                 ...trace,
-                turns: trace.turns.map(turn => turn.id === turnId ? { ...turn, completedAt: Date.now(), error: message } : turn),
+                turns: trace.turns.map(turn => turn.id === turnId ? { ...turn, completedAt: Date.now(), error: displayMsg } : turn),
               }));
-              throw error;
+              throw new Error(displayMsg);
             }
           },
           executeTool: (call, task, signal) => executeAgentTool(call, task, signal),
@@ -3911,19 +4310,12 @@ export default function App() {
             // Live speech synchronization for Agent Pointer HUD
             const latestAnswer = [...task.events].reverse().find(e => e.type === 'answer' && e.text && e.text.trim());
             if (latestAnswer) {
-              if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
-              setAgentState(prev => ({
-                ...prev,
-                speak: parseAgentCommunication(latestAnswer.text).shortText,
-                visible: true,
-              }));
-            } else if (status === 'planning' || status === 'waiting_tools') {
-              const latestTool = [...task.events].reverse().find(e => e.type === 'tool' && e.text && e.text.trim());
-              if (latestTool) {
+              const shortSpeech = parseAgentCommunication(latestAnswer.text).shortText;
+              if (shortSpeech) {
                 if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
                 setAgentState(prev => ({
                   ...prev,
-                  speak: latestTool.text.trim(),
+                  speak: shortSpeech,
                   visible: true,
                 }));
               }

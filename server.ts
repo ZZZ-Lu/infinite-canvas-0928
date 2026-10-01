@@ -59,6 +59,24 @@ const parametersForTool = (toolId: string) => {
   return { type: 'object', properties: schema.properties, ...(schema.required ? { required: schema.required } : {}) };
 };
 
+function trySanitizeAndParseJson(str: string): Record<string, any> | null {
+  try {
+    const parsed = JSON.parse(str);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  } catch {}
+
+  try {
+    // Sanitize unquoted JS object keys e.g. { cardId: "rshuewfmu", prompt: "..." } -> { "cardId": "rshuewfmu", "prompt": "..." }
+    const sanitized = str
+      .replace(/([{,]\s*)([a-zA-Z0-9_$]+)\s*:/g, '$1"$2":')
+      .replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, ':"$1"'); // single quote string values to double quote
+    const parsed = JSON.parse(sanitized);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  } catch {}
+
+  return null;
+}
+
 function tryFastParseToolCalls(actionDesc: string): any[] | null {
   try {
     const rawMatches = [...actionDesc.matchAll(/\{\{([\s\S]*?)\}\}/g)];
@@ -75,57 +93,31 @@ function tryFastParseToolCalls(actionDesc: string): any[] | null {
 
       const jsonMatch = rest.match(/(\{[\s\S]*\})/);
       if (jsonMatch) {
-        try {
-          const args = JSON.parse(jsonMatch[1]);
-          if (args && typeof args === 'object') {
-            parsedCalls.push({ name: toolName, arguments: args });
-            continue;
-          }
-        } catch {}
+        const args = trySanitizeAndParseJson(jsonMatch[1]);
+        if (args) {
+          parsedCalls.push({ name: toolName, arguments: args });
+          continue;
+        }
       }
-      
+
+      // Simple zero-ambiguity fallbacks without fragile parameter regexes
       if (toolName === 'page.inspect') {
         if (!rest || rest.includes('overview') || rest.includes('概览')) {
           parsedCalls.push({ name: 'page.inspect', arguments: { scope: 'overview' } });
-        } else {
-          parsedCalls.push({ name: 'page.inspect', arguments: { scope: rest.replace(/^["'“]|["'”]$/g, '').trim() } });
         }
       } else if (toolName === 'guide.lookup') {
-        parsedCalls.push({ name: 'guide.lookup', arguments: { query: rest.replace(/^["'“]|["'”]$/g, '').trim() } });
+        const cleanQuery = rest.replace(/^["'“]|["'”]$/g, '').trim();
+        if (cleanQuery) {
+          parsedCalls.push({ name: 'guide.lookup', arguments: { query: cleanQuery } });
+        }
       } else if (toolName === 'sys.endTask') {
-        parsedCalls.push({ name: 'sys.endTask', arguments: { success: true, finalResponse: rest.replace(/^["'“]|["'”]$/g, '').trim() || '任务完成。' } });
+        const cleanMsg = rest.replace(/^["'“]|["'”]$/g, '').trim();
+        parsedCalls.push({ name: 'sys.endTask', arguments: { success: true, finalResponse: cleanMsg || '任务完成。' } });
       } else if (toolName === 'user.ask') {
-        parsedCalls.push({ name: 'user.ask', arguments: { question: rest.replace(/^["'“]|["'”]$/g, '').trim() } });
-      } else if (toolName === 'sys.updateState') {
-        const goalMatch = rest.match(/(?:更新总目标为|总目标|目标|goal)[:：]?\s*([^,，;\n]+)/i);
-        const subGoalMatch = rest.match(/(?:更新当前小目标为|当前小目标|小目标|subGoal|子目标)[:：]?\s*([^,，;\n]+)/i);
-        const notesMatch = rest.match(/(?:重点笔记|记录.*?到笔记|笔记|notes)[:：]?\s*([^,，;\n]+)/i);
-        const progressMatch = rest.match(/(?:当前进度|进度|progress)[:：]?\s*([^,，;\n]+)/i);
-        const stateArgs: Record<string, any> = {};
-        if (goalMatch) stateArgs.goal = goalMatch[1].trim();
-        if (subGoalMatch) stateArgs.subGoal = subGoalMatch[1].trim();
-        if (notesMatch) stateArgs.notes = notesMatch[1].trim();
-        if (progressMatch) stateArgs.progress = progressMatch[1].trim();
-
-        if (Object.keys(stateArgs).length === 0 && rest.trim()) {
-          if (rest.includes('目标')) {
-            stateArgs.goal = rest.trim();
-          } else if (rest.includes('笔记')) {
-            stateArgs.notes = rest.trim();
-          } else {
-            stateArgs.progress = rest.trim();
-          }
+        const cleanQ = rest.replace(/^["'“]|["'”]$/g, '').trim();
+        if (cleanQ) {
+          parsedCalls.push({ name: 'user.ask', arguments: { question: cleanQ } });
         }
-        parsedCalls.push({ name: 'sys.updateState', arguments: stateArgs });
-      } else if (toolName === 'ui.actAndObserve') {
-        const clickMatch = rest.match(/(?:点击|click)\s*([a-zA-Z0-9_.-]+)/i);
-        if (clickMatch) {
-          parsedCalls.push({ name: 'ui.actAndObserve', arguments: { action: 'mouse.click', targetId: clickMatch[1].trim() } });
-        } else {
-          return null;
-        }
-      } else {
-        return null;
       }
     }
     return parsedCalls.length > 0 ? parsedCalls : null;
@@ -564,7 +556,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         : AGENT_TOOL_REGISTRY.map((tool) => tool.id));
       const toolPrompt = AGENT_TOOL_REGISTRY
         .filter((tool) => enabledToolIds.has(tool.id))
-        .map((tool) => `【${tool.id}】\n  描述：${tool.description}\n  支持的参数：${tool.input}\n  调用示例：{{调用 ${tool.id}，[用自然语言描述参数]}}`)
+        .map((tool) => `【${tool.id}】\n  描述：${tool.description}\n  支持的参数：${tool.input}\n  调用示例：{{调用 ${tool.id}, ${tool.input}}}`)
         .join('\n\n');
       const systemPrompt = getSystemPrompt().replace('{toolPrompt}', toolPrompt);
 
@@ -806,7 +798,27 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       }
       if (!response.ok) {
         const detail = await response.json().catch(() => ({}));
-        throw new Error(detail?.error?.message || `HTTP ${response.status}`);
+        const rawMsg = detail?.error?.message || detail?.message || `HTTP ${response.status}`;
+        const isBalanceError = /insufficient\s*balance|quota|402|out\s*of\s*credit|余额不足|欠费/i.test(rawMsg);
+        
+        const fallbackSystemKey = process.env.DEEPSEEK_API_KEY || process.env.DASHSCOPE_API_KEY || process.env.ZHIPU_API_KEY || process.env.SILICONFLOW_API_KEY;
+        if (isBalanceError && fallbackSystemKey && keyToUse !== fallbackSystemKey) {
+          console.warn(`User Key insufficient balance (${rawMsg}), retrying with system fallback API key...`);
+          const retryRes = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${fallbackSystemKey}` },
+            body: JSON.stringify(requestPayload),
+          });
+          if (retryRes.ok) {
+            response = retryRes;
+          } else {
+            throw new Error('API Key 账户余额不足 (Insufficient Balance)。请在设置页面更新有效的 API Key 或切换模型。');
+          }
+        } else if (isBalanceError) {
+          throw new Error('API Key 账户余额不足 (Insufficient Balance)。请在设置页面更新有效的 API Key 或切换模型。');
+        } else {
+          throw new Error(rawMsg);
+        }
       }
       const message = await parseChatCompletionResponse(response, !!stream);
       
@@ -880,6 +892,8 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         .join('\n');
 
       let parsedToolCalls: any[] = [];
+      let jsonAdapterTrace: any = null;
+
       if (typeof message.content === 'string') {
         const matches = [...message.content.matchAll(/\{\{([\s\S]*?)\}\}/g)];
         let actionDesc = matches.length > 0 ? matches.map(m => m[0]).join('\n') : null;
@@ -898,6 +912,12 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
           const fastCalls = tryFastParseToolCalls(actionDesc);
           if (fastCalls && fastCalls.length > 0) {
             parsedToolCalls = fastCalls;
+            jsonAdapterTrace = {
+              mode: 'fast_sanitizer_0ms',
+              description: '0 毫秒语法修复模式（修正无引号 Key / 单引号等普通 JS 对象语法）',
+              rawInput: actionDesc,
+              parsedOutput: fastCalls,
+            };
           } else {
             try {
               const parseResponse = await fetch(endpoint, {
@@ -911,7 +931,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
                   messages: [
                     { 
                       role: 'system', 
-                      content: `你是一个极其精准的工具参数适配器。你的任务是将 Agent 的自然语言动作意图，严格翻译为对应工具的 JSON 调用参数。\n\n【核心转换规则】\n1. 目标识别：根据自然语言描述，推断出最合理的 targetId。\n2. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 数值（像素）。"向下滚一点/一屏" -> 正数 (如 480)；"向上滚一点/一屏" -> 负数 (如 -480)；"滚到最底部" -> 极大的正数 (如 99999)；"滚到最顶部" -> 极小的负数 (如 -99999)。\n3. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, notes, notesMode 等）的文本内容。如果包含重写/替换笔记意图，提取 notesMode 为 "overwrite"；若为追加新增笔记，提取 notesMode 为 "append"。注意：绝对不要在没有明确指令的情况下脑补并写入 goal 和 subGoal。除非指令中明确说了"更新总目标"，否则不要输出 goal 字段。同理，除非明确说明，否则不要随意填写其他非必要的更新字段。\n\n可用工具的 JSON Schema：\n${adapterToolPrompt}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }` 
+                      content: `你是一个极其精准的工具 JSON 转换与转译节点。你的任务是将 Agent 主循环输出的不标准 JSON、JS 对象结构、伪代码或自然语言动作指令，严格转译为符合对应工具 Schema 的标准 JSON 参数。\n\n【转换与纠错规则】\n1. 提取参数与 ID：对于 card.generate，精确提取参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！\n2. 修复非标格式：遇到未加双引号的 Key（如 cardId: "xxx"）或单引号文本，一律重写纠正为标准合法 JSON。\n3. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 像素数值。\n4. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, notes, notesMode 等）。\n\n可用工具的 JSON Schema：\n${adapterToolPrompt}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }` 
                     },
                     { role: 'user', content: actionDesc }
                   ]
@@ -919,10 +939,17 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
               });
               if (parseResponse.ok) {
                 const parseBody = await parseResponse.json();
-                const parsed = JSON.parse(parseBody.choices?.[0]?.message?.content || '{}');
-                if (Array.isArray(parsed.tool_calls)) {
-                  parsedToolCalls = parsed.tool_calls;
+                const parsedResult = JSON.parse(parseBody.choices?.[0]?.message?.content || '{}');
+                if (Array.isArray(parsedResult.tool_calls)) {
+                  parsedToolCalls = parsedResult.tool_calls;
                 }
+                jsonAdapterTrace = {
+                  mode: 'llm_adapter_node',
+                  description: '工具 JSON 转译节点 LLM 重新组装（重构非标结构或自然语言参数）',
+                  rawInput: actionDesc,
+                  adapterModel: actualModel,
+                  parsedOutput: parsedToolCalls,
+                };
               } else {
                 console.warn('Failed to parse natural language tool call. Status:', parseResponse.status);
               }
@@ -965,6 +992,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
           ? [{ id: item.id, title: item.title, status: item.status === 'completed' ? 'completed' : 'pending' }]
           : []) : undefined,
         toolCalls,
+        jsonAdapterTrace,
         response: typeof parsed.response === 'string' ? parsed.response : undefined,
         waitForUser: typeof parsed.waitForUser === 'string' ? parsed.waitForUser : undefined,
         complete: isComplete,
