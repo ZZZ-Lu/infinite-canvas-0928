@@ -36,7 +36,8 @@ type TaskStatus =
   | 'waiting_user'
   | 'completed'
   | 'failed'
-  | 'cancelled';
+  | 'cancelled'
+  | 'paused';
 
 interface AgentTask {
   id: string;
@@ -64,6 +65,17 @@ interface AgentTask {
   → 若该任务正在流式输出，只入队，不并发启动
   → 当前 Turn 结束后，根据队列启动下一轮
 ```
+
+### 3.1 异步挂起（等待生成）与零延迟唤醒机制 (Async Pause & Zero-Delay Awakening)
+
+对于耗时较长、非阻塞式的后台异步能力（如 AI 生图、视频渲染）：
+1. **生图开始：乐观即时状态汇报 (Optimistic Instant Feedback)**：在 `card.generate` 创建卡片并提交后台排队的第 0 毫秒，系统通过 `runtime.addFeedback` 立即向事件队列与 HUD 注入确认文本（如 *“已从源卡片复刻并进入排队渲染...”*），用户无需苦等第二轮模型 4 秒推理即可获得即时响应。
+2. **生图排队：自适应高频探测 (Adaptive High-Frequency Polling)**：前 15 次轮询窗口压缩至 800ms，消除死板的 3 秒等待盲区，平均提速出图感知 2 秒以上。
+3. **生图完成：零延迟双相唤醒 (Two-Phase Zero-Delay Re-awakening)**：
+   * **第一相 (Phase 1, 0ms)**：出图成功的第 0 毫秒，立即将成图事实（“生好了，我先看下...”）注入 UI 事件流并切换指针为审视形态（👁️ Inspecting），让用户瞬时感知出图并与后续视觉审视自然衔接；
+   * **第二相 (Phase 2, 后台并行)**：非阻塞后台异步拉取大图视觉上下文并通过 `runtime.wake(taskId)` 唤醒 Agent 进行认知总结，彻底斩断大图下载对前端界面的阻塞。
+4. **挂起判定 (Context-Aware Auto-Guard)**：当 Agent 调用 `card.generate` 且返回 `cardState: 'generating'` 或明确声明 `paused: true` 时，`sys.endTask` 会将任务标记为 `task.status = 'paused'`（而非 `completed`）。
+5. **面板语义反馈**：右下角任务面板自动识别生成中卡片事实，将状态胶囊呈现为 **「等待生成」** 并伴随紫色呼吸脉冲，让用户清晰知晓当前正处于异步等待期。
 
 工具结果不会插入已经发出的模型请求；它们只成为下一轮的新增事实。任务结束条件只能由 Agent 明确输出完成命令，且 Runtime 应检查是否存在覆盖任务目标的工具证据。用户暂时不说话不是任务完成条件。
 

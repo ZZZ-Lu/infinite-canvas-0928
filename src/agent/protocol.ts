@@ -24,6 +24,7 @@ export interface AgentTurnResult {
   failureSummaries?: string[];
   plan?: Array<{ id: string; title: string; status?: 'pending' | 'completed' }>;
   toolCalls: AgentToolCall[];
+  jsonAdapterTrace?: any;
   response?: string;
   waitForUser?: string;
   complete: boolean;

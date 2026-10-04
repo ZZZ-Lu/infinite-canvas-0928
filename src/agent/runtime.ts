@@ -128,7 +128,11 @@ export class AgentRuntime {
 
   async wake(taskId: string): Promise<RuntimeTask> {
     const task = this.requireTask(taskId);
-    if (terminal.has(task.status) || this.running.has(taskId)) return task;
+    if ((task.status as RuntimeTaskStatus) === 'cancelled' || this.running.has(taskId)) return task;
+    // If task was paused, completed, or waiting_user, unfreeze it to planning so the ReAct loop executes
+    if (task.status === 'paused' || task.status === 'completed' || task.status === 'waiting_user') {
+      task.status = 'planning';
+    }
     this.running.add(taskId);
     let controller = this.abortControllers.get(taskId);
     if (!controller || controller.signal.aborted) {
@@ -313,16 +317,26 @@ export class AgentRuntime {
     }
 
     if (call.name === 'sys.endTask') {
+      const responseText = typeof call.arguments.finalResponse === 'string' ? call.arguments.finalResponse : '';
+      const responseSuggestsPending = /后台|渲染|排队|稍候|生成中|等待生成|正在生成|提交生成/i.test(responseText);
+
+      // Check if recent observations or tool calls in this task contain active pending card.generate
+      const hasRecentPendingGeneration = task.observations.some(obs => {
+        const content = obs.content as any;
+        const out = content?.output;
+        return content?.name === 'card.generate' && (
+          out?.cardState === 'generating' ||
+          out?.status === 'pending' ||
+          out?.autoStarted === true
+        );
+      }) || task.events.some(e => e.toolName === 'card.generate' && (e.status === 'succeeded' || e.status === 'running'));
+
       const isPaused = Boolean(
         call.arguments.paused ||
         call.arguments.isPaused ||
         call.arguments.status === 'paused' ||
-        (typeof call.arguments.finalResponse === 'string' && (
-          call.arguments.finalResponse.includes('后台') ||
-          call.arguments.finalResponse.includes('渲染') ||
-          call.arguments.finalResponse.includes('排队') ||
-          call.arguments.finalResponse.includes('稍候')
-        ))
+        hasRecentPendingGeneration ||
+        responseSuggestsPending
       );
 
       if (typeof call.arguments.waitForUser === 'string' && call.arguments.waitForUser) {
@@ -365,6 +379,18 @@ export class AgentRuntime {
       task.history.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'failed', error: message } });
       task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'failed', error: message } });
     }
+  }
+
+  addFeedback(taskId: string, text: string, type: 'answer' | 'system' = 'answer') {
+    const task = this.tasks.get(taskId);
+    if (!task) return;
+    this.addEvent(task, { type, text });
+  }
+
+  notifyTaskUpdated(taskId: string) {
+    const task = this.tasks.get(taskId);
+    if (!task) return;
+    this.publish(task);
   }
 
   private addEvent(task: RuntimeTask, partial: Omit<RuntimeEvent, 'id' | 'taskId' | 'turnId' | 'createdAt'> & { turnId?: string }) {

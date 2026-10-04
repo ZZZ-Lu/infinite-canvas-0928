@@ -16,6 +16,7 @@ export interface NanoLodCanvasProps {
   selectedCardIds: string[];
   renderedCardIds?: Set<string>;
   agentTargetCardId?: string | null;
+  agentReferenceCardIds?: string[];
   pickerSession?: {
     targetCardId: string;
     selectedReferences?: Array<{
@@ -116,6 +117,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   selectedCardIds,
   renderedCardIds,
   agentTargetCardId,
+  agentReferenceCardIds,
   pickerSession,
   scale,
   tx,
@@ -150,6 +152,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
   const agentTargetCardIdRef = useRef(agentTargetCardId);
   agentTargetCardIdRef.current = agentTargetCardId;
+
+  const agentReferenceCardIdsRef = useRef(agentReferenceCardIds);
+  agentReferenceCardIdsRef.current = agentReferenceCardIds;
 
   const pickerSessionRef = useRef(pickerSession);
   pickerSessionRef.current = pickerSession;
@@ -619,28 +624,51 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         }
       }
 
-      const isAgentTarget = Boolean(
+      const isAgentPrimary = Boolean(
         agentTargetCardIdRef.current && agentTargetCardIdRef.current === card.id
+      );
+      const isAgentRef = Boolean(
+        agentReferenceCardIdsRef.current && agentReferenceCardIdsRef.current.includes(card.id)
       );
 
       // 3. Border (sharp straight rectangle stroke)
       if (isPickerSelected) {
         ctx.strokeStyle = borderPickerSelected;
         ctx.lineWidth = pickerSelectedLineWidth;
-      } else if (isAgentTarget) {
+        ctx.strokeRect(cardX, cardY, dim.width, dim.height);
+      } else if (isAgentPrimary) {
+        if (isSelected) {
+          // Dual co-presence: user blue inner border + agent purple outer border
+          ctx.strokeStyle = borderSelected;
+          ctx.lineWidth = selectedLineWidth;
+          ctx.strokeRect(cardX, cardY, dim.width, dim.height);
+          ctx.strokeStyle = borderAgentTarget;
+          ctx.lineWidth = selectedLineWidth * 1.3;
+          ctx.strokeRect(cardX - 1.5, cardY - 1.5, dim.width + 3, dim.height + 3);
+        } else {
+          ctx.strokeStyle = borderAgentTarget;
+          ctx.lineWidth = selectedLineWidth * 1.25;
+          ctx.strokeRect(cardX, cardY, dim.width, dim.height);
+        }
+      } else if (isAgentRef) {
         ctx.strokeStyle = borderAgentTarget;
-        ctx.lineWidth = selectedLineWidth;
+        ctx.lineWidth = normalLineWidth * 1.5;
+        ctx.setLineDash([4, 4]);
+        ctx.strokeRect(cardX, cardY, dim.width, dim.height);
+        ctx.setLineDash([]);
       } else if (isPickerTarget) {
         ctx.strokeStyle = borderPickerTarget;
         ctx.lineWidth = selectedLineWidth;
+        ctx.strokeRect(cardX, cardY, dim.width, dim.height);
       } else if (isSelected) {
         ctx.strokeStyle = borderSelected;
         ctx.lineWidth = selectedLineWidth;
+        ctx.strokeRect(cardX, cardY, dim.width, dim.height);
       } else {
         ctx.strokeStyle = borderNormal;
         ctx.lineWidth = normalLineWidth;
+        ctx.strokeRect(cardX, cardY, dim.width, dim.height);
       }
-      ctx.strokeRect(cardX, cardY, dim.width, dim.height);
 
       // 3b. Bottom Panel Skeleton Color Block for Generation Cards in 2D Canvas Mode
       const isGenerationCard = !card.fileName && !card.isAsset;

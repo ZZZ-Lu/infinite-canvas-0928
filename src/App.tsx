@@ -11,6 +11,7 @@ import { fastGetImageDimensions } from './utils/imageHeader';
 import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold } from './utils/viewportCulling';
 import { buildCardQuadTree, QuadTree, BoundingBox } from './utils/quadTree';
 import { getBottomPanelHeight } from './utils/cardLayout';
+import { createSquareLetterboxImage, unpadLandmarks } from './utils/squareImageLetterbox';
 import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp } from 'lucide-react';
 import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
 import { SettingsPage } from './components/SettingsPage';
@@ -28,6 +29,7 @@ import { CanvasLineageOverlay } from './components/CanvasLineageOverlay';
 import { AGENT_TOOL_REGISTRY, getAgentToolConfig } from './agent/toolRegistry';
 import { getPageComponentDefinition, type MouseActionName } from './agent/pageComponentRegistry';
 import { buildAutoInjectedCardContext } from './agent/cardContextBuilder';
+import { agentFocusManager, type AgentFocusSnapshot } from './agent/agentFocusManager';
 import { AnimatePresence, motion, useMotionValue, animate, useMotionTemplate, useMotionValueEvent, useTransform } from 'motion/react';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -586,6 +588,25 @@ export default function App() {
     }
   }, [agentRuntimeTraces]);
 
+  const updateAgentRuntimeTrace = useCallback((task: RuntimeTask, update?: (trace: AgentRuntimeTrace) => AgentRuntimeTrace) => {
+    const taskSnapshot = snapshotRuntimeTask(task);
+    setAgentRuntimeTraces(current => {
+      const now = Date.now();
+      const existing = current.find(trace => trace.taskId === task.id);
+      const base: AgentRuntimeTrace = existing || {
+        id: `trace_${task.id}`,
+        taskId: task.id,
+        goal: task.goal,
+        createdAt: now,
+        updatedAt: now,
+        task: taskSnapshot,
+        turns: [],
+      };
+      const next = update ? update({ ...base, task: taskSnapshot, updatedAt: now }) : { ...base, task: taskSnapshot, updatedAt: now };
+      return [...current.filter(trace => trace.taskId !== task.id), next].slice(-12);
+    });
+  }, []);
+
   // An Agent may act only on a target it has actually received from page.inspect.
   // This closes the gap between a semantic target registry and human-visible UI.
   const observedTargetsByTaskRef = useRef(new Map<string, Set<string>>());
@@ -712,14 +733,26 @@ export default function App() {
     isActive: boolean;
     isMoving: boolean;
     speak?: string;
+    lastPrompt?: string;
+    cursorMode?: 'default' | 'inspect' | 'working' | 'interact';
   }>(() => ({ 
     x: typeof window !== 'undefined' ? window.innerWidth - 80 : 0, 
     y: typeof window !== 'undefined' ? window.innerHeight - 150 : 0, 
     visible: true, 
     isActive: false,
-    isMoving: false
+    isMoving: false,
+    cursorMode: 'default',
   }));
+  const [agentFocus, setAgentFocus] = useState<AgentFocusSnapshot>(() => agentFocusManager.getSnapshot());
+  useEffect(() => {
+    return agentFocusManager.subscribe((snapshot) => {
+      setAgentFocus(snapshot);
+      setAgentState(prev => prev.cursorMode !== snapshot.cursorMode ? { ...prev, cursorMode: snapshot.cursorMode } : prev);
+    });
+  }, []);
   const [isAgentRunning, setIsAgentRunning] = useState(false);
+  const isAgentRunningRef = useRef(false);
+  isAgentRunningRef.current = isAgentRunning;
   const [agentPrompt, setAgentPrompt] = useState("");
   const [agentQuestion, setAgentQuestion] = useState<{ question: string, resolve: (val: string) => void } | null>(null);
   const [isAgentThinking, setIsAgentThinking] = useState(false);
@@ -988,9 +1021,9 @@ export default function App() {
       setSelectedCardIds([hitCard.id]);
       const promptText = "选中了这组内容，要调整什么？";
       const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
-        ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant')
+        ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
         : undefined;
-      const lastReply = lastReplyObj ? (lastReplyObj.shortText || lastReplyObj.text) : undefined;
+      const lastReply = lastReplyObj ? ((lastReplyObj as any).shortText || lastReplyObj.text) : undefined;
 
       setAgentState(prev => ({
         ...prev,
@@ -1067,9 +1100,9 @@ export default function App() {
         setSelectedCardIds([hitCard.id]);
         const promptText = "选中了这组内容，要调整什么？";
         const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
-          ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant')
+          ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
           : undefined;
-        const lastReply = lastReplyObj ? (lastReplyObj.shortText || lastReplyObj.text) : undefined;
+        const lastReply = lastReplyObj ? ((lastReplyObj as any).shortText || lastReplyObj.text) : undefined;
 
         setAgentState(prev => ({
           ...prev,
@@ -1133,6 +1166,351 @@ export default function App() {
   const loadedProjectIdRef = useRef<string | null>(null);
   const recoveringTaskIdsRef = useRef(new Set<string>());
 
+  // 🎯 Serialized Card Inspection Queue: ensures agent reviews multiple completed cards one by one
+  interface InspectQueueItem {
+    targetCard: CardData;
+    mediaUrl: string;
+    taskId: string;
+  }
+  const inspectQueueRef = useRef<InspectQueueItem[]>([]);
+  const isProcessingInspectQueueRef = useRef(false);
+  const processInspectQueueRef = useRef<() => Promise<void>>(async () => {});
+  const extractCardImageBase64Ref = useRef<(card: CardData) => Promise<string | undefined>>(async () => undefined);
+
+  const processInspectQueue = useCallback(async () => {
+    // 🛡️ 统一排队互斥锁：如果当前 Agent 正在分发创建卡片或执行工具流，严禁中途抢占视角与打断鼠标！
+    if (isAgentRunningRef.current || isProcessingInspectQueueRef.current) return;
+    isProcessingInspectQueueRef.current = true;
+
+    try {
+      while (inspectQueueRef.current.length > 0) {
+        const item = inspectQueueRef.current.shift();
+        if (!item) break;
+        const { targetCard, mediaUrl, taskId } = item;
+
+        // Obtain fresh card from cardsRef to ensure latest coordinate/state
+        const freshCard = cardsRef.current.find(c => c.id === targetCard.id) || targetCard;
+
+        const taskCardContext = {
+          cardId: freshCard.id,
+          targetId: freshCard.id,
+          title: freshCard.fileName || '生图卡片',
+          prompt: freshCard.prompt,
+          aspectRatio: freshCard.ratio,
+          resolution: freshCard.res,
+          imageUrl: mediaUrl,
+          markdownSummary: `卡片【${freshCard.id}】AI 生图渲染完成。画面 URL: ${mediaUrl}`
+        };
+
+        const instantNotice = '图生好了，我先看下...';
+
+        // 1. Calculate target card center position & dimensions
+        const dim = getCardSize(freshCard);
+        const cardCenterX = freshCard.x + dim.width / 2;
+        const cardCenterY = freshCard.y + dim.height / 2;
+
+        // 2. Smoothly center camera viewport to focus on this card
+        centerCardOnScreen(freshCard.x, freshCard.y, dim.width, dim.height);
+
+        // 3. Mark focus in agentFocusManager (inspect mode - QC scenario)
+        // 触发开始：在显示“图生好了，我先看下...”开始时同步触发卡片质检端详
+        agentFocusManager.setCursorMode('inspect');
+        agentFocusManager.setPrimaryFocus(freshCard.id, 'inspect', 'card.inspect.qc');
+
+        // 4. Move mouse cursor to target card with visible glide animation & speak HUD
+        setAgentState(prev => ({
+          ...prev,
+          x: cardCenterX,
+          y: cardCenterY,
+          visible: true,
+          isMoving: true,
+          isActive: true,
+          speak: instantNotice,
+        }));
+
+        // Wait for cursor glide to reach target card (350ms)
+        await sleep(350);
+
+        setAgentState(prev => ({
+          ...prev,
+          isMoving: false,
+          isActive: true,
+        }));
+
+        // 5. Extract card image for vision evaluation
+        let imgBase64: string | null = null;
+        try {
+          imgBase64 = await Promise.race([
+            extractCardImageBase64Ref.current(freshCard),
+            new Promise<null>((r) => setTimeout(() => r(null), 1200))
+          ]);
+        } catch {}
+
+        // 6. 🌟 查看的时长完全由模型的回复时长决定：
+        // 在大模型生成评语的整个在途期间，Mira 持续处于“图生好了，我先看下...”的端详状态，卡片端详漫游动效持续生动运行！
+        let reviewText = '';
+        const task = runtimeRef.current && taskId ? runtimeRef.current.getTask(taskId) : null;
+
+        if (runtimeRef.current && task && task.status !== 'cancelled' && task.status !== 'failed') {
+          // 主任务唤醒分支：将出图事实作为事件注入主任务，并调用 runtime.wake(taskId) 推进主循环（如 第 3 轮）
+          // 这会自动触发 requestTurn，进而完整记录到【节点调试台 - 运行追踪】对应会话的轮次列表中！
+          task.cardContext = taskCardContext;
+          if (imgBase64) {
+            task.images = [imgBase64];
+          }
+          const reawakeMsg = `[系统通知] 生图卡片【${freshCard.id}】已在后台成功完成 AI 图像渲染！最新画面 URL: ${mediaUrl}。请向用户汇报渲染已完成，并对生成效果做简要说明。`;
+          const preEventsCount = task.events.length;
+          runtimeRef.current.addUserInput(
+            taskId,
+            reawakeMsg,
+            imgBase64 ? [imgBase64] : undefined,
+            taskCardContext
+          );
+
+          try {
+            const updatedTask = await runtimeRef.current.wake(taskId);
+            if (updatedTask) {
+              const turnAnswers = updatedTask.events.slice(preEventsCount).filter(e => e.type === 'answer' && e.text && e.text.trim() && !e.text.includes('我先看下'));
+              const latestReview = turnAnswers[turnAnswers.length - 1];
+              if (latestReview) {
+                reviewText = latestReview.text;
+              }
+            }
+          } catch (e) {
+            console.warn('[App] Agent background re-awakening failed:', e);
+          }
+        }
+
+        // 独立生图兜底分支（例如用户在画布直接点击生成，没有前置主任务）：
+        // 也通过 updateAgentRuntimeTrace 创建规范的质检追踪会话并记录轮次！
+        if (!reviewText) {
+          const now = Date.now();
+          const standaloneTaskId = taskId || `qc_${Date.now().toString(36)}`;
+          const standaloneTask: RuntimeTask = {
+            id: standaloneTaskId,
+            sessionId: standaloneTaskId,
+            goal: `自主质检查看卡片【${freshCard.id}】`,
+            title: `卡片质检【${freshCard.id}】`,
+            turn: 1,
+            status: 'planning',
+            summary: '',
+            progress: '正在查看出图效果',
+            plan: [{ id: '1', title: '查看出图效果', status: 'pending' }],
+            history: [],
+            observations: [],
+            events: [{
+              id: `evt_qc_in_${now}`,
+              taskId: standaloneTaskId,
+              turnId: `${standaloneTaskId}:turn:1`,
+              type: 'user',
+              text: `生图卡片【${freshCard.id}】已完成渲染，请向用户汇报出图效果。`,
+              createdAt: now,
+            }],
+            pendingCallIds: [],
+            negotiationLog: [{ role: 'user', content: `生图卡片【${freshCard.id}】已完成渲染，请向用户汇报出图效果。`, timestamp: now }],
+            lastGoalUpdatedAt: now,
+            lastUserInputAt: now,
+            cardContext: taskCardContext,
+            images: imgBase64 ? [imgBase64] : undefined,
+          };
+          const turnId = `${standaloneTaskId}:turn:1`;
+          updateAgentRuntimeTrace(standaloneTask, trace => ({
+            ...trace,
+            turns: [{
+              id: turnId,
+              turn: 1,
+              requireTool: false,
+              startedAt: now,
+              taskBefore: snapshotRuntimeTask(standaloneTask),
+            }],
+          }));
+
+          try {
+            const agentModel = assetExtractionService.getNodeModels().agentModel;
+            const res = await fetch('/api/agent/turn', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                userMessage: `生图卡片【${freshCard.id}】提示词为“${freshCard.prompt}”，画面已渲染完成。请以你的专属助手口吻，用一两句话向用户汇报出图效果。`,
+                history: [],
+                events: standaloneTask.events,
+                observations: [],
+                project: { id: currentProject.id, name: currentProject.name },
+                task: standaloneTask,
+                images: imgBase64 ? [imgBase64] : undefined,
+                cardContext: taskCardContext,
+                modelType: agentModel,
+                requireTool: false,
+              })
+            });
+            if (res.ok) {
+              const body = await res.json().catch(() => ({}));
+              const result = body as AgentTurnResult;
+              reviewText = result.speak || result.fullAnswer || result.response || '';
+              updateAgentRuntimeTrace(standaloneTask, trace => ({
+                ...trace,
+                task: { ...standaloneTask, status: 'completed' },
+                turns: trace.turns.map(turn => turn.id === turnId ? {
+                  ...turn,
+                  completedAt: Date.now(),
+                  transport: result.debug,
+                  parsedResult: result,
+                } : turn),
+              }));
+            }
+          } catch (e) {
+            console.warn('[App] Standalone inspect turn call failed:', e);
+          }
+        }
+
+        // 7. 模型生成完成到达瞬间：切换气泡文字为评语
+        if (reviewText) {
+          const parsed = parseAgentCommunication(reviewText);
+          const speech = parsed.shortText || parsed.fullText;
+          // 🛡️ 保持质检专注状态：在向用户汇报评语与留白阅读期间，继续无缝维持端详漫游动效！
+          agentFocusManager.setCursorMode('inspect');
+          agentFocusManager.setPrimaryFocus(freshCard.id, 'inspect', 'card.inspect.qc');
+          setAgentState(prev => ({
+            ...prev,
+            speak: speech,
+            visible: true,
+            isActive: true,
+          }));
+
+          const reviewId = `review_${Date.now()}`;
+          setCards(prevCards => prevCards.map(c => {
+            if (c.id !== freshCard.id) return c;
+            const cleanHistory = (c.chatHistory || []).filter(m => !m.text.includes('我先看下'));
+            return {
+              ...c,
+              chatHistory: [
+                ...cleanHistory,
+                {
+                  id: reviewId,
+                  role: 'assistant' as const,
+                  text: parsed.fullText,
+                  shortText: parsed.shortText,
+                  timestamp: Date.now(),
+                }
+              ]
+            };
+          }));
+
+          // 同步记入运行时任务事件日志
+          if (runtimeRef.current && taskId && runtimeRef.current.getTask(taskId)) {
+            const runtimeTask = runtimeRef.current.getTask(taskId);
+            if (runtimeTask) {
+              runtimeTask.events.push({
+                id: reviewId,
+                turnId: `${taskId}:qc`,
+                type: 'answer',
+                text: reviewText,
+                createdAt: Date.now(),
+              });
+            }
+          }
+
+          // 舒适留白：让用户完整阅读该卡片评语后，再移步下一张卡片
+          const readingDwellMs = Math.min(6000, Math.max(3000, speech.length * 150));
+          await sleep(readingDwellMs);
+        }
+
+        // 8. 完整结束本张卡片的端详
+        agentFocusManager.removeFocus(freshCard.id);
+
+        // 9. 若队列中还有待查看卡片，稍作平滑交接后开启下一张卡片的完整生命周期
+        if (inspectQueueRef.current.length > 0) {
+          await sleep(350);
+        } else {
+          agentFocusManager.setCursorMode('default');
+        }
+      }
+    } finally {
+      isProcessingInspectQueueRef.current = false;
+      if (inspectQueueRef.current.length === 0) {
+        agentFocusManager.setCursorMode('default');
+      }
+    }
+  }, [centerCardOnScreen, currentProject]);
+  processInspectQueueRef.current = processInspectQueue;
+
+  const detectAndSaveCardLandmarks = useCallback(async (targetCard: CardData, mediaUrl: string) => {
+    if (!mediaUrl || targetCard.landmarks) return;
+    try {
+      let effectiveUrl = mediaUrl;
+      const b64 = await extractCardImageBase64Ref.current(targetCard);
+      if (b64) {
+        effectiveUrl = b64;
+      }
+
+      // 🌟 核心机制：竖向/横向比例图像发送给主体识别节点前，先在前端扩展成 1:1 正方形垫边图，以彻底消除 ViT 空间注意力畸变
+      const { paddedUrl, padInfo } = await createSquareLetterboxImage(effectiveUrl, 1024);
+
+      const nodeModels = assetExtractionService.getNodeModels();
+      const modelToUse = nodeModels.subjectLandmarksModel || 'deepseek-v4-flash';
+      const deepseekKey = localStorage.getItem('deepseek_api_key') || '';
+      const qwenKey = localStorage.getItem('qwen_api_key') || '';
+      const isDashscope = modelToUse.includes('qwen') || modelToUse.includes('GLM') || modelToUse.includes('ZHIPU');
+      const apiKeyToSend = isDashscope ? (qwenKey || deepseekKey) : (deepseekKey || qwenKey);
+
+      const res = await fetch('/api/agent/detect-landmarks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          imageUrl: paddedUrl,
+          prompt: targetCard.prompt || targetCard.lastGeneratedPrompt || '',
+          ratio: padInfo.isPadded ? '1:1' : (targetCard.ratio || '16:9'),
+          model: modelToUse,
+          apiKey: apiKeyToSend || undefined,
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.regions) {
+          // 🌟 逆向映射：将 1:1 正方形空间模型坐标无损反解还原回原图真实几何百分比坐标
+          const restoredLandmarks = unpadLandmarks(data, padInfo);
+
+          setCards(prev => prev.map(c => {
+            if (c.id !== targetCard.id) return c;
+            return {
+              ...c,
+              landmarks: restoredLandmarks
+            };
+          }), false);
+        }
+      }
+    } catch (err) {
+      console.warn('[LandmarksNode] Auto-detection error:', err);
+    }
+  }, []);
+
+  const enqueueCardInspection = useCallback((targetCard: CardData, mediaUrl: string) => {
+    if (!mediaUrl) return;
+
+    // 🌟 自动调用图像主体定位模型节点：识别并持久化记录人物头部、胸部、腿部及核心主体空间坐标
+    void detectAndSaveCardLandmarks(targetCard, mediaUrl);
+
+    // Deduplicate: avoid pushing the same card ID if already waiting in queue
+    if (inspectQueueRef.current.some(item => item.targetCard.id === targetCard.id)) {
+      return;
+    }
+
+    const activeTaskId = activeTaskIdRef.current || `qc_task_${Date.now().toString(36)}`;
+
+    inspectQueueRef.current.push({
+      targetCard,
+      mediaUrl,
+      taskId: activeTaskId,
+    });
+
+    // 🌟 统一排队控制：只有在 Agent 没有在忙碌创建卡片/下发工具时才立即消费队列；
+    // 若 Agent 正在创建卡片，卡片安全入队挂起，等全部创建完成后自动触发消费！
+    if (!isAgentRunningRef.current) {
+      void processInspectQueue();
+    }
+  }, [detectAndSaveCardLandmarks, processInspectQueue]);
+
   const setCards = (updater: CardData[] | ((prev: CardData[]) => CardData[]), pushToHistory = true) => {
     setHistory(curr => {
       const nextPresent = typeof updater === 'function' ? updater(curr.present) : updater;
@@ -1180,7 +1558,8 @@ export default function App() {
             });
             const parsed = await safeParseJsonResponse(response);
             if (!parsed.success || !response.ok) {
-              await sleep(3000);
+              const pollInterval = pollCount <= 15 ? 800 : pollCount <= 30 ? 1500 : 3000;
+              await sleep(pollInterval);
               continue;
             }
 
@@ -1213,39 +1592,12 @@ export default function App() {
                   : current
               ), false);
 
-              // 🔔 Event-Driven Agent Re-awakening: Notify agent runtime if active task exists!
-              if (runtimeRef.current && activeTaskIdRef.current) {
-                const activeTaskId = activeTaskIdRef.current;
-                const updatedCard: CardData = {
-                  ...card,
-                  imageUrl: result.mediaUrl,
-                  state: 'completed',
-                };
-                void (async () => {
-                  try {
-                    const imgBase64 = await extractCardImageBase64(updatedCard);
-                    const reawakeMsg = `[系统通知] 生图卡片【${card.id}】已在后台成功完成 AI 图像渲染！最新高清画面已自动同步注入多模态视觉上下文。请对此生成结果进行审视并向用户汇报。`;
-                    runtimeRef.current?.addUserInput(
-                      activeTaskId,
-                      reawakeMsg,
-                      imgBase64 ? [imgBase64] : undefined,
-                      {
-                        cardId: card.id,
-                        title: card.fileName || card.name || '生图卡片',
-                        prompt: card.prompt,
-                        aspectRatio: card.ratio,
-                        resolution: card.res,
-                        imageUrl: imgBase64,
-                        markdownSummary: `卡片【${card.id}】AI 生图渲染完成。画面 URL: ${result.mediaUrl}`
-                      }
-                    );
-                    await runtimeRef.current?.wake(activeTaskId);
-                  } catch (e) {
-                    console.warn('[App] Agent re-awakening failed:', e);
-                  }
-                })();
-              }
-
+              const updatedCard: CardData = {
+                ...card,
+                imageUrl: result.mediaUrl,
+                state: 'completed',
+              };
+              enqueueCardInspection(updatedCard, result.mediaUrl);
               break;
             }
 
@@ -1260,7 +1612,9 @@ export default function App() {
             }
 
             if (result.pending) {
-              await sleep(3000);
+              // 🚀 Optimization 3: Adaptive high-frequency polling (800ms initial window)
+              const pollInterval = pollCount <= 15 ? 800 : pollCount <= 30 ? 1500 : 3000;
+              await sleep(pollInterval);
               continue;
             }
 
@@ -1288,10 +1642,18 @@ export default function App() {
                     }
                   : current
               ), false);
+
+              const updatedCard: CardData = {
+                ...card,
+                imageUrl: result.mediaUrl,
+                state: 'completed',
+              };
+              enqueueCardInspection(updatedCard, result.mediaUrl);
               break;
             }
 
-            await sleep(3000);
+            const pollInterval = pollCount <= 15 ? 800 : pollCount <= 30 ? 1500 : 3000;
+            await sleep(pollInterval);
           }
         } catch (error) {
           const errMsg = error instanceof Error ? error.message : String(error);
@@ -1913,6 +2275,18 @@ export default function App() {
     const shouldPush = isSignificant && !isOnlyPrompt;
     setCards(prev => prev.map(c => {
       if (c.id !== id) return c;
+      // 🛡️ Automatic Queue Trigger: Detect whenever a card transitions to 'completed' with mediaUrl
+      if (
+        updates.state === 'completed' &&
+        (updates.imageUrl || c.imageUrl) &&
+        c.state === 'generating'
+      ) {
+        const finishedMedia = updates.imageUrl || c.imageUrl || '';
+        const updatedCard = { ...c, ...updates };
+        setTimeout(() => {
+          enqueueCardInspection(updatedCard, finishedMedia);
+        }, 60);
+      }
       // If the card has completed media, ALWAYS preserve and establish baselineConfig before applying user modifications
       let baselineConfig = c.baselineConfig;
       if (!baselineConfig && (c.imageUrl || c.originalImageUrl || c.fileData) && !updates.baselineConfig) {
@@ -2069,6 +2443,8 @@ export default function App() {
     } else {
       setCards(prev => [...prev, forkedCard], true);
     }
+    // Synchronously register forkedCard in cardsRef.current so immediate agent animations can resolve its world coordinates
+    cardsRef.current = [...cardsRef.current.filter(c => c.id !== forkedCard.id), forkedCard];
     setSelectedCardIds([newId]);
 
     // Center the newly forked card in the page viewport
@@ -2129,7 +2505,7 @@ export default function App() {
               state: 'generating',
               generationError: undefined,
             }, true);
-            return;
+            return forkedCard;
           }
           if (resResult.ok && result.success && result.mediaUrl) {
             let thumb: string | undefined;
@@ -2152,11 +2528,11 @@ export default function App() {
               mcpTaskId: result.taskIds?.[0],
               generationError: undefined,
             }, true);
-            return;
+            return forkedCard;
           } else {
             const errMsg = result.error || '生成失败，请稍后重试';
             handleUpdateCard(newId, { state: 'draft', generationError: errMsg }, true);
-            return;
+            return forkedCard;
           }
         }
 
@@ -2832,7 +3208,7 @@ export default function App() {
     if (ownerId === 'user' && !isAgentRunning) {
       const hitCard = targetId ? cardsRef.current.find(c => c.id === targetId) : undefined;
       const lastReplyObj = hitCard && hitCard.chatHistory && hitCard.chatHistory.length > 0
-        ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant')
+        ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
         : undefined;
       const lastReply = lastReplyObj ? (lastReplyObj.shortText || lastReplyObj.text) : undefined;
 
@@ -3163,9 +3539,28 @@ export default function App() {
 
   // Animate cursor movement to visually focus and inspect a specific target component
   const animateMoveToTarget = useCallback(async (targetId: string) => {
+    if (targetId === 'canvas.viewport' || targetId === 'overview') {
+      const scaleVal = tScale.get() || 1;
+      const centerX = (window.innerWidth / 2 - tx.get()) / scaleVal;
+      const centerY = (window.innerHeight / 2 - ty.get()) / scaleVal;
+      setAgentState(prev => ({
+        ...prev,
+        x: centerX + 20,
+        y: centerY - 20,
+        visible: true,
+        isMoving: true,
+        isActive: false,
+      }));
+      await sleep(350);
+      setAgentState(prev => ({ ...prev, isMoving: false, isActive: false }));
+      await sleep(160);
+      return;
+    }
+
+    let moved = false;
     let target = document.querySelector(`[data-agent-target="${targetId}"]`);
     if (!target) {
-      await sleep(80);
+      await sleep(60);
       target = document.querySelector(`[data-agent-target="${targetId}"]`);
     }
     if (target instanceof HTMLElement) {
@@ -3173,8 +3568,9 @@ export default function App() {
       if (rect.width > 0 && rect.height > 0 && rect.bottom >= 0 && rect.top <= window.innerHeight && rect.right >= 0 && rect.left <= window.innerWidth) {
         const centerX = rect.width > 360 ? rect.left + Math.min(rect.width / 2, 240) : rect.left + rect.width / 2;
         const centerY = rect.height > 200 ? rect.top + Math.min(rect.height / 4, 90) : rect.top + rect.height / 2;
-        const targetX = (centerX - tx.get()) / tScale.get();
-        const targetY = (centerY - ty.get()) / tScale.get();
+        const scaleVal = tScale.get() || 1;
+        const targetX = (centerX - tx.get()) / scaleVal;
+        const targetY = (centerY - ty.get()) / scaleVal;
 
         setAgentState(prev => ({
           ...prev,
@@ -3188,9 +3584,12 @@ export default function App() {
         await sleep(350);
         setAgentState(prev => ({ ...prev, isMoving: false, isActive: false }));
         await sleep(160);
+        moved = true;
       }
-    } else if (targetId.startsWith('canvas.card.')) {
-      // In Nano-LOD or offscreen virtual mode, resolve world coordinates from data layer
+    }
+    
+    // Fallback: If DOM element is not mounted or not fully within viewport, directly resolve world coordinates from data layer
+    if (!moved && targetId.startsWith('canvas.card.')) {
       const cardId = targetId.replace('canvas.card.', '');
       const cardObj = cardsRef.current.find(c => c.id === cardId);
       if (cardObj) {
@@ -3443,12 +3842,21 @@ export default function App() {
       return page;
     };
     if (call.name === 'page.inspect') {
+      agentFocusManager.setCursorMode('inspect');
       const scope = typeof call.arguments?.scope === 'string' && call.arguments.scope !== 'overview'
         ? call.arguments.scope
         : (typeof call.arguments?.targetId === 'string' && call.arguments.targetId !== 'overview' ? call.arguments.targetId : undefined);
 
       if (scope) {
+        if (scope.startsWith('canvas.card.')) {
+          agentFocusManager.setPrimaryFocus(scope.replace('canvas.card.', ''), 'inspect', 'page.inspect.compare');
+        } else if (scope.startsWith('card_')) {
+          agentFocusManager.setPrimaryFocus(scope, 'inspect', 'page.inspect.compare');
+        }
         await animateMoveToTarget(scope);
+        if (signal?.aborted) return { aborted: true };
+      } else {
+        await animateMoveToTarget('overview');
         if (signal?.aborted) return { aborted: true };
       }
       return rememberObservation(await inspectPage(call.arguments));
@@ -3512,6 +3920,10 @@ export default function App() {
       if (!card) {
         throw new Error(`未找到 ID 为 ${cardId} 的卡片。请核对当前页面观察可见卡片。`);
       }
+
+      agentFocusManager.setCursorMode('inspect');
+      agentFocusManager.setPrimaryFocus(cleanCardId, 'inspect', 'card.inspect.compare');
+      await animateMoveToTarget('canvas.card.' + cleanCardId);
 
       const response: Record<string, any> = {
         cardId: card.id,
@@ -3581,6 +3993,13 @@ export default function App() {
       const aspectRatio = typeof call.arguments.aspectRatio === 'string' ? call.arguments.aspectRatio : undefined;
       const autoStart = call.arguments.autoStart !== false; // Defaults to true unless explicitly set to false
 
+      // 提取规范的卡片名称（短小精炼、辨识度高）
+      const rawName = typeof call.arguments.name === 'string' ? call.arguments.name.trim() :
+                      typeof call.arguments.cardName === 'string' ? call.arguments.cardName.trim() :
+                      typeof call.arguments.title === 'string' ? call.arguments.title.trim() : '';
+      const fallbackName = prompt ? prompt.slice(0, 10).replace(/[^\w\u4e00-\u9fa5]/g, '') : '生图卡片';
+      const cardName = rawName || fallbackName || '生图卡片';
+
       // Extract referenceCardIds array from tool arguments
       let rawRefIds: string[] = [];
       if (Array.isArray(call.arguments.referenceCardIds)) {
@@ -3644,6 +4063,8 @@ export default function App() {
           // Inherit sourceForPos parameters (prompt, ratio, res, mcpModel, referenceImages)
           // UNLESS Agent explicitly provided custom overrides in arguments!
           const forkConfig: Partial<CardData> = {
+            name: cardName,
+            fileName: cardName,
             prompt: prompt || sourceForPos.prompt || '基于参考素材创作的生图卡片',
             ratio: aspectRatio || sourceForPos.ratio || '16:9',
             res: sourceForPos.res || '2K',
@@ -3659,13 +4080,18 @@ export default function App() {
             forkConfig.referenceImages = collectedRefImages;
           }
 
-          activeCard = (await handleForkCard(sourceForPos.id, forkConfig, autoStart)) || undefined;
+          // 🛡️ Card is instantiated instantly without blocking on network requests;
+          // autoStart generation is performed downstream after visual cursor action!
+          activeCard = (await handleForkCard(sourceForPos.id, forkConfig, false)) || undefined;
         } else {
           const newId = `card_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
           const newCardObj: CardData = {
             id: newId,
+            name: cardName,
+            fileName: cardName,
             x: 200,
             y: 200,
+            imageUrl: '',
             prompt: prompt || '基于参考素材创作的生图卡片',
             ratio: aspectRatio || '1:1',
             res: '2K',
@@ -3674,7 +4100,8 @@ export default function App() {
             referenceImages: collectedRefImages,
             mcpModel: WORKRALLY_IMAGE_MODELS[0].id,
           };
-          handleCreateCard(newCardObj);
+          setCards(prev => [...prev, newCardObj]);
+          cardsRef.current = [...cardsRef.current.filter(c => c.id !== newCardObj.id), newCardObj];
           activeCard = newCardObj;
         }
       } else {
@@ -3682,6 +4109,8 @@ export default function App() {
         activeCard = targetCard;
         if (activeCard && (collectedRefImages.length > 0 || collectedRefSourceIds.length > 0)) {
           handleUpdateCard(activeCard.id, {
+            name: cardName,
+            fileName: cardName,
             referenceSourceIds: Array.from(new Set([...(activeCard.referenceSourceIds || []), ...collectedRefSourceIds])),
             referenceImages: dedupeReferenceImages([...(activeCard.referenceImages || []), ...collectedRefImages]),
           }, false);
@@ -3694,9 +4123,27 @@ export default function App() {
 
       if (activeCard) {
         handleUpdateCard(activeCard.id, {
+          name: cardName,
+          fileName: cardName,
           prompt: effectivePrompt,
           ratio: effectiveRatio,
         }, false);
+
+        agentFocusManager.setCursorMode('working');
+        agentFocusManager.batchSetFocus({
+          primary: activeCard.id,
+          references: rawRefIds,
+          role: 'working',
+          sourceTool: 'card.generate',
+          cursorMode: 'working',
+        });
+        await animateMoveToTarget('canvas.card.' + activeCard.id);
+
+        // Perform physical generation gesture: press down to trigger generation, then release
+        setAgentState(prev => ({ ...prev, isActive: true }));
+        await sleep(180);
+        setAgentState(prev => ({ ...prev, isActive: false }));
+        await sleep(120);
       }
 
       // 🛡️ Mode A: autoStart === false -> Draft Configuration Only
@@ -3707,14 +4154,15 @@ export default function App() {
         return {
           success: true,
           cardId: activeCardId,
+          cardName: cardName,
           cardState: 'draft',
           isForked,
           autoStarted: false,
           prompt: effectivePrompt,
           referenceCount: collectedRefImages.length,
           message: isForked
-            ? `从卡片【${cleanTargetId || '源卡片'}】复刻衍生出生图卡片【${activeCardId}】，参考图与新提示词已就位（处于草稿待生成状态）。`
-            : `生图卡片【${activeCardId}】已配置完成，参考图与提示词已就位（处于草稿待生成状态）。`
+            ? `从卡片【${cleanTargetId || '源卡片'}】复刻衍生出生图卡片【${cardName} (${activeCardId})】，参考图与新提示词已就位（处于草稿待生成状态）。`
+            : `生图卡片【${cardName} (${activeCardId})】已配置完成，参考图与提示词已就位（处于草稿待生成状态）。`
         };
       }
 
@@ -3775,14 +4223,15 @@ export default function App() {
             success: true,
             status: 'pending',
             cardId: activeCardId,
+            cardName: cardName,
             cardState: 'generating',
             isForked,
             autoStarted: true,
             mcpTaskId: taskId,
             prompt: effectivePrompt,
             message: isForked
-              ? `已从【${cleanTargetId || '源卡片'}】复刻衍生新卡片【${activeCardId}】并在界面启动排队渲染，任务句柄 [${taskId}]。`
-              : `生图卡片【${activeCardId}】已在界面启动加载渲染，任务句柄 [${taskId}] 正在排队中。`
+              ? `已从【${cleanTargetId || '源卡片'}】复刻衍生新卡片【${cardName} (${activeCardId})】并在界面启动排队渲染，任务句柄 [${taskId}]。`
+              : `生图卡片【${cardName} (${activeCardId})】已在界面启动加载渲染，任务句柄 [${taskId}] 正在排队中。`
           };
         }
 
@@ -3819,12 +4268,13 @@ export default function App() {
         return {
           success: true,
           cardId: activeCard.id,
+          cardName: cardName,
           cardState: 'completed',
           imageUrl: newMediaUrl,
           prompt: effectivePrompt,
           message: isNewTarget
-            ? `已自动新建独立生图卡片【${activeCard.id}】并绑定 ${collectedRefImages.length} 张参考图素材，画面已成功渲染发布！`
-            : '画面已成功生成并实时更新挂载到画布卡片上！'
+            ? `已自动新建独立生图卡片【${cardName} (${activeCard.id})】并绑定 ${collectedRefImages.length} 张参考图素材，画面已成功渲染发布！`
+            : `卡片【${cardName}】画面已成功生成并实时更新挂载到画布卡片上！`
         };
       } catch (err) {
         handleUpdateCard(activeCard.id, {
@@ -3853,24 +4303,7 @@ export default function App() {
     throw new Error(`未注册工具：${call.name}`);
   }, [animateMouseAction, applyPageCommand, inspectPage]);
 
-  const updateAgentRuntimeTrace = useCallback((task: RuntimeTask, update?: (trace: AgentRuntimeTrace) => AgentRuntimeTrace) => {
-    const taskSnapshot = snapshotRuntimeTask(task);
-    setAgentRuntimeTraces(current => {
-      const now = Date.now();
-      const existing = current.find(trace => trace.taskId === task.id);
-      const base: AgentRuntimeTrace = existing || {
-        id: `trace_${task.id}`,
-        taskId: task.id,
-        goal: task.goal,
-        createdAt: now,
-        updatedAt: now,
-        task: taskSnapshot,
-        turns: [],
-      };
-      const next = update ? update({ ...base, task: taskSnapshot, updatedAt: now }) : { ...base, task: taskSnapshot, updatedAt: now };
-      return [...current.filter(trace => trace.taskId !== task.id), next].slice(-12);
-    });
-  }, []);
+
 
   const extractCardImageBase64 = useCallback(async (card: CardData): Promise<string | undefined> => {
     const compressImageToJpegBase64 = async (source: Blob | string): Promise<string | undefined> => {
@@ -4022,6 +4455,7 @@ export default function App() {
 
     return undefined;
   }, []);
+  extractCardImageBase64Ref.current = extractCardImageBase64;
 
   const formatCardContextInfo = useCallback((card: CardData, hasImage: boolean): string => {
     const cardType = card.isVideo ? '视频生成卡片' : (card.isAsset ? '素材/参考卡片' : '生图卡片');
@@ -4069,6 +4503,7 @@ export default function App() {
     if (overrideMessage === undefined) {
       setAgentPrompt('');
     }
+    isAgentRunningRef.current = true;
     setIsAgentThinking(true);
     setIsAgentRunning(true);
 
@@ -4156,7 +4591,9 @@ export default function App() {
               }],
             }));
             try {
-              setAgentState(prev => ({ ...prev, speak: '...', visible: true }));
+              if (!isProcessingInspectQueueRef.current) {
+                setAgentState(prev => ({ ...prev, speak: '...', visible: true }));
+              }
               const res = await fetch('/api/agent/turn', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -4166,6 +4603,16 @@ export default function App() {
               const body = await res.json().catch(() => ({}));
               if (!res.ok) throw new Error(body.error || 'Agent 轮次失败');
               const result = body as AgentTurnResult;
+
+              // Immediately notify agentFocusManager with the validated tool calls from the JSON adapter node
+              if (Array.isArray(result.toolCalls) && result.toolCalls.length > 0) {
+                result.toolCalls.forEach(call => {
+                  agentFocusManager.handleJsonNodeToolCall(call);
+                });
+              } else if (result.complete && !isProcessingInspectQueueRef.current) {
+                agentFocusManager.clearAll(2500);
+              }
+
               updateAgentRuntimeTrace(task, trace => ({
                 ...trace,
                 turns: trace.turns.map(turn => turn.id === turnId ? {
@@ -4201,7 +4648,41 @@ export default function App() {
               throw new Error(displayMsg);
             }
           },
-          executeTool: (call, task, signal) => executeAgentTool(call, task, signal),
+          executeTool: async (call, task, signal) => {
+            const output = await executeAgentTool(call, task, signal);
+            if (signal?.aborted) return output;
+
+            // 🛡️ Output-Driven Action Resolver (基于工具输出的动作解析器)
+            // 契约：凡是依赖执行结果产出/实例化实体对象的工具（如 card.generate 产出具体的 cardId），
+            // 一旦监测到工具产生有效输出，系统第一时间截获并解析 output.cardId，
+            // 立即驱动 Agent 聚焦锁定并调度鼠标毫秒级飞赴新卡片执行下压手势！
+            if (call.name === 'card.generate' && output && typeof output === 'object') {
+              const outputCardId = (output as any).cardId;
+              const outMsg = (output as any).message || `生图卡片【${outputCardId}】已成功创建并进入排队渲染。`;
+              if (typeof outputCardId === 'string' && outputCardId) {
+                agentFocusManager.setCursorMode('working');
+                agentFocusManager.setPrimaryFocus(outputCardId, 'working', 'card.generate');
+                await animateMoveToTarget('canvas.card.' + outputCardId);
+                setAgentState(prev => ({ ...prev, isActive: true }));
+                await sleep(180);
+                setAgentState(prev => ({ ...prev, isActive: false }));
+              }
+
+              // 🚀 Optimization 1: 乐观即时状态汇报 (Optimistic Instant Feedback)
+              // 无需等待第二轮大模型漫长的 4 秒推理，在工具返回的第 0 毫秒立即将进展注入事件流与 HUD
+              if (runtimeRef.current) {
+                runtimeRef.current.addFeedback(task.id, outMsg, 'answer');
+              }
+              const shortText = parseAgentCommunication(outMsg).shortText || `卡片【${outputCardId}】已启动排队渲染...`;
+              setAgentState(prev => ({
+                ...prev,
+                speak: shortText,
+                visible: true,
+              }));
+            }
+
+            return output;
+          },
           requireVisibleInteraction: false,
           isParallelSafe: (call) => {
             if (call.name === 'guide.lookup') return true;
@@ -4308,16 +4789,19 @@ export default function App() {
             });
 
             // Live speech synchronization for Agent Pointer HUD
-            const latestAnswer = [...task.events].reverse().find(e => e.type === 'answer' && e.text && e.text.trim());
-            if (latestAnswer) {
-              const shortSpeech = parseAgentCommunication(latestAnswer.text).shortText;
-              if (shortSpeech) {
-                if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
-                setAgentState(prev => ({
-                  ...prev,
-                  speak: shortSpeech,
-                  visible: true,
-                }));
+            // Only update speech if not currently protected by active card inspection queue
+            if (!isProcessingInspectQueueRef.current) {
+              const latestAnswer = [...task.events].reverse().find(e => e.type === 'answer' && e.text && e.text.trim());
+              if (latestAnswer) {
+                const shortSpeech = parseAgentCommunication(latestAnswer.text).shortText;
+                if (shortSpeech) {
+                  if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
+                  setAgentState(prev => ({
+                    ...prev,
+                    speak: shortSpeech,
+                    visible: true,
+                  }));
+                }
               }
             }
 
@@ -4328,11 +4812,11 @@ export default function App() {
             // If task is bound to a specific card context, sync answer events to that card's chat history
             const cardId = task.cardContext?.cardId || task.cardContext?.targetId;
             if (cardId) {
-              const answers = task.events.filter(e => e.type === 'answer' && e.text && e.text.trim());
+              const answers = task.events.filter(e => e.type === 'answer' && e.text && e.text.trim() && !e.text.includes('生好了，我先看下'));
               if (answers.length > 0) {
                 setCards(prevCards => prevCards.map(c => {
                   if (c.id !== cardId) return c;
-                  const currentHistory = c.chatHistory || [];
+                  const currentHistory = (c.chatHistory || []).filter(m => !m.text.includes('生好了，我先看下'));
                   const newAnswers = answers.filter(a => !currentHistory.some(m => m.id === a.id));
                   if (newAnswers.length === 0) return c;
                   return {
@@ -4415,6 +4899,11 @@ export default function App() {
     } finally {
       setIsAgentThinking(false);
       setIsAgentRunning(false);
+      isAgentRunningRef.current = false;
+      // 🌟 本轮卡片分发与创建完毕，平滑启动出图检视队列，按序消费出图卡片！
+      setTimeout(() => {
+        void processInspectQueueRef.current();
+      }, 150);
     }
   };
 
@@ -4483,6 +4972,7 @@ export default function App() {
 
   const handleResumeTask = async () => {
     if (!runtimeRef.current || !activeTaskIdRef.current) return;
+    isAgentRunningRef.current = true;
     setIsAgentRunning(true);
     try {
       await runtimeRef.current.resume(activeTaskIdRef.current);
@@ -4490,11 +4980,16 @@ export default function App() {
       console.error('Resume failed:', err);
     } finally {
       setIsAgentRunning(false);
+      isAgentRunningRef.current = false;
       setIsAgentThinking(false);
+      setTimeout(() => {
+        void processInspectQueueRef.current();
+      }, 150);
     }
   };
 
   const handleCancelTask = () => {
+    inspectQueueRef.current = [];
     if (!runtimeRef.current || !activeTaskIdRef.current) return;
     runtimeRef.current.cancel(activeTaskIdRef.current);
     setIsAgentRunning(false);
@@ -5449,6 +5944,12 @@ export default function App() {
       const centerY = (window.innerHeight / 2 - ty.get()) / scaleVal;
 
       const sortedPending = [...pendingCards].sort((a, b) => {
+        // Preemptive top priority for Agent-focused cards (Primary & References)
+        const aAgentFocused = Boolean(agentFocus.primaryCardId === a.id || agentFocus.referenceCardIds.includes(a.id));
+        const bAgentFocused = Boolean(agentFocus.primaryCardId === b.id || agentFocus.referenceCardIds.includes(b.id));
+        if (aAgentFocused && !bAgentFocused) return -1;
+        if (!aAgentFocused && bAgentFocused) return 1;
+
         const aSel = selectedCardIdsRef.current.includes(a.id);
         const bSel = selectedCardIdsRef.current.includes(b.id);
         if (aSel && !bSel) return -1;
@@ -5677,12 +6178,10 @@ export default function App() {
         selectedCardIds={selectedCardIds}
         renderedCardIds={renderedCardIds}
         agentTargetCardId={
-          agentQuickInput?.isOpen && agentQuickInput.targetId
-            ? agentQuickInput.targetId
-            : (Object.values(contextMenus) as any[]).find(m => m?.targetId)?.targetId || 
-              (agentTask && !['completed', 'cancelled', 'failed'].includes(agentTask.status) && ((agentTask as any).cardContext?.cardId || (agentTask as any).cardContext?.targetId)) || 
-              null
+          agentFocus.primaryCardId || 
+          (agentQuickInput?.isOpen && agentQuickInput.targetId ? agentQuickInput.targetId : null)
         }
+        agentReferenceCardIds={agentFocus.referenceCardIds}
         pickerSession={pickerSession}
         scale={tScale}
         tx={tx}
@@ -5727,11 +6226,16 @@ export default function App() {
               )
             : -1;
           const pickerSelectionIndex = pickerIndex !== -1 ? pickerIndex + 1 : undefined;
-          const isAgentTarget = Boolean(
-            (agentQuickInput?.isOpen && (agentQuickInput.targetIds?.includes(card.id) || agentQuickInput.targetId === card.id)) ||
-            Object.values(contextMenus).some((m: any) => m?.targetId === card.id) ||
-            (agentTask && !['completed', 'cancelled', 'failed'].includes(agentTask.status) && ((agentTask as any).cardContext?.cardId === card.id || (agentTask as any).cardContext?.targetId === card.id))
+          const focusItem = agentFocus.focusedMap[card.id];
+          const isQuickInputTarget = Boolean(
+            agentQuickInput?.isOpen && (agentQuickInput.targetIds?.includes(card.id) || agentQuickInput.targetId === card.id)
           );
+          const agentFocusRole = focusItem?.role || (isQuickInputTarget ? 'inspect' : null);
+          const isAgentTarget = Boolean(focusItem?.role || isQuickInputTarget);
+          const isQcInspectTarget = Boolean(focusItem?.sourceTool?.includes('qc'));
+          const agentInspectScenario: 'qc' | 'quickInput' | 'compare' = isQcInspectTarget
+            ? 'qc'
+            : (isQuickInputTarget ? 'quickInput' : (focusItem?.sourceTool?.includes('compare') ? 'compare' : 'qc'));
 
           return (
             <GenerationCard 
@@ -5746,6 +6250,8 @@ export default function App() {
               onStartCanvasPicker={handleStartCanvasPicker}
               isSelected={selectedCardIds.includes(card.id)}
               isAgentTarget={isAgentTarget}
+              agentFocusRole={agentFocusRole}
+              agentInspectScenario={agentInspectScenario}
               isZooming={isZooming}
               allCards={cards}
               currentProject={currentProject}
@@ -5785,7 +6291,7 @@ export default function App() {
         {/* Agent Marquee Selection Box */}
         {agentSelectionBox && (
           <div
-            className="absolute border-[#a855f7]/60 bg-[#a855f7]/12 pointer-events-none z-[200] rounded-xl shadow-[0_0_15px_rgba(168,85,247,0.15)]"
+            className="absolute border-[#a45cf8]/60 bg-[#a45cf8]/12 pointer-events-none z-[200] rounded-xl shadow-[0_0_15px_rgba(164,92,248,0.15)]"
             style={{
               left: Math.min(agentSelectionBox.startX, agentSelectionBox.currentX),
               top: Math.min(agentSelectionBox.startY, agentSelectionBox.currentY),
@@ -5918,6 +6424,7 @@ export default function App() {
                   if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
                   setAgentState(prev => ({
                     ...prev,
+                    lastPrompt: prompt,
                     speak: "正在思考...",
                     visible: true
                   }));
@@ -5974,18 +6481,30 @@ export default function App() {
               </p>
             </div>
             <div className="flex items-center gap-1.5 shrink-0">
-              <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium whitespace-nowrap ${
-                ['planning', 'waiting_tools'].includes(agentTask.status) ? 'bg-purple-100 text-purple-700 dark:bg-purple-950/60 dark:text-purple-300' :
-                agentTask.status === 'completed' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300' :
-                agentTask.status === 'paused' || agentTask.status === 'waiting_user' ? 'bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300' :
-                'bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300'
-              }`}>
-                {['planning', 'waiting_tools'].includes(agentTask.status) ? '执行中' :
-                 agentTask.status === 'completed' ? '已完成' :
-                 agentTask.status === 'paused' ? '已暂停' :
-                 agentTask.status === 'waiting_user' ? '等待用户' :
-                 agentTask.status === 'cancelled' ? '已取消' : '失败'}
-              </span>
+              {(() => {
+                const isWaitingGeneration = (agentTask.status === 'paused' || (agentTask.status === 'completed' && cards.some(c => c.state === 'generating'))) && (
+                  cards.some(c => c.state === 'generating') ||
+                  agentTask.events.some(e => /生成|排队|渲染|正在生成/i.test(e.text))
+                );
+
+                return (
+                  <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium whitespace-nowrap flex items-center gap-1.5 ${
+                    ['planning', 'waiting_tools'].includes(agentTask.status) ? 'bg-purple-100 text-purple-700 dark:bg-purple-950/60 dark:text-purple-300' :
+                    isWaitingGeneration ? 'bg-purple-50 text-purple-700 border border-purple-200/90 dark:bg-purple-950/50 dark:text-purple-300 dark:border-purple-800/80 shadow-xs' :
+                    agentTask.status === 'completed' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300' :
+                    agentTask.status === 'paused' || agentTask.status === 'waiting_user' ? 'bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300' :
+                    'bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300'
+                  }`}>
+                    {isWaitingGeneration && <span className="w-1.5 h-1.5 rounded-full bg-purple-500 animate-pulse" />}
+                    {['planning', 'waiting_tools'].includes(agentTask.status) ? '执行中' :
+                     isWaitingGeneration ? '等待生成' :
+                     agentTask.status === 'completed' ? '已完成' :
+                     agentTask.status === 'paused' ? '已暂停' :
+                     agentTask.status === 'waiting_user' ? '等待用户' :
+                     agentTask.status === 'cancelled' ? '已取消' : '失败'}
+                  </span>
+                );
+              })()}
               <button 
                 onClick={() => setAgentTask(null)}
                 className="p-1 rounded-full bg-gray-100 hover:bg-gray-200 dark:bg-neutral-700/60 dark:hover:bg-neutral-700 text-gray-500 dark:text-neutral-300 transition-colors cursor-pointer"

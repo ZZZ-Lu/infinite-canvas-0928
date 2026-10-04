@@ -8,15 +8,17 @@ import { mcpRouter } from './src/server/mcpRouter';
 dotenv.config();
 const defaultPromptFilePath = path.join(process.cwd(), "src/agent/systemPrompt.txt");
 const defaultStatePromptFilePath = path.join(process.cwd(), "src/agent/stateNodePrompt.txt");
+const defaultLandmarksPromptFilePath = path.join(process.cwd(), "src/agent/subjectLandmarksPrompt.txt");
 const customPromptDir = path.join(process.cwd(), ".data");
 const customPromptFilePath = path.join(customPromptDir, "systemPrompt.txt");
 const customStatePromptFilePath = path.join(customPromptDir, "stateNodePrompt.txt");
+const customLandmarksPromptFilePath = path.join(customPromptDir, "subjectLandmarksPrompt.txt");
 
-function getPrompt(type: 'main' | 'state' = 'main') {
+function getPrompt(type: 'main' | 'state' | 'landmarks' = 'main') {
   try {
     const isProd = process.env.NODE_ENV === 'production';
-    const customPath = type === 'state' ? customStatePromptFilePath : customPromptFilePath;
-    const defaultPath = type === 'state' ? defaultStatePromptFilePath : defaultPromptFilePath;
+    const customPath = type === 'state' ? customStatePromptFilePath : (type === 'landmarks' ? customLandmarksPromptFilePath : customPromptFilePath);
+    const defaultPath = type === 'state' ? defaultStatePromptFilePath : (type === 'landmarks' ? defaultLandmarksPromptFilePath : defaultPromptFilePath);
     if (isProd) {
       if (fs.existsSync(customPath)) {
         return fs.readFileSync(customPath, "utf-8");
@@ -52,28 +54,102 @@ const parametersForTool = (toolId: string) => {
     'page.inspect': { properties: observationProperties },
     'guide.lookup': { properties: { query: { type: 'string' } }, required: ['query'] },
     'sys.updateState': { properties: { taskTitle: { type: 'string' }, goal: { type: 'string' }, subGoal: { type: 'string' }, progress: { type: 'string' }, notes: { type: 'string' }, notesMode: { type: 'string', enum: ['append', 'overwrite'], description: '重点笔记模式：append（追加，默认）或 overwrite（重写替换现有笔记）' }, plan: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, title: { type: 'string' }, status: { type: 'string' } } } } } },
-    'sys.endTask': { properties: { success: { type: 'boolean' }, finalResponse: { type: 'string' }, waitForUser: { type: 'string' } }, required: ['success', 'finalResponse'] },
+    'sys.endTask': { properties: { success: { type: 'boolean' }, finalResponse: { type: 'string' }, waitForUser: { type: 'string' }, paused: { type: 'boolean', description: '若任务属于等待后台异步生图/排队渲染，设置为 true 挂起任务等待出图事件唤醒' } }, required: ['success', 'finalResponse'] },
     'user.ask': { properties: { question: { type: 'string' } }, required: ['question'] },
   };
   const schema = schemas[toolId] || { properties: {} };
   return { type: 'object', properties: schema.properties, ...(schema.required ? { required: schema.required } : {}) };
 };
 
+function robustParseJson<T = any>(str: string): T | null {
+  if (!str || typeof str !== 'string') return null;
+
+  let cleaned = str.trim();
+  // 1. Strip Markdown code block if wrapped in ```json ... ```
+  const mdMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (mdMatch) {
+    cleaned = mdMatch[1].trim();
+  }
+
+  // 2. Find boundaries of outer JSON structure ({ ... } or [ ... ])
+  const firstBrace = cleaned.indexOf('{');
+  const firstBracket = cleaned.indexOf('[');
+  let startIdx = -1;
+  let isObject = true;
+
+  if (firstBrace !== -1 && (firstBracket === -1 || firstBrace < firstBracket)) {
+    startIdx = firstBrace;
+    isObject = true;
+  } else if (firstBracket !== -1) {
+    startIdx = firstBracket;
+    isObject = false;
+  }
+
+  if (startIdx !== -1) {
+    const lastChar = isObject ? '}' : ']';
+    const endIdx = cleaned.lastIndexOf(lastChar);
+    if (endIdx > startIdx) {
+      cleaned = cleaned.slice(startIdx, endIdx + 1);
+    }
+  }
+
+  // First direct try
+  try {
+    return JSON.parse(cleaned);
+  } catch {}
+
+  // 3. Repair common LLM JSON formatting defects:
+  let repaired = cleaned;
+
+  // a) Missing commas between array elements (e.g. ["a" "b"] or ["a"\n"b"]):
+  repaired = repaired
+    .replace(/(["\d\]}])\s*\n\s*(["\d\[{])/g, '$1,\n$2')
+    .replace(/(")\s+(")/g, '$1, $2')
+    .replace(/(\})\s+(\{)/g, '$1, $2')
+    .replace(/(\])\s+(\[)/g, '$1, $2');
+
+  // b) Trailing commas before closing braces/brackets
+  repaired = repaired.replace(/,\s*([}\]])/g, '$1');
+
+  // c) Unquoted keys: { key: "val" } -> { "key": "val" }
+  repaired = repaired.replace(/([{,]\s*)([a-zA-Z0-9_$]+)\s*:/g, '$1"$2":');
+
+  // d) Single-quoted strings to double-quoted strings
+  repaired = repaired.replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, ':"$1"');
+
+  try {
+    return JSON.parse(repaired);
+  } catch {}
+
+  // 4. Fallback: extract tool_calls using regex if it's a tool_calls payload
+  try {
+    const toolCallRegex = /"name"\s*:\s*"([^"]+)"[\s\S]*?"arguments"\s*:\s*(\{[\s\S]*?\})/g;
+    const extractedCalls: any[] = [];
+    let match;
+    while ((match = toolCallRegex.exec(cleaned)) !== null) {
+      const name = match[1];
+      const argsRaw = match[2];
+      try {
+        const args = JSON.parse(argsRaw.replace(/,\s*([}\]])/g, '$1'));
+        extractedCalls.push({ name, arguments: args });
+      } catch {
+        const repairedArgs = robustParseJson(argsRaw);
+        if (repairedArgs) {
+          extractedCalls.push({ name, arguments: repairedArgs });
+        }
+      }
+    }
+    if (extractedCalls.length > 0) {
+      return { tool_calls: extractedCalls } as any;
+    }
+  } catch {}
+
+  return null;
+}
+
 function trySanitizeAndParseJson(str: string): Record<string, any> | null {
-  try {
-    const parsed = JSON.parse(str);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
-  } catch {}
-
-  try {
-    // Sanitize unquoted JS object keys e.g. { cardId: "rshuewfmu", prompt: "..." } -> { "cardId": "rshuewfmu", "prompt": "..." }
-    const sanitized = str
-      .replace(/([{,]\s*)([a-zA-Z0-9_$]+)\s*:/g, '$1"$2":')
-      .replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, ':"$1"'); // single quote string values to double quote
-    const parsed = JSON.parse(sanitized);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
-  } catch {}
-
+  const result = robustParseJson(str);
+  if (result && typeof result === 'object' && !Array.isArray(result)) return result;
   return null;
 }
 
@@ -112,7 +188,8 @@ function tryFastParseToolCalls(actionDesc: string): any[] | null {
         }
       } else if (toolName === 'sys.endTask') {
         const cleanMsg = rest.replace(/^["'“]|["'”]$/g, '').trim();
-        parsedCalls.push({ name: 'sys.endTask', arguments: { success: true, finalResponse: cleanMsg || '任务完成。' } });
+        const isGeneratingOrWaiting = /等待|生成|排队|渲染|稍候|后台/i.test(cleanMsg);
+        parsedCalls.push({ name: 'sys.endTask', arguments: { success: true, finalResponse: cleanMsg || '任务完成。', paused: isGeneratingOrWaiting } });
       } else if (toolName === 'user.ask') {
         const cleanQ = rest.replace(/^["'“]|["'”]$/g, '').trim();
         if (cleanQ) {
@@ -144,7 +221,7 @@ function getModelConfig(modelType: string, userKey?: string): ModelConfig {
   let reasoningEffort: 'low' | 'high' | 'max' = 'max';
 
   if (modelType === 'deepseek-v4-pro') {
-    actualModel = 'deepseek-reasoner';
+    actualModel = 'deepseek-v4-pro';
     enableThinking = true;
     stream = true;
   } else if (
@@ -364,7 +441,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const body = await response.json();
-        const parsed = JSON.parse(body.choices?.[0]?.message?.content || '{}');
+        const parsed = robustParseJson(body.choices?.[0]?.message?.content || '{}') || {};
         if (parsed.scenePattern || parsed.pattern || parsed.tocPattern) {
           return res.json({ 
             ...parsed,
@@ -439,7 +516,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
 
       const body = await response.json();
       const resultText = body.choices?.[0]?.message?.content || '{}';
-      const parsed = JSON.parse(resultText);
+      const parsed = robustParseJson(resultText) || {};
       
       return res.json({
         scale: parsed.scale || 'trivial',
@@ -749,7 +826,10 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
           { type: 'text', text: finalPrompt },
           ...allImages.map((img: string) => ({
             type: 'image_url',
-            image_url: { url: img }
+            image_url: {
+              url: img,
+              detail: 'auto',
+            }
           }))
         ];
       }
@@ -766,6 +846,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         requestPayload.stream = true;
       }
       if (enableThinking) {
+        requestPayload.thinking = { type: 'enabled' };
         requestPayload.enable_thinking = true;
         requestPayload.reasoning_effort = reasoningEffort;
         requestPayload.extra_body = {
@@ -939,7 +1020,8 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
               });
               if (parseResponse.ok) {
                 const parseBody = await parseResponse.json();
-                const parsedResult = JSON.parse(parseBody.choices?.[0]?.message?.content || '{}');
+                const rawContent = parseBody.choices?.[0]?.message?.content || '{}';
+                const parsedResult = robustParseJson(rawContent) || {};
                 if (Array.isArray(parsedResult.tool_calls)) {
                   parsedToolCalls = parsedResult.tool_calls;
                 }
@@ -967,7 +1049,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         
         if (!name || !allowedTools.has(name)) return [];
         try {
-          const arguments_ = typeof call.arguments === 'object' ? call.arguments : JSON.parse(call.arguments || '{}');
+          const arguments_ = typeof call.arguments === 'object' ? call.arguments : (robustParseJson(call.arguments || '{}') || {});
           if (!arguments_ || typeof arguments_ !== 'object') return [];
           const id = call.id || `call_${Date.now()}_${index}`;
           return [{ id, name, arguments: arguments_ }];
@@ -1122,6 +1204,380 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       res.status(500).json({ error: err.message || 'State node update failed' });
     }
   });
+
+  // Dedicated Ultra-Fast Subject Landmarks Detection Node (DeepSeek detail: low)
+  app.post('/api/agent/detect-landmarks', async (req, res) => {
+    try {
+      const { imageUrl, prompt, apiKey, model, ratio } = req.body || {};
+      if (!imageUrl) {
+        return res.status(400).json({ error: 'Missing imageUrl' });
+      }
+
+      const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(model || 'deepseek-v4-flash', apiKey);
+
+      let landmarksPromptTemplate = getPrompt('landmarks');
+      if (!landmarksPromptTemplate || !landmarksPromptTemplate.trim()) {
+        landmarksPromptTemplate = `你是一个具备卓越艺术人体解剖结构与空间定位能力的图像核心视觉兴趣点专家。
+你的核心任务是：深入观察分析输入的图像，利用原生 Visual Grounding 空间感知能力，精准圈定全图最核心的 3~8 个动态兴趣点（Interest Points）。
+
+【人体核心解剖部位必选清单（只要画面可见必须全部提取，严禁遗漏）】
+当画面中包含人物时，必须完整覆盖以下核心解剖与形体部位：
+1. 面部与五官神态（id: "eyes" 或 "face"，如眼神光、微闭双眼、唇角、微表情）；
+2. 颈项与锁骨线条（id: "neck" 或 "necklace"，如锁骨反光、颈项弧线）；
+3. ★★★ 胸部与胸腔起伏线条（id: "chest"，如挺拔胸部轮廓、丰满胸前起伏、深V领口曲线与胸前阴影，必须明确标注，严禁遗漏！）；
+4. 手部姿态与指节动作（id: "hands"，如手指姿势、轻抚动作、手腕指戒）；
+5. 姿态身形与腿部曲线（id: "legs" 或 "body"，如腰腹线条、修长腿部坐卧姿态）；
+6. 核心贴身服饰与质感工艺（id: "dress" 或 "outfit"，如礼服密集水钻、珠光褶皱）。
+
+【DeepSeek 原生 Visual Grounding 坐标规约】
+1. 每个部位与兴趣点必须输出在主体画面上的 2D 目标包围盒 "box_2d": [ymin, xmin, ymax, xmax]；
+2. 坐标数值必须为 0~1000 范围内的归一化整数（以有效主体画面为基准，0 为最顶/最左边缘，1000 为最底/最右边缘）：
+   - ymin: 目标顶部边界 (0~1000)
+   - xmin: 目标左侧边界 (0~1000)
+   - ymax: 目标底部边界 (0~1000)
+   - xmax: 目标右侧边界 (0~1000)
+3. 必须完全依据图像中真实的几何像素特征进行定位打框，严禁产生任何人为偏移。
+
+【输出格式规范（严格返回合法 JSON 对象，严禁 Markdown）】
+{
+  "summary": "画面主体特征、角色姿态与艺术氛围简述",
+  "shotType": "close_up | medium_shot | full_shot | landscape | macro | object",
+  "hasPerson": true,
+  "interestPoints": [
+    {
+      "id": "eyes",
+      "label": "精准具体的解剖与特征描述（如'迷离仰视的半睁双眼与微张红唇'）",
+      "box_2d": [ymin, xmin, ymax, xmax],
+      "importance": 0.98,
+      "dwellSeconds": 2.2,
+      "category": "face"
+    }
+  ],
+  "regions": {
+    "head": { "box_2d": [ymin, xmin, ymax, xmax] },
+    "eyes": { "box_2d": [ymin, xmin, ymax, xmax] },
+    "chest": { "box_2d": [ymin, xmin, ymax, xmax] },
+    "legs": { "box_2d": [ymin, xmin, ymax, xmax] },
+    "hands": [{ "box_2d": [ymin, xmin, ymax, xmax] }],
+    "primaryObject": { "label": "核心主体焦点", "box_2d": [ymin, xmin, ymax, xmax] }
+  }
+}`;
+      }
+
+      const userTextPrompt = `请深入观察并定位此图像的核心视觉焦点。
+【目标画幅比例】: ${ratio || '原始画幅'}
+【任务要求】:
+1. 识别并提取图像中最核心的 3~8 个兴趣点 (interestPoints) 及 regions，覆盖人体关键解剖部位（面部五官、锁骨颈项、挺拔胸部与领口、手部动态、身形腿部）及贴身服饰；
+2. 严格利用 Visual Grounding 为每个部位输出 "box_2d": [ymin, xmin, ymax, xmax]（0~1000 范围整数），务必紧贴目标真实像素边缘；
+${prompt ? `参考提示词: ${prompt}` : ''}
+严格返回纯 JSON 格式。`;
+
+      const requestPayload = {
+        model: actualModel,
+        response_format: { type: 'json_object' },
+        thinking: { type: 'disabled' },
+        extra_body: { thinking: { type: 'disabled' } },
+        messages: [
+          { role: 'system', content: landmarksPromptTemplate },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image_url',
+                image_url: {
+                  url: imageUrl,
+                  detail: 'low'
+                }
+              },
+              {
+                type: 'text',
+                text: userTextPrompt
+              }
+            ]
+          }
+        ]
+      };
+
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${keyToUse}`
+        },
+        body: JSON.stringify(requestPayload)
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.info(`[LandmarksNode] Model API returned status ${response.status}:`, errText);
+        const fallback = generateFallbackLandmarks(prompt);
+        return res.json({
+          ...fallback,
+          detectedAt: Date.now(),
+          modelUsed: 'heuristic_fallback',
+          fallbackNotice: `视觉接口响应异常 (${response.status})，已启用启发式保底定位`,
+          apiError: errText,
+        });
+      }
+
+      const data = await parseChatCompletionResponse(response, false);
+      let parsed: any = {};
+      try {
+        parsed = JSON.parse(data.content || '{}');
+      } catch {
+        console.warn('Failed to parse landmarks json:', data.content);
+        parsed = generateFallbackLandmarks(prompt);
+      }
+
+      // Helper function to extract (x, y) centroid from box_2d [ymin, xmin, ymax, xmax] (0~1000 or 0~100) or direct coordinates
+      function parseCentroidAndBox(item: any): { x: number; y: number; box_2d?: [number, number, number, number] } | null {
+        if (!item || typeof item !== 'object') return null;
+
+        const rawBox = Array.isArray(item.box_2d) ? item.box_2d : (Array.isArray(item.box) ? item.box : null);
+        if (rawBox && rawBox.length === 4) {
+          const [b0, b1, b2, b3] = rawBox.map((v: any) => typeof v === 'number' ? v : parseFloat(v) || 0);
+          const isThousandScale = Math.max(b0, b1, b2, b3) > 100;
+          const scale = isThousandScale ? 10 : 1;
+
+          // Standard DeepSeek grounding [ymin, xmin, ymax, xmax]
+          const ymin = Math.min(b0, b2) / scale;
+          const ymax = Math.max(b0, b2) / scale;
+          const xmin = Math.min(b1, b3) / scale;
+          const xmax = Math.max(b1, b3) / scale;
+
+          const cx = Math.round(((xmin + xmax) / 2) * 10) / 10;
+          const cy = Math.round(((ymin + ymax) / 2) * 10) / 10;
+
+          return {
+            x: Math.max(0, Math.min(100, cx)),
+            y: Math.max(0, Math.min(100, cy)),
+            box_2d: [ymin, xmin, ymax, xmax],
+          };
+        }
+
+        if (typeof item.x === 'number' && typeof item.y === 'number') {
+          let px = item.x;
+          let py = item.y;
+          if (px > 100 || py > 100) {
+            px /= 10;
+            py /= 10;
+          }
+          return {
+            x: Math.max(0, Math.min(100, Math.round(px * 10) / 10)),
+            y: Math.max(0, Math.min(100, Math.round(py * 10) / 10)),
+          };
+        }
+
+        return null;
+      }
+
+      // Process interestPoints using DeepSeek Grounding Centroid Calculation
+      let rawPoints = Array.isArray(parsed.interestPoints) ? parsed.interestPoints : [];
+      let interestPoints: any[] = [];
+      const seenPointIds = new Set<string>();
+
+      for (let i = 0; i < rawPoints.length; i++) {
+        const pt = rawPoints[i];
+        if (!pt || typeof pt !== 'object') continue;
+        const pos = parseCentroidAndBox(pt);
+        if (pos) {
+          const rawId = String(pt.id || `pt_${i}`).trim();
+          let uniqueId = rawId;
+          let counter = 1;
+          while (seenPointIds.has(uniqueId)) {
+            uniqueId = `${rawId}_${counter++}`;
+          }
+          seenPointIds.add(uniqueId);
+
+          interestPoints.push({
+            id: uniqueId,
+            label: pt.label || '重点特征',
+            x: pos.x,
+            y: pos.y,
+            importance: typeof pt.importance === 'number' ? pt.importance : 0.85,
+            dwellSeconds: typeof pt.dwellSeconds === 'number' ? pt.dwellSeconds : 1.8,
+            category: pt.category || 'highlight',
+            box_2d: pos.box_2d,
+          });
+        }
+      }
+
+      // Process regions using DeepSeek Grounding Centroid Calculation
+      const rawRegions = parsed.regions || {};
+      const regions: any = {};
+
+      if (rawRegions.head) {
+        const p = parseCentroidAndBox(rawRegions.head);
+        if (p) regions.head = { x: p.x, y: p.y, box_2d: p.box_2d };
+      }
+      if (rawRegions.eyes) {
+        const p = parseCentroidAndBox(rawRegions.eyes);
+        if (p) regions.eyes = { x: p.x, y: p.y, box_2d: p.box_2d };
+      }
+      if (rawRegions.chest) {
+        const p = parseCentroidAndBox(rawRegions.chest);
+        if (p) regions.chest = { x: p.x, y: p.y, box_2d: p.box_2d };
+      }
+      if (rawRegions.legs) {
+        const p = parseCentroidAndBox(rawRegions.legs);
+        if (p) regions.legs = { x: p.x, y: p.y, box_2d: p.box_2d };
+      }
+      if (Array.isArray(rawRegions.hands)) {
+        regions.hands = rawRegions.hands
+          .map((h: any) => parseCentroidAndBox(h))
+          .filter(Boolean)
+          .map((p: any) => ({ x: p.x, y: p.y, box_2d: p.box_2d }));
+      } else if (rawRegions.hands) {
+        const p = parseCentroidAndBox(rawRegions.hands);
+        if (p) regions.hands = [{ x: p.x, y: p.y, box_2d: p.box_2d }];
+      }
+      if (rawRegions.primaryObject) {
+        const p = parseCentroidAndBox(rawRegions.primaryObject);
+        if (p) {
+          regions.primaryObject = {
+            label: rawRegions.primaryObject.label || '核心主体焦点',
+            x: p.x,
+            y: p.y,
+            box_2d: p.box_2d,
+          };
+        }
+      }
+
+      // Fallback synthesis if interestPoints is empty
+      if (interestPoints.length === 0) {
+        if (regions.eyes || regions.head) {
+          interestPoints.push({
+            id: 'eyes',
+            label: '面部五官与眼神光',
+            x: regions.eyes?.x ?? regions.head?.x ?? 50,
+            y: regions.eyes?.y ?? (regions.head ? regions.head.y - 2 : 25),
+            importance: 0.98,
+            dwellSeconds: 2.2,
+            category: 'face',
+          });
+        }
+        if (regions.chest) {
+          interestPoints.push({
+            id: 'chest',
+            label: '服饰质感与领口细节',
+            x: regions.chest.x,
+            y: regions.chest.y,
+            importance: 0.92,
+            dwellSeconds: 1.8,
+            category: 'clothing',
+          });
+        }
+        if (regions.hands?.[0]) {
+          interestPoints.push({
+            id: 'hands',
+            label: '手部结构与饰品',
+            x: regions.hands[0].x,
+            y: regions.hands[0].y,
+            importance: 0.85,
+            dwellSeconds: 1.4,
+            category: 'anatomy',
+          });
+        }
+        if (regions.legs) {
+          interestPoints.push({
+            id: 'legs',
+            label: '腿部与身形线条',
+            x: regions.legs.x,
+            y: regions.legs.y,
+            importance: 0.80,
+            dwellSeconds: 1.3,
+            category: 'anatomy',
+          });
+        }
+        if (regions.primaryObject) {
+          interestPoints.push({
+            id: 'primaryObject',
+            label: regions.primaryObject.label || '核心主体焦点',
+            x: regions.primaryObject.x,
+            y: regions.primaryObject.y,
+            importance: 0.90,
+            dwellSeconds: 2.0,
+            category: 'highlight',
+          });
+        }
+      }
+
+      // If person is in scene and regions.chest exists, ensure chest interest point is present
+      if (parsed.hasPerson !== false && regions.chest) {
+        const hasChest = interestPoints.some((pt: any) => pt.id === 'chest' || /胸|领口|cleavage|bust/i.test(pt.label || ''));
+        if (!hasChest) {
+          const insertIdx = Math.min(interestPoints.length, 2);
+          interestPoints.splice(insertIdx, 0, {
+            id: 'chest',
+            label: '挺拔胸部与深V领口',
+            x: regions.chest.x,
+            y: regions.chest.y,
+            importance: 0.95,
+            dwellSeconds: 2.0,
+            category: 'anatomy',
+            box_2d: regions.chest.box_2d,
+          });
+        }
+      }
+
+      res.json({
+        summary: parsed.summary || '画面核心视觉焦点分析完成',
+        hasPerson: parsed.hasPerson ?? true,
+        shotType: parsed.shotType || 'medium_shot',
+        interestPoints,
+        regions,
+        detectedAt: Date.now(),
+        modelUsed: actualModel,
+      });
+    } catch (err: any) {
+      console.error('Detect landmarks error:', err);
+      const fallback = generateFallbackLandmarks(req.body?.prompt);
+      res.json({
+        ...fallback,
+        detectedAt: Date.now(),
+        modelUsed: 'heuristic_error_fallback',
+        error: err.message
+      });
+    }
+  });
+
+  function generateFallbackLandmarks(prompt = '') {
+    const p = (prompt || '').toLowerCase();
+    const isCloseUp = /close.?up|特写|face|portrait|肖像/.test(p);
+    const isLandscape = /landscape|scenery|room|city|street|风景|场景|街道/.test(p);
+    if (isLandscape) {
+      return {
+        summary: '风景与空间构图',
+        hasPerson: false,
+        shotType: 'landscape',
+        interestPoints: [
+          { id: 'horizon', label: '中心景物焦点', x: 50, y: 50, importance: 0.9, dwellSeconds: 2.0, category: 'highlight' },
+          { id: 'sky_light', label: '天际光影漫射', x: 50, y: 25, importance: 0.7, dwellSeconds: 1.4, category: 'lighting' },
+          { id: 'foreground', label: '近景空间质感', x: 50, y: 75, importance: 0.65, dwellSeconds: 1.2, category: 'texture' }
+        ],
+        regions: {
+          primaryObject: { label: '中心景物', x: 50, y: 50, box: [25, 25, 75, 75] }
+        }
+      };
+    }
+    return {
+      summary: isCloseUp ? '人物微距特写肖像' : '人物中景肖像',
+      hasPerson: true,
+      shotType: isCloseUp ? 'close_up' : 'medium_shot',
+      interestPoints: [
+        { id: 'eyes', label: '眼神光与微表情', x: 50, y: isCloseUp ? 33 : 21, importance: 0.95, dwellSeconds: 2.2, category: 'face' },
+        { id: 'chest', label: '服饰质感与领口细节', x: 50, y: isCloseUp ? 68 : 45, importance: 0.8, dwellSeconds: 1.5, category: 'clothing' },
+        { id: 'hands', label: '手部结构细节', x: 38, y: 52, importance: 0.7, dwellSeconds: 1.2, category: 'anatomy' }
+      ],
+      regions: {
+        head: { x: 50, y: isCloseUp ? 35 : 24, box: [10, 35, 45, 65] },
+        eyes: { x: 50, y: isCloseUp ? 33 : 21 },
+        chest: { x: 50, y: isCloseUp ? 68 : 45, box: [38, 30, 65, 70] },
+        legs: { x: 50, y: 80, box: [65, 28, 95, 72] },
+        hands: [{ x: 38, y: 52 }, { x: 62, y: 52 }]
+      }
+    };
+  }
 
   // Catch-all 404 for unmatched /api routes - ALWAYS return JSON, never fallback to Vite SPA HTML
   app.all('/api/*', (req, res) => {

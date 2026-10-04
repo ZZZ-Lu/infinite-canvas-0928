@@ -185,7 +185,8 @@ export function resolveCardLineage(targetCard: CardData, allCards: CardData[]): 
 }
 
 /**
- * Builds the complete auto-injected context and extracts multimodal images for the lineage
+ * Builds the complete auto-injected context and extracts multimodal images
+ * STRICT SCOPE: Only extracts the focused card's own image and its attached reference images!
  */
 export async function buildAutoInjectedCardContext(
   targetCard: CardData,
@@ -193,23 +194,92 @@ export async function buildAutoInjectedCardContext(
   extractCardImageBase64: (card: CardData) => Promise<string | undefined>
 ): Promise<InjectedCardContextResult> {
   const lineage = resolveCardLineage(targetCard, allCards);
-  const cardsMap = new Map(allCards.map(c => [c.id, c]));
 
-  // Extract images in order of lineage chain (Root -> Parent -> Target)
+  // 1. Extract Target Card's Own Image
+  const targetImageB64 = await extractCardImageBase64(targetCard);
+  const seenB64 = new Set<string>();
+  if (targetImageB64) {
+    seenB64.add(targetImageB64);
+  }
+
+  // 2. Extract Target Card's Attached Reference Images (strictly belonging to targetCard)
+  const refImages: { label: string; b64: string }[] = [];
+
+  if (Array.isArray(targetCard.referenceImages) && targetCard.referenceImages.length > 0) {
+    for (let i = 0; i < targetCard.referenceImages.length; i++) {
+      const ref = targetCard.referenceImages[i];
+      let b64: string | undefined = undefined;
+
+      // A. If reference points to a canvas card, retrieve from that source card
+      if (ref.sourceCardId) {
+        const sourceCard = allCards.find(c => c.id === ref.sourceCardId);
+        if (sourceCard) {
+          b64 = await extractCardImageBase64(sourceCard);
+        }
+      }
+
+      // B. If reference has direct fileData Blob
+      if (!b64 && ref.fileData instanceof Blob && ref.fileData.size > 0) {
+        try {
+          b64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsDataURL(ref.fileData as Blob);
+          });
+        } catch {}
+      }
+
+      // C. If reference has data URL
+      if (!b64 && ref.url && ref.url.startsWith('data:image/')) {
+        b64 = ref.url;
+      }
+
+      // D. If reference has remote URL or thumbnail URL, extract via pipeline
+      if (!b64 && (ref.url || ref.thumbnailUrl)) {
+        const mockRefCard: Partial<CardData> = {
+          id: `ref_${targetCard.id}_${i}`,
+          imageUrl: ref.url || ref.thumbnailUrl,
+        };
+        b64 = await extractCardImageBase64(mockRefCard as CardData);
+      }
+
+      if (b64 && !seenB64.has(b64)) {
+        seenB64.add(b64);
+        const refName = ref.name || `参考图 ${i + 1}`;
+        refImages.push({
+          label: `参考图 ${refImages.length + 1} (${refName})`,
+          b64,
+        });
+      }
+    }
+  } else if (targetCard.referenceImageUrl || targetCard.referenceImageFileData) {
+    const mockRefCard: Partial<CardData> = {
+      id: `ref_single_${targetCard.id}`,
+      fileData: targetCard.referenceImageFileData as Blob,
+      imageUrl: targetCard.referenceImageUrl,
+    };
+    const b64 = await extractCardImageBase64(mockRefCard as CardData);
+    if (b64 && !seenB64.has(b64)) {
+      seenB64.add(b64);
+      refImages.push({
+        label: `关联参考图 (${targetCard.referenceImageUrl?.slice(-20) || '参考原图'})`,
+        b64,
+      });
+    }
+  }
+
   const images: string[] = [];
   const imageLabels: string[] = [];
 
-  for (const node of lineage.orderedChain) {
-    const card = cardsMap.get(node.id);
-    if (card) {
-      const b64 = await extractCardImageBase64(card);
-      if (b64) {
-        images.push(b64);
-        const roleLabel = node.type === 'root_asset' ? '根资产/故事板' : (node.type === 'parent_iteration' ? '父级参考' : (node.type === 'target_focus' ? '当前目标卡片' : '下游衍生'));
-        imageLabels.push(`图 ${images.length} (${roleLabel} - ${node.title}, ID: ${node.id})`);
-        node.imageBase64 = b64;
-      }
-    }
+  if (targetImageB64) {
+    images.push(targetImageB64);
+    imageLabels.push(`图 ${images.length} (当前聚焦卡片画面 - ${targetCard.fileName || '卡片 #' + targetCard.id.slice(-6)})`);
+  }
+
+  for (const refItem of refImages) {
+    images.push(refItem.b64);
+    imageLabels.push(`图 ${images.length} (${refItem.label})`);
   }
 
   // Format rich Markdown summary for System / User turn prompt
@@ -256,7 +326,7 @@ export async function buildAutoInjectedCardContext(
     lines.push(``);
     lines.push(`## 3. 多模态视觉图像对照 (Visual Images Injected)`);
     imageLabels.forEach(label => lines.push(`- ${label}`));
-    lines.push(`*提示：图像已按谱系顺序传入模型视觉上下文，无需在 UI 上重复点击或打开弹窗即可直接观察分析。*`);
+    lines.push(`*提示：仅精准注入当前聚焦卡片及其关联参考图，无需在 UI 上重复打开弹窗即可直接观察分析。*`);
   }
 
   const markdownSummary = lines.join('\n');

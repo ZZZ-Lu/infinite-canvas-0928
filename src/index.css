@@ -175,4 +175,19 @@
   cursor: none !important;
 }
 
+/* Agent Pointer HUD Compositor Float & Subpixel Stabilization */
+@keyframes agent-cursor-float {
+  0%, 100% {
+    transform: translate3d(0, 0px, 0);
+  }
+  50% {
+    transform: translate3d(0, -5px, 0);
+  }
+}
+
+.animate-agent-float {
+  animation: agent-cursor-float 2.4s ease-in-out infinite;
+  will-change: transform;
+}
+
 

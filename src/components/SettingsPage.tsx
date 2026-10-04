@@ -16,6 +16,7 @@ import {
   RotateCcw,
   ScrollText,
   TerminalSquare,
+  Eye,
   X,
 } from 'lucide-react';
 import { motion } from 'motion/react';
@@ -36,6 +37,7 @@ import {
   ScriptProp,
 } from '../types/script';
 import { assetExtractionService } from '../services/assetExtractionService';
+import { createSquareLetterboxImage, unpadLandmarks, SquarePadInfo } from '../utils/squareImageLetterbox';
 
 interface SettingsPageProps {
   onClose: () => void;
@@ -44,7 +46,7 @@ interface SettingsPageProps {
   agentRuntimeTraces?: AgentRuntimeTrace[];
 }
 
-type NodeKey = 'toc_infer' | 'data_viewer' | 'change_assess' | 'state_node';
+type NodeKey = 'toc_infer' | 'data_viewer' | 'change_assess' | 'state_node' | 'json_adapter' | 'subject_landmarks';
 type ResultTab = 'json' | 'logs';
 type CenterTab = 'source' | 'input' | 'prompt' | 'payload';
 type SettingsSection = 'debug' | 'runtime' | 'architecture' | 'tools' | 'prompt';
@@ -101,6 +103,14 @@ const NODE_DEFINITIONS: NodeDefinition[] = [
     description: '重构非标 JSON/伪代码/自然语言为符合 Schema 的标准工具参数',
     promptKey: 'jsonAdapterPrompt',
     modelKey: 'jsonAdapterModel',
+  },
+  {
+    key: 'subject_landmarks',
+    name: '图像主体定位节点',
+    shortName: 'Landmarks',
+    description: '极速定位图像中人物关键点（头部、胸部、腿部）与核心主体空间百分比坐标',
+    promptKey: 'subjectLandmarksPrompt',
+    modelKey: 'subjectLandmarksModel',
   },
   {
     key: 'data_viewer',
@@ -207,7 +217,11 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
         speak: "正在为你分析画面中的复古奢侈质感..."
       }
     }, null, 2),
-    json_adapter: '{{调用 card.generate, { referenceCardIds: ["rshuewfmu", "yow33r73x"], targetCardId: "new", prompt: "A stunning blonde woman with a glamorous silver fringe necklace, wearing a sheer deep-V evening gown, lying on a luxurious bed in a sensual pose.", aspectRatio: "9:16" }}}',
+    json_adapter: '{{调用 card.generate, { name: "金发女郎晚礼服", referenceCardIds: ["rshuewfmu", "yow33r73x"], targetCardId: "new", prompt: "A stunning blonde woman with a glamorous silver fringe necklace, wearing a sheer deep-V evening gown, lying on a luxurious bed in a sensual pose.", aspectRatio: "9:16" }}}',
+    subject_landmarks: JSON.stringify({
+      imageUrl: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=512&auto=format&fit=crop&q=60",
+      prompt: "一位戴着墨镜的时尚青年在都市街头特写肖像"
+    }, null, 2),
     data_viewer: '',
   }));
   const [completeInputEdits, setCompleteInputEdits] = useState<Partial<Record<NodeKey, string>>>({});
@@ -222,6 +236,16 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [applied, setApplied] = useState(false);
+  const [showLandmarkHUD, setShowLandmarkHUD] = useState(() => {
+    if (typeof window === 'undefined') return true;
+    return localStorage.getItem('show_landmark_spatial_annotations') !== 'false';
+  });
+
+  const handleToggleLandmarkHUD = (enabled: boolean) => {
+    setShowLandmarkHUD(enabled);
+    localStorage.setItem('show_landmark_spatial_annotations', enabled ? 'true' : 'false');
+    window.dispatchEvent(new CustomEvent('landmark-hud-setting-changed', { detail: { enabled } }));
+  };
 
   const activeDefinition = useMemo(
     () => NODE_DEFINITIONS.find((node) => node.key === selectedNode) || NODE_DEFINITIONS[0],
@@ -262,7 +286,9 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
       ? { scenes: '<Node 1 输出>', sourceText: input }
       : selectedNode === 'node3'
         ? { rawEntities: '<Node 2 输出>', scenes: '<Node 1 输出>', sourceText: input }
-        : { text: input },
+        : selectedNode === 'subject_landmarks'
+          ? { image: '<low-quality image (detail: low)>', prompt: input }
+          : { text: input },
     systemPrompt: activePrompt,
     credentials: {
       deepseek: deepseekKey ? '<configured>' : '<missing>',
@@ -423,6 +449,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
     try {
       let endpoint = '/api/script-toc-pattern';
       let body: any = {};
+      let landmarkPadInfo: SquarePadInfo | null = null;
       const keyToUse = isDashscopeOrGlm(activeModel) ? qwenKey : deepseekKey;
       
       if (selectedNode === 'state_node') {
@@ -460,6 +487,30 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
           modelType: activeModel,
           apiKey: keyToUse
         };
+      } else if (selectedNode === 'subject_landmarks') {
+        endpoint = '/api/agent/detect-landmarks';
+        let parsedInput: any = {};
+        try {
+          parsedInput = JSON.parse(input);
+        } catch {
+          parsedInput = {
+            imageUrl: input.startsWith('http') || input.startsWith('data:') ? input : undefined,
+            prompt: input,
+          };
+        }
+
+        if (parsedInput.imageUrl) {
+          const padded = await createSquareLetterboxImage(parsedInput.imageUrl, 1024);
+          parsedInput.imageUrl = padded.paddedUrl;
+          landmarkPadInfo = padded.padInfo;
+        }
+
+        body = {
+          ...parsedInput,
+          ratio: landmarkPadInfo && landmarkPadInfo.isPadded ? '1:1' : (parsedInput.ratio || '原始画幅'),
+          model: activeModel,
+          apiKey: keyToUse
+        };
       } else {
         body = { sampleText: input, systemPrompt: activePrompt, modelType: activeModel, apiKey: keyToUse };
       }
@@ -473,7 +524,10 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
         const body = await response.json().catch(() => ({}));
         throw new Error(body.error || `HTTP ${response.status}`);
       }
-      const data = await response.json();
+      let data = await response.json();
+      if (selectedNode === 'subject_landmarks' && landmarkPadInfo && landmarkPadInfo.isPadded) {
+        data = unpadLandmarks(data, landmarkPadInfo);
+      }
 
       // Slice scenes if scenePattern exists
       if (data.scenePattern && onUpdateProject && currentProject) {
@@ -563,6 +617,21 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
           <button onClick={() => setSettingsSection('prompt')} className={`h-7 rounded-md px-3 text-xs transition ${settingsSection === 'prompt' ? 'bg-gray-100 font-medium text-slate-900 shadow-sm dark:bg-white/10 dark:text-white' : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}>主循环 Prompt</button>
         </nav>
         <div className="ml-auto flex items-center gap-2">
+          {/* Global Landmark HUD Spatial Tags Toggle Button */}
+          <button
+            type="button"
+            onClick={() => handleToggleLandmarkHUD(!showLandmarkHUD)}
+            className={`flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-xs transition ${
+              showLandmarkHUD
+                ? 'border-purple-500/40 bg-purple-50 text-purple-700 dark:border-purple-500/40 dark:bg-purple-950/40 dark:text-purple-300'
+                : 'border-slate-200 text-slate-500 hover:bg-slate-50 dark:border-white/10 dark:text-slate-400 dark:hover:bg-white/10'
+            }`}
+            title="控制画布卡片上是否默认显示 AI 识别出的部位空间文字标签"
+          >
+            <Eye size={13} className={showLandmarkHUD ? 'text-purple-600 dark:text-purple-400' : 'text-slate-400'} />
+            <span>卡片部位标注: {showLandmarkHUD ? '开' : '关'}</span>
+          </button>
+
           {settingsSection === 'debug' && <select
             value={activeModel}
             onChange={(event) => activeDefinition.modelKey && changeNodeModel(activeDefinition.modelKey, event.target.value as ExtractionModelType)}
@@ -714,7 +783,33 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
             )}
           </div>
 
-          <div className="min-h-0 flex-1 p-3">
+          <div className="min-h-0 flex-1 p-3 flex flex-col">
+            {selectedNode === 'subject_landmarks' && (
+              <div className="mb-3 shrink-0 flex items-center justify-between rounded-xl border border-purple-500/20 bg-purple-500/5 p-3 dark:border-purple-500/30 dark:bg-purple-500/10">
+                <div className="flex items-center gap-2.5">
+                  <div className="grid h-7 w-7 place-items-center rounded-lg bg-purple-600 text-white">
+                    <Eye size={14} />
+                  </div>
+                  <div>
+                    <p className="text-xs font-semibold text-slate-800 dark:text-slate-200">卡片空间部位标签 HUD 浮层</p>
+                    <p className="text-[11px] text-slate-400">控制画布卡片上是否默认显示 AI 识别出的身体部位、五官与关键细节的空间锚点与文字标签</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleToggleLandmarkHUD(!showLandmarkHUD)}
+                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                    showLandmarkHUD ? 'bg-purple-600' : 'bg-slate-300 dark:bg-neutral-700'
+                  }`}
+                >
+                  <span
+                    className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                      showLandmarkHUD ? 'translate-x-5' : 'translate-x-0'
+                    }`}
+                  />
+                </button>
+              </div>
+            )}
             {centerTab === 'source' && (
               <div className="flex h-full flex-col">
                 <div className="mb-2 flex items-center justify-between text-[11px] text-slate-400">
