@@ -340,7 +340,6 @@ export interface CardData {
   closeupThumbnailUrl?: string; // 256px max edge
   customWidth?: number;
   customHeight?: number;
-  name?: string;
   fileName?: string;
   isAsset?: boolean;
   nativeWidth?: number;
@@ -1000,149 +999,28 @@ export function InfiniteRealtimeQCGaze({
   useEffect(() => {
     let isMounted = true;
 
-    function extractFromLandmarks(lm?: SubjectLandmarks): InterestPoint[] {
-      if (!lm) return [];
-      if (lm.interestPoints && lm.interestPoints.length > 0) {
-        return [...lm.interestPoints];
-      }
-      if (lm.regions) {
-        const r = lm.regions;
-        const pts: InterestPoint[] = [];
-        if (r.eyes || r.head) {
-          pts.push({
-            id: 'eyes',
-            label: '面部眼神光与神态',
-            x: r.eyes?.x ?? r.head?.x ?? 50,
-            y: r.eyes?.y ?? (r.head ? r.head.y - 2 : 25),
-            importance: 0.98,
-            dwellSeconds: 2.0,
-            category: 'face',
-          });
-        }
-        if (r.chest) {
-          pts.push({
-            id: 'chest',
-            label: '领口与服饰质感',
-            x: r.chest.x,
-            y: r.chest.y,
-            importance: 0.90,
-            dwellSeconds: 1.6,
-            category: 'clothing',
-          });
-        }
-        if (r.hands?.[0]) {
-          pts.push({
-            id: 'hands',
-            label: '手部结构与饰品',
-            x: r.hands[0].x,
-            y: r.hands[0].y,
-            importance: 0.86,
-            dwellSeconds: 1.4,
-            category: 'anatomy',
-          });
-        }
-        if (r.legs) {
-          pts.push({
-            id: 'legs',
-            label: '腿部与身形线条',
-            x: r.legs.x,
-            y: r.legs.y,
-            importance: 0.80,
-            dwellSeconds: 1.3,
-            category: 'anatomy',
-          });
-        }
-        if (r.primaryObject) {
-          pts.push({
-            id: 'primaryObject',
-            label: r.primaryObject.label || '核心主体焦点',
-            x: r.primaryObject.x,
-            y: r.primaryObject.y,
-            importance: 0.92,
-            dwellSeconds: 1.8,
-            category: 'highlight',
-          });
-        }
-        return pts;
-      }
-      return [];
-    }
-
     async function runInfiniteGazeWalk() {
-      // 等待 DOM 元素在 Framer Motion 中完全挂载并绑定 Ref，防止 start() 提前触发警告
-      await new Promise(resolve => requestAnimationFrame(resolve));
-      if (!isMounted) return;
+      // 1. Initial Glance Baseline (黄金分割中心)
+      const baseX = 50;
+      const baseY = isPortrait || isTall ? 36 : (isLandscape || isWide ? 40 : 42);
 
-      const baseY = isPortrait || isTall ? 34 : (isLandscape || isWide ? 40 : 42);
+      let curX = baseX;
+      let curY = baseY;
 
-      // 1. 优先调用 Google 浏览器原生本地轻量人脸与生物视觉分析模型 (~3ms 极速就绪)
-      let initialPoints: InterestPoint[] = [];
-      const nodePoints = extractFromLandmarks(landmarksRef.current);
-      let hasSwitchedToNode = nodePoints.length > 0;
+      // Small-amplitude fixed cyclical trajectory waypoints (小幅定点循环微动)
+      const cyclicOffsets = [
+        { dx: 0, dy: 0, scale: 1.0 },
+        { dx: 3.5, dy: -2.8, scale: 1.04 },
+        { dx: -2.6, dy: 2.2, scale: 0.98 },
+        { dx: -3.4, dy: -2.0, scale: 1.03 },
+        { dx: 2.8, dy: 2.6, scale: 0.97 },
+      ];
 
-      if (hasSwitchedToNode) {
-        initialPoints = nodePoints;
-      } else if (imageUrl) {
-        try {
-          const localRegion = await detectCharacterRegion(imageUrl, prompt, 1200);
-          if (localRegion) {
-            initialPoints = [
-              {
-                id: 'local_eyes',
-                label: '面部眼神光与神态',
-                x: localRegion.eyesPoint.x,
-                y: localRegion.eyesPoint.y,
-                importance: 0.98,
-                dwellSeconds: 1.8,
-                category: 'face',
-              },
-              {
-                id: 'local_face',
-                label: '面部轮廓特征',
-                x: localRegion.faceCenter.x,
-                y: localRegion.faceCenter.y,
-                importance: 0.90,
-                dwellSeconds: 1.5,
-                category: 'face',
-              },
-              ...(localRegion.torsoPoint ? [{
-                id: 'local_torso',
-                label: '服饰与主体质感',
-                x: localRegion.torsoPoint.x,
-                y: localRegion.torsoPoint.y,
-                importance: 0.82,
-                dwellSeconds: 1.4,
-                category: 'clothing' as const,
-              }] : []),
-            ];
-          }
-        } catch {
-          // ignore
-        }
-      }
-
-      if (initialPoints.length === 0) {
-        initialPoints = [
-          { id: 'focal_core', label: '核心视觉中心', x: 50, y: baseY, importance: 0.95, dwellSeconds: 1.8 },
-          { id: 'focal_detail_1', label: '次级工艺区', x: 56, y: baseY + 14, importance: 0.80, dwellSeconds: 1.5 },
-          { id: 'focal_detail_2', label: '周边构图区', x: 44, y: baseY + 18, importance: 0.70, dwellSeconds: 1.2 },
-        ];
-      }
-
-      let activePoints = initialPoints;
-      const sorted = [...activePoints].sort((a, b) => b.importance - a.importance);
-      const firstTarget = sorted[0];
-
-      let curX = Math.max(12, Math.min(88, firstTarget.x));
-      let curY = Math.max(10, Math.min(90, firstTarget.y));
-      let lastPointId: string | null = firstTarget.id;
-
-      await gazeControls.start({
+      await gazeControls.set({
         left: `${curX}%`,
         top: `${curY}%`,
         scale: 1.08,
         opacity: 0,
-        transition: { duration: 0 },
       });
 
       if (!isMounted) return;
@@ -1154,109 +1032,193 @@ export function InfiniteRealtimeQCGaze({
         transition: { duration: 0.45, ease: 'easeOut' },
       });
 
-      // 2. 连续自适应动态打转漫游（本地模型先行端详 -> 节点返回数据后平滑无缝切换）
-      const startTime = Date.now();
-      const visitCounts: Record<string, number> = {};
+      // =========================================================================
+      // 阶段一：小幅微动的固定循环轨迹 (等待异步主体位置识别)
+      // =========================================================================
+      let cycleIndex = 0;
+      while (isMounted) {
+        const currentLandmarks = landmarksRef.current;
+        const hasReadyLandmarks = Boolean(
+          currentLandmarks && (
+            (currentLandmarks.interestPoints && currentLandmarks.interestPoints.length > 0) ||
+            currentLandmarks.regions
+          )
+        );
+
+        if (hasReadyLandmarks) {
+          // 主体位置识别完成，立刻跳出固定循环，进入无缝交接！
+          break;
+        }
+
+        cycleIndex = (cycleIndex + 1) % cyclicOffsets.length;
+        const target = cyclicOffsets[cycleIndex];
+        curX = Math.max(20, Math.min(80, baseX + target.dx));
+        curY = Math.max(18, Math.min(82, baseY + target.dy));
+
+        await gazeControls.start({
+          left: `${curX}%`,
+          top: `${curY}%`,
+          scale: target.scale,
+          transition: {
+            duration: 0.75,
+            ease: 'easeInOut',
+          },
+        });
+
+        if (!isMounted) return;
+        await new Promise((r) => setTimeout(r, 120));
+      }
+
+      if (!isMounted) return;
+
+      // =========================================================================
+      // 阶段二：无缝交接 (Seamless Handover)
+      // 从当前实时位置 (curX, curY) 平滑插值过渡到识别出的第一优先级部位
+      // =========================================================================
+      const resolvedLandmarks = landmarksRef.current;
+      let interestPoints: InterestPoint[] = [];
+
+      if (resolvedLandmarks?.interestPoints && resolvedLandmarks.interestPoints.length > 0) {
+        interestPoints = [...resolvedLandmarks.interestPoints];
+      } else if (resolvedLandmarks?.regions) {
+        const r = resolvedLandmarks.regions;
+        if (r.eyes || r.head) {
+          interestPoints.push({
+            id: 'eyes',
+            label: '面部眼神光与神态',
+            x: r.eyes?.x ?? r.head?.x ?? 50,
+            y: r.eyes?.y ?? (r.head ? r.head.y - 2 : 25),
+            importance: 0.98,
+            dwellSeconds: 2.2,
+            category: 'face',
+          });
+        }
+        if (r.chest) {
+          interestPoints.push({
+            id: 'chest',
+            label: '领口与服饰质感',
+            x: r.chest.x,
+            y: r.chest.y,
+            importance: 0.90,
+            dwellSeconds: 1.6,
+            category: 'clothing',
+          });
+        }
+        if (r.hands?.[0]) {
+          interestPoints.push({
+            id: 'hands',
+            label: '手部结构与饰品',
+            x: r.hands[0].x,
+            y: r.hands[0].y,
+            importance: 0.86,
+            dwellSeconds: 1.4,
+            category: 'anatomy',
+          });
+        }
+        if (r.legs) {
+          interestPoints.push({
+            id: 'legs',
+            label: '腿部与身形线条',
+            x: r.legs.x,
+            y: r.legs.y,
+            importance: 0.80,
+            dwellSeconds: 1.3,
+            category: 'anatomy',
+          });
+        }
+        if (r.primaryObject) {
+          interestPoints.push({
+            id: 'primaryObject',
+            label: r.primaryObject.label || '核心主体焦点',
+            x: r.primaryObject.x,
+            y: r.primaryObject.y,
+            importance: 0.92,
+            dwellSeconds: 2.0,
+            category: 'highlight',
+          });
+        }
+      }
+
+      // 如果未解析出部位，构建合理兜底
+      if (interestPoints.length === 0) {
+        interestPoints = [
+          { id: 'focal_core', label: '核心视觉中心', x: 50, y: baseY, importance: 0.95, dwellSeconds: 2.0 },
+          { id: 'focal_detail_1', label: '次级工艺区', x: 56, y: baseY + 14, importance: 0.80, dwellSeconds: 1.5 },
+          { id: 'focal_detail_2', label: '周边构图区', x: 44, y: baseY + 18, importance: 0.70, dwellSeconds: 1.2 },
+        ];
+      }
+
+      // 第一优先级目标点（按重要性排序）
+      const sortedByImportance = [...interestPoints].sort((a, b) => b.importance - a.importance);
+      const firstTarget = sortedByImportance[0];
+
+      const handoverDist = Math.hypot(firstTarget.x - curX, firstTarget.y - curY);
+      const handoverDuration = Math.max(0.65, Math.min(1.2, (handoverDist / 32) * 0.7 + 0.55));
+
+      curX = firstTarget.x;
+      curY = firstTarget.y;
+
+      // 无缝滑向第一优先级部位
+      await gazeControls.start({
+        left: `${curX}%`,
+        top: `${curY}%`,
+        scale: 1.06,
+        transition: {
+          duration: handoverDuration,
+          ease: [0.16, 1, 0.3, 1], // 平滑阻尼减速曲线
+        },
+      });
+
+      if (!isMounted) return;
+
+      // 第一部位短暂停留凝视
+      await new Promise((r) => setTimeout(r, (firstTarget.dwellSeconds ?? 1.8) * 900));
+
+      // =========================================================================
+      // 阶段三：基于主体部位与兴趣点的高精漫游决策机 (生图质检 1.0x 敏锐检查速度)
+      // =========================================================================
+      let lastPointId: string | null = firstTarget.id;
+      const isVertical = ratio.includes('9:16') || ratio.includes('3:4') || ratio.includes('2:3') || (h > w * 1.05);
+      const verticalOffset = isVertical ? (100 / 15) : 0;
 
       while (isMounted) {
-        // 实时核验：如果主体识别大模型节点返回了更丰富的位置点，立刻无缝交接，后续全量使用节点数据
-        if (!hasSwitchedToNode) {
-          const freshNodePoints = extractFromLandmarks(landmarksRef.current);
-          if (freshNodePoints.length > 0) {
-            activePoints = freshNodePoints;
-            hasSwitchedToNode = true;
+        // 计算返回抑制权重 (IOR)
+        const weightedCandidates = interestPoints.map((pt) => {
+          let weight = pt.importance;
+          if (pt.id === lastPointId && interestPoints.length > 1) {
+            weight *= 0.18; // 抑制上一访问点，避免机械往返
           }
+          return { pt, weight };
+        });
+
+        const totalWeight = weightedCandidates.reduce((acc, c) => acc + c.weight, 0);
+        let randomChoice = Math.random() * totalWeight;
+        let selectedPt = weightedCandidates[0].pt;
+
+        for (const c of weightedCandidates) {
+          if (randomChoice < c.weight) {
+            selectedPt = c.pt;
+            break;
+          }
+          randomChoice -= c.weight;
         }
 
-        const elapsedSec = (Date.now() - startTime) / 1000;
-        // 演进因子 S in [0, 1]: 0~6s 活跃探索, 6~24s 逐渐沉静收敛, >=24s 深度定焦
-        const settlingFactor = Math.min(1.0, Math.max(0.0, (elapsedSec - 6) / 18));
-        const allExplored = Object.keys(visitCounts).length >= activePoints.length;
-        const coreAnchor = [...activePoints].sort((a, b) => b.importance - a.importance)[0] || activePoints[0];
-
-        let selectedPt: InterestPoint;
-
-        if (settlingFactor > 0.85 && allExplored) {
-          // 阶段三：长时深度定焦期（大概率定焦在核心点做极微弱呼吸，极低概率偶尔瞄一眼周边）
-          if (lastPointId === coreAnchor.id) {
-            if (Math.random() < 0.88 || activePoints.length <= 1) {
-              selectedPt = coreAnchor;
-            } else {
-              // 12% 偶发余光扫视 (Occasional Micro-Glance)
-              const others = activePoints.filter(p => p.id !== coreAnchor.id);
-              selectedPt = others[Math.floor(Math.random() * others.length)];
-            }
-          } else {
-            // 归航重力回核心点
-            selectedPt = Math.random() < 0.85 ? coreAnchor : activePoints[Math.floor(Math.random() * activePoints.length)];
-          }
-        } else {
-          // 阶段一与阶段二：探索与收敛过渡期
-          const weightedCandidates = activePoints.map((pt) => {
-            let weight = pt.importance;
-            // 抑制上一访问点
-            if (pt.id === lastPointId && activePoints.length > 1) {
-              weight *= 0.15;
-            }
-            // 访问记忆衰减：看过的点再次被看的几率变小
-            const visits = visitCounts[pt.id] || 0;
-            weight *= Math.pow(0.36, visits);
-
-            // 全览后或收敛期，核心锚点吸引力增强
-            if (allExplored || settlingFactor > 0.3) {
-              if (pt.id === coreAnchor.id) {
-                weight *= (1.5 + 4.5 * settlingFactor);
-              }
-            }
-            return { pt, weight: Math.max(0.02, weight) };
-          });
-
-          const totalWeight = weightedCandidates.reduce((acc, c) => acc + c.weight, 0);
-          let randomChoice = Math.random() * totalWeight;
-          selectedPt = weightedCandidates[0].pt;
-
-          for (const c of weightedCandidates) {
-            if (randomChoice < c.weight) {
-              selectedPt = c.pt;
-              break;
-            }
-            randomChoice -= c.weight;
-          }
-        }
-
-        visitCounts[selectedPt.id] = (visitCounts[selectedPt.id] || 0) + 1;
         lastPointId = selectedPt.id;
 
-        // 基础坐标（精准真实百分比）
-        const anchorX = Math.max(12, Math.min(88, selectedPt.x));
+        // 基础坐标（含竖向偏移）
+        const anchorX = Math.max(12, Math.min(88, selectedPt.x + verticalOffset));
         const anchorY = Math.max(10, Math.min(90, selectedPt.y));
-
-        // 判定该部位的专属眼动动力学生理特征 (Choreography Profile by Point Type)
-        const isFaceOrEyes = selectedPt.category === 'face' || selectedPt.id.includes('eye') || selectedPt.id.includes('face') || selectedPt.id.includes('head');
-        const isClothingOrTorso = selectedPt.category === 'clothing' || selectedPt.id.includes('chest') || selectedPt.id.includes('torso') || selectedPt.id.includes('clothing');
-        const isDetailOrAnatomy = selectedPt.category === 'anatomy' || selectedPt.id.includes('hand') || selectedPt.id.includes('leg') || selectedPt.id.includes('craft') || selectedPt.id.includes('detail');
-        
-        const profileType: 'flutter_8' | 'contour_drape' | 'curious_jitter' | 'spiral_breathe' = 
-          isFaceOrEyes ? 'flutter_8' :
-          isClothingOrTorso ? 'contour_drape' :
-          isDetailOrAnatomy ? 'curious_jitter' : 'spiral_breathe';
 
         let currentAngle = Math.random() * Math.PI * 2;
         const orbitDir = Math.random() > 0.5 ? 1 : -1;
-        // 打转半径随着沉淀逐渐收敛（初期 1.0，最终 0.15，几乎不打转，仅保留微小呼吸感）
-        const orbitRadiusFactor = Math.max(0.15, 1.0 - 0.85 * settlingFactor);
-        
-        // 依据部位定制基准轴比与幅度 (面部横扁、服饰纵长、细节精巧、主体宏阔)
-        const baseRx = (profileType === 'flutter_8' ? 3.0 : profileType === 'contour_drape' ? 1.4 : profileType === 'curious_jitter' ? 2.4 : 2.9) * orbitRadiusFactor;
-        const baseRy = (profileType === 'flutter_8' ? 1.2 : profileType === 'contour_drape' ? 3.2 : profileType === 'curious_jitter' ? 2.2 : 2.6) * orbitRadiusFactor;
+        const baseRx = 2.2 + Math.random() * 1.4;
+        const baseRy = 1.8 + Math.random() * 1.2;
 
         const entryX = Math.max(8, Math.min(92, anchorX + Math.cos(currentAngle) * baseRx));
         const entryY = Math.max(8, Math.min(92, anchorY + Math.sin(currentAngle) * baseRy));
 
         const dist = Math.hypot(entryX - curX, entryY - curY);
-        // 移动速度随时间逐渐放缓
-        const speedDampening = 1.0 + 1.3 * settlingFactor;
-        const travelDuration = Math.max(0.65, Math.min(1.5, (dist / 28) * 0.85 + 0.55)) * speedDampening;
+        const travelDuration = Math.max(0.65, Math.min(1.5, (dist / 28) * 0.85 + 0.55));
 
         curX = entryX;
         curY = entryY;
@@ -1274,54 +1236,23 @@ export function InfiniteRealtimeQCGaze({
 
         if (!isMounted) break;
 
-        // 实时非重复打转微轨迹（不同部位具有截然不同的运动轨迹与节奏变频）
+        // 实时非重复打转微轨迹（质检场景 1.0x 敏捷速度）
         const baseDwellMs = Math.max(1300, (selectedPt.dwellSeconds ?? 1.8) * 1000);
-        const actualDwellMs = (baseDwellMs + (Math.random() - 0.5) * 350) * (1.0 + 1.5 * settlingFactor);
-        const orbitSteps = Math.max(5, Math.round(actualDwellMs / 320));
+        const actualDwellMs = baseDwellMs + (Math.random() - 0.5) * 350;
+        const orbitSteps = Math.max(4, Math.round(actualDwellMs / 380));
         const totalTurnAngle = orbitDir * (Math.PI * 2 * (1.1 + Math.random() * 0.45));
         const stepAngle = totalTurnAngle / orbitSteps;
 
         for (let s = 1; s <= orbitSteps; s++) {
           if (!isMounted) break;
 
-          const progress = s / orbitSteps;
-          let rawDx = 0;
-          let rawDy = 0;
-          let cadenceMod = 1.0;
+          currentAngle += stepAngle + (Math.random() - 0.5) * 0.22;
+          const dynamicRx = baseRx * (0.88 + 0.3 * Math.sin(s * 1.6 + currentAngle)) + (Math.random() - 0.5) * 0.4;
+          const dynamicRy = baseRy * (0.88 + 0.3 * Math.cos(s * 2.1 + currentAngle)) + (Math.random() - 0.5) * 0.4;
 
-          if (profileType === 'flutter_8') {
-            // 1. 面部眼神：双纽线横向8字往返微跳（眼神神态敏锐审视，两端微顿、中段轻掠）
-            const t = currentAngle + s * stepAngle;
-            rawDx = Math.sin(t) * baseRx;
-            rawDy = Math.sin(2 * t) * 0.7 * baseRy;
-            cadenceMod = 0.75 + 0.5 * Math.abs(Math.cos(t));
-          } else if (profileType === 'contour_drape') {
-            // 2. 服饰领口：纵向剪裁垂流扫掠（慢进慢出、舒缓波浪形）
-            const t = currentAngle + s * stepAngle;
-            rawDx = Math.cos(t) * baseRx;
-            rawDy = (Math.sin(t) + 0.35 * Math.sin(2 * t)) * baseRy;
-            cadenceMod = 0.85 + 0.35 * Math.sin(progress * Math.PI);
-          } else if (profileType === 'curious_jitter') {
-            // 3. 手部细节：齿状微顿与非对称探究旋回（节拍变速跳跃、探究感强）
-            const t = currentAngle + s * stepAngle;
-            rawDx = (Math.cos(t) + 0.38 * Math.cos(3 * t)) * baseRx;
-            rawDy = (Math.sin(t) - 0.28 * Math.sin(3 * t)) * baseRy;
-            cadenceMod = s % 2 === 0 ? 1.35 : 0.75;
-          } else {
-            // 4. 核心高光与主体：开阔黄金螺旋与深呼吸漫游（宏观、从容、流线）
-            const t = currentAngle + s * stepAngle;
-            const rSpiral = 1.0 + 0.28 * Math.sin(1.5 * t);
-            rawDx = Math.cos(t) * rSpiral * baseRx;
-            rawDy = Math.sin(t) * rSpiral * baseRy;
-            cadenceMod = 0.9 + 0.25 * Math.cos(progress * Math.PI * 2);
-          }
-
-          const jitterX = (Math.random() - 0.5) * (0.35 * orbitRadiusFactor);
-          const jitterY = (Math.random() - 0.5) * (0.35 * orbitRadiusFactor);
-
-          const stepX = Math.max(8, Math.min(92, anchorX + rawDx + jitterX));
-          const stepY = Math.max(8, Math.min(92, anchorY + rawDy + jitterY));
-          const stepDuration = Math.max(0.18, (actualDwellMs / orbitSteps) / 1000 * cadenceMod);
+          const stepX = Math.max(8, Math.min(92, anchorX + Math.cos(currentAngle) * dynamicRx));
+          const stepY = Math.max(8, Math.min(92, anchorY + Math.sin(currentAngle) * dynamicRy));
+          const stepDuration = Math.max(0.28, (actualDwellMs / orbitSteps) / 1000 * (0.92 + Math.random() * 0.16));
 
           curX = stepX;
           curY = stepY;
@@ -1340,13 +1271,13 @@ export function InfiniteRealtimeQCGaze({
       }
     }
 
-    void runInfiniteGazeWalk();
+    runInfiniteGazeWalk();
 
     return () => {
       isMounted = false;
       gazeControls.stop();
     };
-  }, [imageUrl, isPortrait, isLandscape, isTall, isWide, prompt, gazeControls, ratio, h, w]);
+  }, [imageUrl, isPortrait, isLandscape, isTall, isWide, prompt, gazeControls]);
 
   return (
     <motion.div
@@ -1413,7 +1344,7 @@ export function AdaptiveDwellGaze({
   prompt = '',
   ratio = '1:1',
   landmarks,
-  speedMultiplier = 1.0, // 恢复为 1.0x 标准速度
+  speedMultiplier = 0.3, // 待机查看默认 0.3 倍速（悠缓舒畅）
 }: {
   key?: React.Key;
   w: number;
@@ -1510,10 +1441,6 @@ export function AdaptiveDwellGaze({
     async function runDynamicDwellLoop() {
       if (points.length === 0) return;
 
-      // 等待 DOM 元素在 Framer Motion 中完全挂载并绑定 Ref，防止 start() 提前触发警告
-      await new Promise(resolve => requestAnimationFrame(resolve));
-      if (!isMounted) return;
-
       // 1. Initial Landing on highest-importance anchor
       const sorted = [...points].sort((a, b) => b.importance - a.importance);
       const initialTarget = sorted[0] || { x: 50, y: 35, dwellSeconds: 2.0 };
@@ -1522,18 +1449,16 @@ export function AdaptiveDwellGaze({
       let curY = initialTarget.y;
 
       await Promise.all([
-        gazeControls.start({
+        gazeControls.set({
           left: `${curX}%`,
           top: `${curY}%`,
           scale: 0.96,
           opacity: 0,
-          transition: { duration: 0 },
         }),
-        catchlightControls.start({
+        catchlightControls.set({
           left: `${curX}%`,
           top: `${curY}%`,
           opacity: 0,
-          transition: { duration: 0 },
         }),
       ]);
 
@@ -1552,101 +1477,51 @@ export function AdaptiveDwellGaze({
         }),
       ]);
 
-      // 2. Continuous Real-Time Waypoint Decision Engine with Organic Time-Decay & Settling
-      const startTime = Date.now();
-      const visitCounts: Record<string, number> = {};
+      // 2. Continuous Real-Time Waypoint Decision Engine
+      const isVertical = ratio.includes('9:16') || ratio.includes('3:4') || ratio.includes('2:3') || (h > w * 1.05);
+      const verticalOffset = isVertical ? (100 / 15) : 0;
 
       while (isMounted) {
-        const elapsedSec = (Date.now() - startTime) / 1000;
-        // 演进因子 S in [0, 1]: 0~6s 活跃探索, 6~24s 逐渐沉静收敛, >=24s 深度定焦
-        const settlingFactor = Math.min(1.0, Math.max(0.0, (elapsedSec - 6) / 18));
-        const allExplored = Object.keys(visitCounts).length >= points.length;
-        const coreAnchor = sorted[0] || points[0];
-
-        let selectedPt: InterestPoint;
-
-        if (settlingFactor > 0.85 && allExplored) {
-          // 阶段三：长时深度定焦期（大概率定焦在核心点做极微弱呼吸，极低概率偶尔瞄一眼周边）
-          if (lastPointId === coreAnchor.id) {
-            if (Math.random() < 0.88 || points.length <= 1) {
-              selectedPt = coreAnchor;
-            } else {
-              // 12% 偶发余光扫视 (Occasional Micro-Glance)
-              const others = points.filter(p => p.id !== coreAnchor.id);
-              selectedPt = others[Math.floor(Math.random() * others.length)];
-            }
-          } else {
-            // 归航重力回核心点
-            selectedPt = Math.random() < 0.85 ? coreAnchor : points[Math.floor(Math.random() * points.length)];
+        // Calculate selection weights with Inhibition of Return (IOR)
+        const weightedCandidates = points.map(pt => {
+          let weight = pt.importance;
+          // Suppress immediate previous point by 80% to avoid rigid ping-pong
+          if (pt.id === lastPointId && points.length > 1) {
+            weight *= 0.2;
           }
-        } else {
-          // 阶段一与阶段二：探索与收敛过渡期
-          const weightedCandidates = points.map(pt => {
-            let weight = pt.importance;
-            // 抑制上一访问点
-            if (pt.id === lastPointId && points.length > 1) {
-              weight *= 0.15;
-            }
-            // 访问记忆衰减：看过的点再次被看的几率变小
-            const visits = visitCounts[pt.id] || 0;
-            weight *= Math.pow(0.36, visits);
+          return { pt, weight };
+        });
 
-            // 全览后或收敛期，核心锚点吸引力增强
-            if (allExplored || settlingFactor > 0.3) {
-              if (pt.id === coreAnchor.id) {
-                weight *= (1.5 + 4.5 * settlingFactor);
-              }
-            }
-            return { pt, weight: Math.max(0.02, weight) };
-          });
+        const totalWeight = weightedCandidates.reduce((acc, c) => acc + c.weight, 0);
+        let randomChoice = Math.random() * totalWeight;
+        let selectedPt = weightedCandidates[0].pt;
 
-          const totalWeight = weightedCandidates.reduce((acc, c) => acc + c.weight, 0);
-          let randomChoice = Math.random() * totalWeight;
-          selectedPt = weightedCandidates[0].pt;
-
-          for (const c of weightedCandidates) {
-            if (randomChoice < c.weight) {
-              selectedPt = c.pt;
-              break;
-            }
-            randomChoice -= c.weight;
+        for (const c of weightedCandidates) {
+          if (randomChoice < c.weight) {
+            selectedPt = c.pt;
+            break;
           }
+          randomChoice -= c.weight;
         }
 
-        visitCounts[selectedPt.id] = (visitCounts[selectedPt.id] || 0) + 1;
         lastPointId = selectedPt.id;
 
-        // 基础坐标（精准真实百分比）
-        const anchorX = Math.max(12, Math.min(88, selectedPt.x));
+        // Base anchor coordinates with vertical aspect ratio compensation
+        const anchorX = Math.max(12, Math.min(88, selectedPt.x + verticalOffset));
         const anchorY = Math.max(10, Math.min(90, selectedPt.y));
-
-        // 判定该部位的专属眼动动力学生理特征 (Choreography Profile by Point Type)
-        const isFaceOrEyes = selectedPt.category === 'face' || selectedPt.id.includes('eye') || selectedPt.id.includes('face') || selectedPt.id.includes('head');
-        const isClothingOrTorso = selectedPt.category === 'clothing' || selectedPt.id.includes('chest') || selectedPt.id.includes('torso') || selectedPt.id.includes('clothing');
-        const isDetailOrAnatomy = selectedPt.category === 'anatomy' || selectedPt.id.includes('hand') || selectedPt.id.includes('leg') || selectedPt.id.includes('craft') || selectedPt.id.includes('detail');
-        
-        const profileType: 'flutter_8' | 'contour_drape' | 'curious_jitter' | 'spiral_breathe' = 
-          isFaceOrEyes ? 'flutter_8' :
-          isClothingOrTorso ? 'contour_drape' :
-          isDetailOrAnatomy ? 'curious_jitter' : 'spiral_breathe';
 
         // Initial orbit entry position
         let currentAngle = Math.random() * Math.PI * 2;
         const orbitDir = Math.random() > 0.5 ? 1 : -1;
-        // 打转半径随着沉淀逐渐收敛（初期 1.0，最终 0.15，几乎不打转，仅保留微小呼吸感）
-        const orbitRadiusFactor = Math.max(0.15, 1.0 - 0.85 * settlingFactor);
-        
-        // 依据部位定制基准轴比与幅度 (面部横扁、服饰纵长、细节精巧、主体宏阔)
-        const baseRx = (profileType === 'flutter_8' ? 3.0 : profileType === 'contour_drape' ? 1.4 : profileType === 'curious_jitter' ? 2.4 : 2.9) * orbitRadiusFactor;
-        const baseRy = (profileType === 'flutter_8' ? 1.2 : profileType === 'contour_drape' ? 3.2 : profileType === 'curious_jitter' ? 2.2 : 2.6) * orbitRadiusFactor;
+        const baseRx = 2.2 + Math.random() * 1.4; // 2.2% ~ 3.6% image width
+        const baseRy = 1.8 + Math.random() * 1.2; // 1.8% ~ 3.0% image height
 
         const entryX = Math.max(8, Math.min(92, anchorX + Math.cos(currentAngle) * baseRx));
         const entryY = Math.max(8, Math.min(92, anchorY + Math.sin(currentAngle) * baseRy));
 
-        // Physics-driven transition time based on distance & speedMultiplier & settlingFactor
+        // Physics-driven transition time based on distance & speedMultiplier
         const dist = Math.hypot(entryX - curX, entryY - curY);
-        const speedDampening = (1.0 + 1.3 * settlingFactor) * timeFactor;
-        const travelDuration = Math.max(0.65, Math.min(1.6, (dist / 28) * 0.85 + 0.55)) * speedDampening;
+        const travelDuration = Math.max(0.65, Math.min(1.6, (dist / 28) * 0.85 + 0.55)) * timeFactor;
 
         curX = entryX;
         curY = entryY;
@@ -1676,54 +1551,24 @@ export function AdaptiveDwellGaze({
 
         if (!isMounted) break;
 
-        // 3. Living Dynamic Micro-Orbiting (不同部位具有截然不同的运动轨迹与节奏变频)
-        const baseDwellMs = Math.max(1300, (selectedPt.dwellSeconds ?? 1.8) * 1000);
-        const actualDwellMs = (baseDwellMs + (Math.random() - 0.5) * 350) * (1.0 + 1.5 * settlingFactor) * timeFactor;
-        const orbitSteps = Math.max(5, Math.round(actualDwellMs / (320 * timeFactor)));
+        // 3. Living Dynamic Micro-Orbiting (实时非重复打转轨迹引擎，依据 speedMultiplier 调整舒缓节奏)
+        const baseDwellMs = Math.max(1400, (selectedPt.dwellSeconds ?? 2.0) * 1000);
+        const actualDwellMs = (baseDwellMs + (Math.random() - 0.5) * 400) * timeFactor;
+        const orbitSteps = Math.max(4, Math.round(actualDwellMs / (420 * timeFactor)));
         const totalTurnAngle = orbitDir * (Math.PI * 2 * (1.1 + Math.random() * 0.45));
         const stepAngle = totalTurnAngle / orbitSteps;
 
         for (let s = 1; s <= orbitSteps; s++) {
           if (!isMounted) break;
 
-          const progress = s / orbitSteps;
-          let rawDx = 0;
-          let rawDy = 0;
-          let cadenceMod = 1.0;
+          // Non-repeating multi-frequency harmonic modulation & random micro-jitter
+          currentAngle += stepAngle + (Math.random() - 0.5) * 0.22;
+          const dynamicRx = baseRx * (0.88 + 0.3 * Math.sin(s * 1.6 + currentAngle)) + (Math.random() - 0.5) * 0.45;
+          const dynamicRy = baseRy * (0.88 + 0.3 * Math.cos(s * 2.1 + currentAngle)) + (Math.random() - 0.5) * 0.45;
 
-          if (profileType === 'flutter_8') {
-            // 1. 面部眼神：双纽线横向8字往返微跳（眼神神态敏锐审视，两端微顿、中段轻掠）
-            const t = currentAngle + s * stepAngle;
-            rawDx = Math.sin(t) * baseRx;
-            rawDy = Math.sin(2 * t) * 0.7 * baseRy;
-            cadenceMod = 0.75 + 0.5 * Math.abs(Math.cos(t));
-          } else if (profileType === 'contour_drape') {
-            // 2. 服饰领口：纵向剪裁垂流扫掠（慢进慢出、舒缓波浪形）
-            const t = currentAngle + s * stepAngle;
-            rawDx = Math.cos(t) * baseRx;
-            rawDy = (Math.sin(t) + 0.35 * Math.sin(2 * t)) * baseRy;
-            cadenceMod = 0.85 + 0.35 * Math.sin(progress * Math.PI);
-          } else if (profileType === 'curious_jitter') {
-            // 3. 手部细节：齿状微顿与非对称探究旋回（节拍变速跳跃、探究感强）
-            const t = currentAngle + s * stepAngle;
-            rawDx = (Math.cos(t) + 0.38 * Math.cos(3 * t)) * baseRx;
-            rawDy = (Math.sin(t) - 0.28 * Math.sin(3 * t)) * baseRy;
-            cadenceMod = s % 2 === 0 ? 1.35 : 0.75;
-          } else {
-            // 4. 核心高光与主体：开阔黄金螺旋与深呼吸漫游（宏观、从容、流线）
-            const t = currentAngle + s * stepAngle;
-            const rSpiral = 1.0 + 0.28 * Math.sin(1.5 * t);
-            rawDx = Math.cos(t) * rSpiral * baseRx;
-            rawDy = Math.sin(t) * rSpiral * baseRy;
-            cadenceMod = 0.9 + 0.25 * Math.cos(progress * Math.PI * 2);
-          }
-
-          const jitterX = (Math.random() - 0.5) * (0.35 * orbitRadiusFactor);
-          const jitterY = (Math.random() - 0.5) * (0.35 * orbitRadiusFactor);
-
-          const stepX = Math.max(8, Math.min(92, anchorX + rawDx + jitterX));
-          const stepY = Math.max(8, Math.min(92, anchorY + rawDy + jitterY));
-          const stepDuration = Math.max(0.18, (actualDwellMs / orbitSteps) / 1000 * cadenceMod);
+          const stepX = Math.max(8, Math.min(92, anchorX + Math.cos(currentAngle) * dynamicRx));
+          const stepY = Math.max(8, Math.min(92, anchorY + Math.sin(currentAngle) * dynamicRy));
+          const stepDuration = Math.max(0.32, (actualDwellMs / orbitSteps) / 1000 * (0.92 + Math.random() * 0.16));
 
           curX = stepX;
           curY = stepY;
@@ -1932,68 +1777,46 @@ export function LandmarkSpatialAnnotations({
     return makeUnique(result);
   }, [landmarks]);
 
-  const renderedPoints = useMemo(() => {
-    // 1. Calculate base object-cover mapped coordinates
-    const mapped = points.map((pt, idx) => {
-      let renderX = pt.x;
-      let renderY = pt.y;
-
-      if (naturalDim && cardWidth && cardHeight && cardWidth > 0 && cardHeight > 0) {
-        const { nw, nh } = naturalDim;
-        const imgAspect = nw / nh;
-        const cardAspect = cardWidth / cardHeight;
-
-        if (imgAspect > cardAspect) {
-          // 画面比卡片更宽，左右发生裁剪
-          const sw = nh * cardAspect;
-          const sx = (nw - sw) / 2;
-          const pixelX = (pt.x / 100) * nw;
-          renderX = Math.max(0, Math.min(100, ((pixelX - sx) / sw) * 100));
-        } else if (imgAspect < cardAspect) {
-          // 画面比卡片更高，上下发生裁剪（如竖图比例微差）
-          const sh = nw / cardAspect;
-          const sy = (nh - sh) / 2;
-          const pixelY = (pt.y / 100) * nh;
-          renderY = Math.max(0, Math.min(100, ((pixelY - sy) / sh) * 100));
-        }
-      }
-
-      // If point is on the right half, label displays to the left to avoid card edge clipping
-      const isRightSide = renderX > 52;
-      return { pt, idx, renderX, renderY, isRightSide, offsetY: 0 };
-    });
-
-    // 2. Resolve Y-axis collisions for points on the same side
-    const MIN_GAP_Y = 3.6; // 3.6% vertical gap threshold (~23px on a 640px card)
-    const sides = [
-      mapped.filter(m => !m.isRightSide).sort((a, b) => a.renderY - b.renderY),
-      mapped.filter(m => m.isRightSide).sort((a, b) => a.renderY - b.renderY),
-    ];
-
-    for (const group of sides) {
-      for (let i = 1; i < group.length; i++) {
-        const prev = group[i - 1];
-        const curr = group[i];
-        const effectivePrevY = prev.renderY + prev.offsetY;
-        const effectiveCurrY = curr.renderY;
-        const diff = effectiveCurrY - effectivePrevY;
-        if (diff < MIN_GAP_Y) {
-          const shift = (MIN_GAP_Y - diff) / 2;
-          prev.offsetY -= shift;
-          curr.offsetY += shift;
-        }
-      }
-    }
-
-    return mapped;
-  }, [points, naturalDim, cardWidth, cardHeight]);
-
   if (!visible || points.length === 0) return null;
 
   return (
     <div className="absolute inset-0 pointer-events-none z-25 overflow-hidden squircle">
       <AnimatePresence>
-        {renderedPoints.map(({ pt, idx, renderX, renderY, isRightSide, offsetY }) => {
+        {points.map((pt, idx) => {
+          // Object-cover 反向映射计算，确保在不同比例裁剪下 100% 精准对齐
+          let renderX = pt.x;
+          let renderY = pt.y;
+
+          const isVertical = Boolean(
+            (naturalDim && naturalDim.nw < naturalDim.nh) ||
+            (cardWidth && cardHeight && cardHeight > cardWidth)
+          );
+
+          if (naturalDim && cardWidth && cardHeight && cardWidth > 0 && cardHeight > 0) {
+            const { nw, nh } = naturalDim;
+            const imgAspect = nw / nh;
+            const cardAspect = cardWidth / cardHeight;
+
+            if (imgAspect > cardAspect) {
+              // 画面比卡片更宽，左右发生裁剪
+              const sw = nh * cardAspect;
+              const sx = (nw - sw) / 2;
+              const pixelX = (pt.x / 100) * nw;
+              renderX = Math.max(0, Math.min(100, ((pixelX - sx) / sw) * 100));
+            } else if (imgAspect < cardAspect) {
+              // 画面比卡片更高，上下发生裁剪（如竖图比例微差）
+              const sh = nw / cardAspect;
+              const sy = (nh - sh) / 2;
+              const pixelY = (pt.y / 100) * nh;
+              renderY = Math.max(0, Math.min(100, ((pixelY - sy) / sh) * 100));
+            }
+          }
+
+          // 竖向比例图像的定位点，统一向右偏移图像横向宽度的 1/15 (约 6.67%)
+          if (isVertical) {
+            renderX = Math.max(0, Math.min(100, renderX + (100 / 15)));
+          }
+
           return (
             <motion.div
               key={pt.id ? `${pt.id}-${idx}` : `landmark-${idx}`}
@@ -2009,11 +1832,7 @@ export function LandmarkSpatialAnnotations({
                 left: `${renderX}%`,
                 top: `${renderY}%`,
               }}
-              className={`absolute pointer-events-auto group/landmark cursor-pointer flex items-center select-none ${
-                isRightSide
-                  ? 'flex-row-reverse -translate-x-[calc(100%-4px)] -translate-y-1/2'
-                  : 'flex-row -translate-x-1 -translate-y-1/2'
-              }`}
+              className="absolute -translate-x-1 -translate-y-1/2 pointer-events-auto group/landmark cursor-pointer flex items-center select-none"
               onClick={(e) => {
                 e.stopPropagation();
                 onSelectPoint?.(pt);
@@ -2025,13 +1844,8 @@ export function LandmarkSpatialAnnotations({
                 <span className="relative w-2 h-2 rounded-full bg-purple-500 border-1.5 border-white dark:border-neutral-900 shadow-[0_0_8px_rgba(168,85,247,0.95)] transition-transform duration-200 group-hover/landmark:scale-130" />
               </div>
 
-              {/* 2. 文字：无底色、无描边，根据左右侧自适应贴边显示，带防撞错位微调 */}
-              <span
-                style={offsetY !== 0 ? { transform: `translateY(${offsetY * 6.4}px)` } : undefined}
-                className={`${
-                  isRightSide ? 'mr-1.5 text-right' : 'ml-1.5 text-left'
-                } text-[11px] font-medium tracking-wide text-white drop-shadow-[0_1px_3px_rgba(0,0,0,0.95)] whitespace-nowrap transition-transform duration-200`}
-              >
+              {/* 2. 文字：无底色、无描边，直接显示在点的右侧，字号不变 (11px) */}
+              <span className="ml-1.5 text-[11px] font-medium tracking-wide text-white drop-shadow-[0_1px_3px_rgba(0,0,0,0.95)] whitespace-nowrap">
                 {pt.label}
               </span>
             </motion.div>
@@ -2118,42 +1932,6 @@ export const GenerationCard = React.memo(function GenerationCard({
       setCurrentScale(scale.get());
     }
   }, [isZooming, scale]);
-
-  // 🔍 动态探针：准确获取并缓存真实返回图片/视频的物理像素尺寸
-  const [actualDimensions, setActualDimensions] = useState<{ width: number; height: number } | null>(() => {
-    if (data.nativeWidth && data.nativeHeight) {
-      return { width: data.nativeWidth, height: data.nativeHeight };
-    }
-    return null;
-  });
-
-  useEffect(() => {
-    if (data.nativeWidth && data.nativeHeight) {
-      setActualDimensions({ width: data.nativeWidth, height: data.nativeHeight });
-      return;
-    }
-
-    const srcToProbe = data.trueOriginalImageUrl || data.originalImageUrl || imageUrl;
-    if (!srcToProbe || data.isVideo) return;
-
-    let isMounted = true;
-    const img = new Image();
-    img.referrerPolicy = 'no-referrer';
-    img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      if (!isMounted) return;
-      if (img.naturalWidth && img.naturalHeight) {
-        setActualDimensions({ width: img.naturalWidth, height: img.naturalHeight });
-        onUpdate(id, { nativeWidth: img.naturalWidth, nativeHeight: img.naturalHeight }, false);
-      }
-    };
-    img.src = srcToProbe;
-
-    return () => {
-      isMounted = false;
-      img.onload = null;
-    };
-  }, [imageUrl, data.originalImageUrl, data.trueOriginalImageUrl, data.nativeWidth, data.nativeHeight, data.isVideo, id, onUpdate]);
 
   // If we don't render CardImageCanvas (which is when !imageUrl or isVideo is true),
   // we must manually manage __paintedCardIds for Zero-Flicker Handoff so that
@@ -3459,10 +3237,8 @@ export const GenerationCard = React.memo(function GenerationCard({
 
     const isVideo = Boolean(data.isVideo);
     const ext = isVideo ? 'mp4' : 'png';
-    const cardTitle = data.name || data.fileName || '';
     const cleanPrompt = data.prompt ? data.prompt.slice(0, 24).replace(/[^\w\u4e00-\u9fa5]/g, '_') : 'media';
-    const baseName = cardTitle ? cardTitle.replace(/\.[^/.]+$/, "") : cleanPrompt;
-    const filename = `${baseName}_${Date.now()}.${ext}`;
+    const filename = `${data.fileName ? data.fileName.replace(/\.[^/.]+$/, "") : cleanPrompt}_${Date.now()}.${ext}`;
 
     const triggerDownload = (url: string, downloadName: string) => {
       const a = document.createElement('a');
@@ -3474,76 +3250,56 @@ export const GenerationCard = React.memo(function GenerationCard({
       document.body.removeChild(a);
     };
 
-    // 🌟 优先级 1：无损原始二进制数据（trueOriginalFileData 4K/8K 原始文件 > originalFileData 4K 代理）
-    const trueOriginalBlob = (data.trueOriginalFileData instanceof Blob && data.trueOriginalFileData.size > 0)
-      ? data.trueOriginalFileData
-      : (data.originalFileData instanceof Blob && data.originalFileData.size > 0)
-        ? data.originalFileData
-        : null;
-
-    if (trueOriginalBlob) {
-      const blobUrl = URL.createObjectURL(trueOriginalBlob);
-      triggerDownload(blobUrl, filename);
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 3000);
-      return;
-    }
-
-    // 🌟 优先级 2：AI 渲染高清原图 / 远程高清资源（通过代理端无损拉取原始二进制流）
-    const targetMediaUrl = data.trueOriginalImageUrl || data.originalImageUrl || imageUrl || data.imageUrl || videoPlaySrc || blobVideoUrl;
-    if (targetMediaUrl) {
-      if (targetMediaUrl.startsWith('blob:')) {
-        triggerDownload(targetMediaUrl, filename);
-        return;
-      }
-
-      if (/^https?:\/\//i.test(targetMediaUrl)) {
-        try {
-          const activeToken = localStorage.getItem('workrally_mcp_token') || '';
-          const taskId = data.mcpTaskId || targetMediaUrl.match(/(2k[a-z0-9]{6,16})/i)?.[1] || targetMediaUrl.match(/\/(2k[a-z0-9]+)_MAIN_/i)?.[1] || '';
-          const proxyUrl = `/api/mcp/workrally/proxy-media?url=${encodeURIComponent(targetMediaUrl)}${taskId ? `&taskId=${encodeURIComponent(taskId)}` : ''}${activeToken ? `&token=${encodeURIComponent(activeToken)}` : ''}&download=true&filename=${encodeURIComponent(filename)}`;
-
-          const response = await fetch(proxyUrl);
-          if (response.ok) {
-            const blob = await response.blob();
-            if (blob && blob.size > 0) {
-              const blobUrl = URL.createObjectURL(blob);
-              triggerDownload(blobUrl, filename);
-              setTimeout(() => URL.revokeObjectURL(blobUrl), 3000);
-              return;
-            }
-          }
-        } catch (err) {
-          console.warn('[handleDownloadMedia] Proxy fetch download error:', err);
-        }
-
-        // Direct fetch fallback for CORS-enabled CDNs
-        try {
-          const directRes = await fetch(targetMediaUrl);
-          if (directRes.ok) {
-            const blob = await directRes.blob();
-            if (blob && blob.size > 0) {
-              const blobUrl = URL.createObjectURL(blob);
-              triggerDownload(blobUrl, filename);
-              setTimeout(() => URL.revokeObjectURL(blobUrl), 3000);
-              return;
-            }
-          }
-        } catch {}
-      }
-    }
-
-    // 🌟 优先级 3：本地草稿 / 预览数据托底
+    // 1. Direct local Blob in data.fileData
     if (data.fileData instanceof Blob) {
       const blobUrl = URL.createObjectURL(data.fileData);
       triggerDownload(blobUrl, filename);
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 3000);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
       return;
     }
 
-    // 🌟 兜底：直接触发下载链接
-    if (targetMediaUrl) {
-      triggerDownload(targetMediaUrl, filename);
+    // 2. Active video or image source
+    const mediaSrc = blobVideoUrl || videoPlaySrc || imageUrl || data.originalImageUrl;
+    if (!mediaSrc) return;
+
+    if (mediaSrc.startsWith('blob:')) {
+      triggerDownload(mediaSrc, filename);
+      return;
     }
+
+    // 3. Try direct fetch for same-origin or CORS-enabled URLs
+    try {
+      const response = await fetch(mediaSrc);
+      if (response.ok) {
+        const blob = await response.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        triggerDownload(blobUrl, filename);
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+        return;
+      }
+    } catch {
+      // Direct fetch failed (likely CORS restriction on external domain)
+    }
+
+    // 4. Fallback: Fetch via same-origin media proxy endpoint
+    if (/^https?:\/\//i.test(mediaSrc)) {
+      try {
+        const proxyUrl = `/api/mcp/workrally/proxy-media?url=${encodeURIComponent(mediaSrc)}`;
+        const response = await fetch(proxyUrl);
+        if (response.ok) {
+          const blob = await response.blob();
+          const blobUrl = URL.createObjectURL(blob);
+          triggerDownload(blobUrl, filename);
+          setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+          return;
+        }
+      } catch {
+        // Proxy fetch failed
+      }
+    }
+
+    // 5. Direct link download fallback
+    triggerDownload(mediaSrc, filename);
   };
 
   // Asset list items (Only computed when Asset Picker modal is opened)
@@ -3995,24 +3751,30 @@ export const GenerationCard = React.memo(function GenerationCard({
     });
   };
 
-  // 🌟 角标展示规则：必须根据真实返回图片/视频的实际物理像素精确标记，不再基于选择器的预设值瞎猜
-  const effWidth = actualDimensions?.width || data.nativeWidth;
-  const effHeight = actualDimensions?.height || data.nativeHeight;
-  const hasLoadedMedia = Boolean(imageUrl || data.originalImageUrl || data.fileData || data.thumbnailUrl);
-
   let resolutionTag = '';
-  if (hasLoadedMedia && effWidth && effHeight) {
-    const maxDim = Math.max(effWidth, effHeight);
-    const minDim = Math.min(effWidth, effHeight);
+  if (data.nativeWidth && data.nativeHeight) {
+    const maxDim = Math.max(data.nativeWidth, data.nativeHeight);
+    const minDim = Math.min(data.nativeWidth, data.nativeHeight);
     if (data.isVideo) {
       if (minDim >= 2160 || maxDim >= 3840) resolutionTag = '4K';
-      else if (minDim >= 1080 || maxDim >= 1920) resolutionTag = '1080p';
-      else if (minDim >= 720 || maxDim >= 1280) resolutionTag = '720p';
+      else if (minDim >= 1080) resolutionTag = '1080p';
+      else if (minDim >= 720) resolutionTag = '720p';
       else resolutionTag = '480p';
     } else {
       if (maxDim >= 4000) resolutionTag = '4K+';
-      else if (maxDim >= 3840 || minDim >= 2160) resolutionTag = '4K';
-      else if (maxDim >= 2048 || minDim >= 1440) resolutionTag = '2K';
+      else if (maxDim >= 3840) resolutionTag = '4K';
+      else if (maxDim >= 2048) resolutionTag = '2K';
+      else resolutionTag = '1K';
+    }
+  } else {
+    // Fallback based on data.res
+    if (data.isVideo) {
+      if (data.res === '4K') resolutionTag = '4K';
+      else if (data.res === '2K') resolutionTag = '1080p';
+      else resolutionTag = '720p';
+    } else {
+      if (data.res === '4K') resolutionTag = '4K';
+      else if (data.res === '2K') resolutionTag = '2K';
       else resolutionTag = '1K';
     }
   }
@@ -4302,8 +4064,8 @@ export const GenerationCard = React.memo(function GenerationCard({
             </div>
           </div>
         )}
-        {/* Card / File Name Tag */}
-        {(data.name || data.fileName) && (
+        {/* File Name Tag */}
+        {data.fileName && (
           <div 
             className="absolute z-[60] pointer-events-none asset-heavy-dom"
             style={{
@@ -4316,7 +4078,7 @@ export const GenerationCard = React.memo(function GenerationCard({
           >
             <div className="bg-black/60 px-2.5 py-1.5 rounded-lg border border-white/10 shadow-sm flex items-center">
               <span className="text-white/95 text-[13px] font-medium truncate leading-none tracking-wide">
-                {(data.name || data.fileName || '').replace(/\.[^/.]+$/, "")}
+                {data.fileName.replace(/\.[^/.]+$/, "")}
               </span>
             </div>
           </div>
@@ -4448,12 +4210,6 @@ export const GenerationCard = React.memo(function GenerationCard({
                     const video = e.currentTarget;
                     const dur = video.duration || 0;
                     setDuration(dur);
-                    const vWidth = video.videoWidth;
-                    const vHeight = video.videoHeight;
-                    if (vWidth && vHeight && (!data.nativeWidth || !data.nativeHeight)) {
-                      setActualDimensions({ width: vWidth, height: vHeight });
-                      onUpdate(id, { nativeWidth: vWidth, nativeHeight: vHeight }, false);
-                    }
                     const savedPos = getStoredVideoProgress();
                     if (savedPos > 0 && dur > 0 && savedPos < (dur - 0.4)) {
                       video.currentTime = savedPos;

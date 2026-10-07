@@ -1,36 +1,29 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
-import {defineConfig, type Plugin} from 'vite';
-
-// Suppress automatic location.reload() triggered when Cloud Run/Nginx idle WebSocket drops
-const disableHmrClientReloadPlugin = (): Plugin => ({
-  name: 'disable-hmr-client-reload',
-  transform(code, id) {
-    if (id.includes('vite/dist/client/client.mjs')) {
-      return code.replace(/location\.reload\(\)/g, '/* [vite] HMR auto-reload suppressed in AI Studio */');
-    }
-  },
-});
+import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
-    plugins: [
-      disableHmrClientReloadPlugin(),
-      react(),
-      tailwindcss(),
-    ],
+    plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
       },
     },
     server: {
-      // HMR is completely disabled in AI Studio to prevent automatic page reload when Cloud Run/Nginx WebSocket times out.
-      hmr: false,
-      ws: false,
-      // Disable file watching to prevent reload loops and save CPU during edits.
-      watch: null,
+      // HMR is disabled in AI Studio via DISABLE_HMR env var.
+      // Do not modify—file watching is disabled to prevent flickering during agent edits.
+      hmr: process.env.DISABLE_HMR !== 'true',
+      // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
+      watch: process.env.DISABLE_HMR === 'true' ? null : {
+        ignored: [
+          '**/.mcp_last_known.json',
+          '**/.data/**',
+          '**/src/agent/systemPrompt.txt',
+          '**/src/agent/stateNodePrompt.txt',
+        ],
+      },
     },
   };
 });

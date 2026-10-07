@@ -53,9 +53,6 @@ const parametersForTool = (toolId: string) => {
     'ui.actAndObserve': { properties: { targetId: target, action: { type: 'string', enum: ['mouse.move', 'mouse.click', 'mouse.doubleClick', 'mouse.longPress', 'mouse.hover', 'mouse.drag', 'mouse.scroll', 'mouse.type', 'mouse.keyPress'] }, arguments: { type: 'object', description: '鼠标动作的附加参数。例如：mouse.scroll 可传 { delta: number }（正数向下，负数向上）；mouse.type 可传 { text: string, clear?: boolean }（输入文本，clear 为 true 时先清空原有内容）；mouse.keyPress 可传 { key: string, shiftKey?: boolean }（如 key="Enter"）' }, observe: { type: 'object', properties: observationProperties } }, required: ['targetId', 'action'] },
     'page.inspect': { properties: observationProperties },
     'guide.lookup': { properties: { query: { type: 'string' } }, required: ['query'] },
-    'card.inspect': { properties: { cardId: { type: 'string', description: '需要深入查看的目标卡片 ID' }, includeImage: { type: 'boolean', description: '是否提取高清图像并注入多模态视觉上下文' }, includePrompt: { type: 'boolean', description: '是否提取提示词' }, includeReference: { type: 'boolean', description: '是否提取参考图列表' }, includeParameters: { type: 'boolean', description: '是否提取画幅、模型、渲染状态等参数' } }, required: ['cardId'] },
-    'card.detectLandmarks': { properties: { cardId: { type: 'string', description: '需要进行主体与部位识别的目标卡片 ID（例如 card_xxx 或 canvas.card.xxx）' }, prompt: { type: 'string', description: '针对该图像特定部位识别的补充引导词（可选）' }, force: { type: 'boolean', description: '是否强制重新识别并覆盖已有标注（默认为 true）' } }, required: ['cardId'] },
-    'card.generate': { properties: { name: { type: 'string', description: '卡片名称（尽可能简短、辨识度高）' }, targetCardId: { type: 'string', description: '目标卡片 ID（"new" 表示新建衍生生图卡片，或已有卡片 ID）' }, prompt: { type: 'string', description: '正向生图提示词' }, aspectRatio: { type: 'string', description: '画幅比例，如 16:9, 9:16, 1:1 等' }, referenceCardIds: { type: 'array', items: { type: 'string' }, description: '参考图卡片 ID 列表' }, autoStart: { type: 'boolean', description: '是否直接排队启动生成（默认为 true）' }, forceOverwrite: { type: 'boolean', description: '是否强制在原卡片覆盖（慎用，默认已出图卡片会触发 Fork 衍生）' } }, required: ['name'] },
     'sys.updateState': { properties: { taskTitle: { type: 'string' }, goal: { type: 'string' }, subGoal: { type: 'string' }, progress: { type: 'string' }, notes: { type: 'string' }, notesMode: { type: 'string', enum: ['append', 'overwrite'], description: '重点笔记模式：append（追加，默认）或 overwrite（重写替换现有笔记）' }, plan: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, title: { type: 'string' }, status: { type: 'string' } } } } } },
     'sys.endTask': { properties: { success: { type: 'boolean' }, finalResponse: { type: 'string' }, waitForUser: { type: 'string' }, paused: { type: 'boolean', description: '若任务属于等待后台异步生图/排队渲染，设置为 true 挂起任务等待出图事件唤醒' } }, required: ['success', 'finalResponse'] },
     'user.ask': { properties: { question: { type: 'string' } }, required: ['question'] },
@@ -189,20 +186,6 @@ function tryFastParseToolCalls(actionDesc: string): any[] | null {
         if (cleanQuery) {
           parsedCalls.push({ name: 'guide.lookup', arguments: { query: cleanQuery } });
         }
-      } else if (toolName === 'card.detectLandmarks') {
-        const cleanCard = rest.replace(/^["'“]|["'”]$/g, '').trim();
-        const cardMatch = cleanCard.match(/(?:canvas\.card\.|card_)[a-zA-Z0-9_-]+/i) || cleanCard.match(/[a-zA-Z0-9_-]+/);
-        const cardId = cardMatch ? cardMatch[0] : cleanCard;
-        if (cardId) {
-          parsedCalls.push({ name: 'card.detectLandmarks', arguments: { cardId, force: true } });
-        }
-      } else if (toolName === 'card.inspect') {
-        const cleanCard = rest.replace(/^["'“]|["'”]$/g, '').trim();
-        const cardMatch = cleanCard.match(/(?:canvas\.card\.|card_)[a-zA-Z0-9_-]+/i) || cleanCard.match(/[a-zA-Z0-9_-]+/);
-        const cardId = cardMatch ? cardMatch[0] : cleanCard;
-        if (cardId) {
-          parsedCalls.push({ name: 'card.inspect', arguments: { cardId, includeImage: true, includeParameters: true } });
-        }
       } else if (toolName === 'sys.endTask') {
         const cleanMsg = rest.replace(/^["'“]|["'”]$/g, '').trim();
         const isGeneratingOrWaiting = /等待|生成|排队|渲染|稍候|后台/i.test(cleanMsg);
@@ -254,16 +237,6 @@ function getModelConfig(modelType: string, userKey?: string): ModelConfig {
   } else if (modelType === 'qwen3.8-flash') {
     endpoint = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
     actualModel = 'qwen3.8-flash';
-    apiKey = userKey || process.env.DASHSCOPE_API_KEY || process.env.DEEPSEEK_API_KEY;
-    stream = true;
-  } else if (
-    modelType === 'qwen3-vl-plus' ||
-    modelType === 'qwen-vl-plus' ||
-    modelType.toLowerCase().includes('qwen3-vl') ||
-    modelType.toLowerCase().includes('vl-plus')
-  ) {
-    endpoint = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
-    actualModel = 'qwen3-vl-plus';
     apiKey = userKey || process.env.DASHSCOPE_API_KEY || process.env.DEEPSEEK_API_KEY;
     stream = true;
   } else if (
@@ -1039,7 +1012,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
                   messages: [
                     { 
                       role: 'system', 
-                      content: `你是一个极其精准的工具 JSON 转换与转译节点。你的任务是将 Agent 主循环输出的不标准 JSON、JS 对象结构、伪代码或自然语言动作指令，严格转译为符合对应工具 Schema 的标准 JSON 参数。\n\n【转换与纠错规则】\n1. 提取参数与 ID：\n   - 对于 card.detectLandmarks，精确提取目标卡片 ID cardId（如 "card_xxx" 或 "canvas.card.xxx"）、补充引导词 prompt 及 force 标识。若输入仅提及卡片或自然语言指示识别某图部位，提取其 cardId 组装为 { cardId, force: true }。\n   - 对于 card.inspect，精确提取目标卡片 ID cardId 及 includeImage / includePrompt / includeReference / includeParameters 布尔开关。\n   - 对于 card.generate，必须精准提取卡片名称 name（尽可能简短、辨识度高）、参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。\n2. 修复非标格式：遇到未加双引号的 Key（如 cardId: "xxx"）或单引号文本，一律重写纠正为标准合法 JSON。\n3. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 像素数值。\n4. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, notes, notesMode 等）。\n\n可用工具的 JSON Schema：\n${adapterToolPrompt}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }` 
+                      content: `你是一个极其精准的工具 JSON 转换与转译节点。你的任务是将 Agent 主循环输出的不标准 JSON、JS 对象结构、伪代码或自然语言动作指令，严格转译为符合对应工具 Schema 的标准 JSON 参数。\n\n【转换与纠错规则】\n1. 提取参数与 ID：对于 card.generate，精确提取参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！\n2. 修复非标格式：遇到未加双引号的 Key（如 cardId: "xxx"）或单引号文本，一律重写纠正为标准合法 JSON。\n3. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 像素数值。\n4. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, notes, notesMode 等）。\n\n可用工具的 JSON Schema：\n${adapterToolPrompt}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }` 
                     },
                     { role: 'user', content: actionDesc }
                   ]
@@ -1232,22 +1205,20 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
     }
   });
 
-  // Dedicated Ultra-Fast Subject Landmarks Detection Node (DeepSeek / Qwen / GLM)
+  // Dedicated Ultra-Fast Subject Landmarks Detection Node (DeepSeek detail: low)
   app.post('/api/agent/detect-landmarks', async (req, res) => {
     try {
-      const { imageUrl, slices, prompt, apiKey, model, ratio } = req.body || {};
-      if (!imageUrl && (!Array.isArray(slices) || slices.length === 0)) {
-        return res.status(400).json({ error: 'Missing imageUrl or slices' });
+      const { imageUrl, prompt, apiKey, model, ratio } = req.body || {};
+      if (!imageUrl) {
+        return res.status(400).json({ error: 'Missing imageUrl' });
       }
 
       const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(model || 'deepseek-v4-flash', apiKey);
 
-      const hasSlices = Array.isArray(slices) && slices.length > 1;
-
       let landmarksPromptTemplate = getPrompt('landmarks');
       if (!landmarksPromptTemplate || !landmarksPromptTemplate.trim()) {
         landmarksPromptTemplate = `你是一个具备卓越艺术人体解剖结构与空间定位能力的图像核心视觉兴趣点专家。
-你的核心任务是：深入观察分析输入的图像（或一组沿纵向无损切分的 16:9 局部高清切片），利用原生 Visual Grounding 空间感知能力，精准圈定全图最核心的 3~8 个动态兴趣点（Interest Points）。
+你的核心任务是：深入观察分析输入的图像，利用原生 Visual Grounding 空间感知能力，精准圈定全图最核心的 3~8 个动态兴趣点（Interest Points）。
 
 【人体核心解剖部位必选清单（只要画面可见必须全部提取，严禁遗漏）】
 当画面中包含人物时，必须完整覆盖以下核心解剖与形体部位：
@@ -1259,8 +1230,8 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
 6. 核心贴身服饰与质感工艺（id: "dress" 或 "outfit"，如礼服密集水钻、珠光褶皱）。
 
 【DeepSeek 原生 Visual Grounding 坐标规约】
-1. 每个部位与兴趣点必须输出在对应画面上的 2D 目标包围盒 "box_2d": [ymin, xmin, ymax, xmax]；
-2. 坐标数值必须为 0~1000 范围内的归一化整数（以该切片/画面为基准，0 为最顶/最左边缘，1000 为最底/最右边缘）：
+1. 每个部位与兴趣点必须输出在整张原图上的 2D 目标包围盒 "box_2d": [ymin, xmin, ymax, xmax]；
+2. 坐标数值必须为 0~1000 范围内的归一化整数（0 为最顶/最左边缘，1000 为最底/最右边缘）：
    - ymin: 目标顶部边界 (0~1000)
    - xmin: 目标左侧边界 (0~1000)
    - ymax: 目标底部边界 (0~1000)
@@ -1276,7 +1247,6 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
     {
       "id": "eyes",
       "label": "精准具体的解剖与特征描述（如'迷离仰视的半睁双眼与微张红唇'）",
-      "sliceIndex": 0,
       "box_2d": [ymin, xmin, ymax, xmax],
       "importance": 0.98,
       "dwellSeconds": 2.2,
@@ -1284,71 +1254,23 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
     }
   ],
   "regions": {
-    "head": { "sliceIndex": 0, "box_2d": [ymin, xmin, ymax, xmax] },
-    "eyes": { "sliceIndex": 0, "box_2d": [ymin, xmin, ymax, xmax] },
-    "chest": { "sliceIndex": 1, "box_2d": [ymin, xmin, ymax, xmax] },
-    "legs": { "sliceIndex": 2, "box_2d": [ymin, xmin, ymax, xmax] },
-    "hands": [{ "sliceIndex": 1, "box_2d": [ymin, xmin, ymax, xmax] }],
-    "primaryObject": { "sliceIndex": 1, "label": "核心主体焦点", "box_2d": [ymin, xmin, ymax, xmax] }
+    "head": { "box_2d": [ymin, xmin, ymax, xmax] },
+    "eyes": { "box_2d": [ymin, xmin, ymax, xmax] },
+    "chest": { "box_2d": [ymin, xmin, ymax, xmax] },
+    "legs": { "box_2d": [ymin, xmin, ymax, xmax] },
+    "hands": [{ "box_2d": [ymin, xmin, ymax, xmax] }],
+    "primaryObject": { "label": "核心主体焦点", "box_2d": [ymin, xmin, ymax, xmax] }
   }
 }`;
       }
 
-      let userMessagesContent: any[] = [];
-
-      if (hasSlices) {
-        userMessagesContent.push({
-          type: 'text',
-          text: `这是一张纵向全身长图，已沿纵向精准无损切分为 ${slices.length} 个横向 16:9 高清局部特写切片（每个切片均为 100% 原始画面宽度的标准 16:9 画幅，0 黑边，极高分辨率）：`
-        });
-
-        for (let i = 0; i < slices.length; i++) {
-          const s = slices[i];
-          userMessagesContent.push({
-            type: 'text',
-            text: `【切片 ${i} (sliceIndex: ${i}) / 共 ${slices.length} 个切片：${s.label}】（对应原图纵向区间: ${Math.round(s.yStartPercent)}% ~ ${Math.round(s.yStartPercent + s.heightPercent)}%）`
-          });
-          userMessagesContent.push({
-            type: 'image_url',
-            image_url: {
-              url: s.dataUrl || s.imageUrl,
-              detail: 'low'
-            }
-          });
-        }
-
-        userMessagesContent.push({
-          type: 'text',
-          text: `【识别与定位任务要求】:
-1. 观察所有切片中的局部高清画面，识别出全图最核心的人体关键解剖部位与视觉兴趣点（覆盖：面部五官、锁骨颈项、挺拔胸部与深V领口、手指动态、身形腿部线条及核心贴身服饰）；
-2. 必须为每个识别出的部位标注所在切片编号 "sliceIndex": 0, 1, 2...（严格对应上述切片的【sliceIndex: 0】、【sliceIndex: 1】等编号，严禁从 1 开始）；
-3. 以及在该切片 16:9 局部画面中的 2D 包围盒 "box_2d": [ymin, xmin, ymax, xmax]（0~1000 范围整数，紧贴目标像素边缘）；
-${prompt ? `参考提示词: ${prompt}` : ''}
-严格返回纯 JSON 格式。`
-        });
-      } else {
-        const userTextPrompt = `请深入观察并定位此图像的核心视觉焦点。
-【输入画幅说明】: 图像已统一以 16:9 标准横向画幅作为识别基准视角，以确保最佳的 Visual Grounding 空间注意力和解剖定位精度。
+      const userTextPrompt = `请深入观察并定位此图像的核心视觉焦点。
+【目标画幅比例】: ${ratio || '原始画幅'}
 【任务要求】:
-1. 识别并提取图像中最核心的 3~8 个兴趣点 (interestPoints) 及 regions，覆盖人体关键解剖部位（面部五官、锁骨颈项、挺拔胸部与领口、手部动态、身形腿部）及贴身服饰与主体焦点；
-2. 严格利用 Visual Grounding 为每个部位输出相对于输入画面的 2D 包围盒 "box_2d": [ymin, xmin, ymax, xmax]（0~1000 范围整数），务必紧贴目标真实像素边缘；
+1. 识别并提取图像中最核心的 3~8 个兴趣点 (interestPoints) 及 regions，覆盖人体关键解剖部位（面部五官、锁骨颈项、挺拔胸部与领口、手部动态、身形腿部）及贴身服饰；
+2. 严格利用 Visual Grounding 为每个部位输出 "box_2d": [ymin, xmin, ymax, xmax]（0~1000 范围整数），务必紧贴目标真实像素边缘；
 ${prompt ? `参考提示词: ${prompt}` : ''}
 严格返回纯 JSON 格式。`;
-
-        userMessagesContent = [
-          {
-            type: 'image_url',
-            image_url: {
-              url: imageUrl || (slices && slices[0]?.dataUrl),
-              detail: 'low'
-            }
-          },
-          {
-            type: 'text',
-            text: userTextPrompt
-          }
-        ];
-      }
 
       const requestPayload = {
         model: actualModel,
@@ -1359,7 +1281,19 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
           { role: 'system', content: landmarksPromptTemplate },
           {
             role: 'user',
-            content: userMessagesContent
+            content: [
+              {
+                type: 'image_url',
+                image_url: {
+                  url: imageUrl,
+                  detail: 'low'
+                }
+              },
+              {
+                type: 'text',
+                text: userTextPrompt
+              }
+            ]
           }
         ]
       };
@@ -1395,70 +1329,9 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
         parsed = generateFallbackLandmarks(prompt);
       }
 
-      // Process regions from model (supports both Object and Array structures)
-      let rawRegions: Record<string, any> = {};
-      if (Array.isArray(parsed.regions)) {
-        for (const item of parsed.regions) {
-          if (item && typeof item === 'object') {
-            const key = String(item.label || item.id || item.type || item.name || '').trim().toLowerCase();
-            if (key) {
-              if (key.includes('head') || key.includes('头') || key.includes('面') || key.includes('face')) rawRegions.head = item;
-              else if (key.includes('eye') || key.includes('眼')) rawRegions.eyes = item;
-              else if (key.includes('chest') || key.includes('胸') || key.includes('领口') || key.includes('cleavage') || key.includes('neck') || key.includes('锁骨')) rawRegions.chest = item;
-              else if (key.includes('leg') || key.includes('腿') || key.includes('knee') || key.includes('foot') || key.includes('feet') || key.includes('足') || key.includes('鞋')) rawRegions.legs = item;
-              else if (key.includes('hand') || key.includes('手') || key.includes('arm')) {
-                if (!rawRegions.hands) rawRegions.hands = [];
-                rawRegions.hands.push(item);
-              } else {
-                rawRegions[key] = item;
-              }
-            }
-          }
-        }
-      } else if (parsed.regions && typeof parsed.regions === 'object') {
-        rawRegions = parsed.regions;
-      }
-
-      // Helper function to extract and transform coordinates based on slices
-      function parseCentroidAndBox(item: any, fallbackType?: string): { x: number; y: number; box_2d?: [number, number, number, number]; _alreadyGlobal?: boolean } | null {
+      // Helper function to extract (x, y) centroid from box_2d [ymin, xmin, ymax, xmax] (0~1000 or 0~100) or direct coordinates
+      function parseCentroidAndBox(item: any): { x: number; y: number; box_2d?: [number, number, number, number] } | null {
         if (!item || typeof item !== 'object') return null;
-
-        // Parse sliceIndex robustly (handle number, string "0", "1", slice_index, slice)
-        let rawIdx = item.sliceIndex ?? item.slice_index ?? item.slice;
-        let sliceIdx: number | undefined = undefined;
-        if (typeof rawIdx === 'number' && !isNaN(rawIdx)) {
-          sliceIdx = rawIdx;
-        } else if (typeof rawIdx === 'string') {
-          const match = rawIdx.match(/\d+/);
-          if (match) sliceIdx = parseInt(match[0], 10);
-        }
-
-        // Detect 1-based indexing if sliceIdx equals slices.length
-        if (hasSlices && typeof sliceIdx === 'number') {
-          if (sliceIdx >= slices.length && sliceIdx === slices.length) {
-            sliceIdx = sliceIdx - 1; // Convert 1-based to 0-based
-          } else if (sliceIdx < 0 || sliceIdx >= slices.length) {
-            sliceIdx = undefined;
-          }
-        }
-
-        // Semantic fallback if sliceIdx is missing
-        if (hasSlices && sliceIdx === undefined) {
-          const semantic = `${fallbackType || ''} ${item.id || ''} ${item.name || ''} ${item.label || ''} ${item.category || ''}`.toLowerCase();
-          if (/head|face|eye|hair|头|面|眼|发|表情/.test(semantic)) {
-            sliceIdx = 0;
-          } else if (/neck|necklace|collar|chest|cleavage|bust|胸|领口|锁骨|深v/.test(semantic)) {
-            sliceIdx = Math.min(1, slices.length - 1);
-          } else if (/waist|hand|finger|hip|body|腰|手|指|腹|身/.test(semantic)) {
-            sliceIdx = Math.min(slices.length > 3 ? 2 : 1, slices.length - 1);
-          } else if (/leg|foot|feet|knee|ankle|shoe|skirt|dress|腿|足|脚|膝|踝|鞋|裙/.test(semantic)) {
-            sliceIdx = slices.length - 1;
-          } else {
-            sliceIdx = 0;
-          }
-        }
-
-        const slice = (hasSlices && typeof sliceIdx === 'number' && slices[sliceIdx]) ? slices[sliceIdx] : null;
 
         const rawBox = Array.isArray(item.box_2d) ? item.box_2d : (Array.isArray(item.box) ? item.box : null);
         if (rawBox && rawBox.length === 4) {
@@ -1466,15 +1339,11 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
           const isThousandScale = Math.max(b0, b1, b2, b3) > 100;
           const scale = isThousandScale ? 10 : 1;
 
-          let ymin = Math.min(b0, b2) / scale;
-          let ymax = Math.max(b0, b2) / scale;
-          let xmin = Math.min(b1, b3) / scale;
-          let xmax = Math.max(b1, b3) / scale;
-
-          if (slice) {
-            ymin = slice.yStartPercent + ymin * (slice.heightPercent / 100);
-            ymax = slice.yStartPercent + ymax * (slice.heightPercent / 100);
-          }
+          // Standard DeepSeek grounding [ymin, xmin, ymax, xmax]
+          const ymin = Math.min(b0, b2) / scale;
+          const ymax = Math.max(b0, b2) / scale;
+          const xmin = Math.min(b1, b3) / scale;
+          const xmax = Math.max(b1, b3) / scale;
 
           const cx = Math.round(((xmin + xmax) / 2) * 10) / 10;
           const cy = Math.round(((ymin + ymax) / 2) * 10) / 10;
@@ -1483,29 +1352,26 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
             x: Math.max(0, Math.min(100, cx)),
             y: Math.max(0, Math.min(100, cy)),
             box_2d: [ymin, xmin, ymax, xmax],
-            _alreadyGlobal: true,
           };
         }
 
         if (typeof item.x === 'number' && typeof item.y === 'number') {
           let px = item.x;
           let py = item.y;
-          if (px > 100) px /= 10;
-          if (py > 100) py /= 10;
-          if (slice) {
-            py = slice.yStartPercent + py * (slice.heightPercent / 100);
+          if (px > 100 || py > 100) {
+            px /= 10;
+            py /= 10;
           }
           return {
             x: Math.max(0, Math.min(100, Math.round(px * 10) / 10)),
             y: Math.max(0, Math.min(100, Math.round(py * 10) / 10)),
-            _alreadyGlobal: true,
           };
         }
 
         return null;
       }
 
-      // Process interestPoints using Grounding Centroid Calculation
+      // Process interestPoints using DeepSeek Grounding Centroid Calculation
       let rawPoints = Array.isArray(parsed.interestPoints) ? parsed.interestPoints : [];
       let interestPoints: any[] = [];
       const seenPointIds = new Set<string>();
@@ -1513,9 +1379,9 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
       for (let i = 0; i < rawPoints.length; i++) {
         const pt = rawPoints[i];
         if (!pt || typeof pt !== 'object') continue;
-        const pos = parseCentroidAndBox(pt, pt.id || pt.name || pt.category || pt.label);
+        const pos = parseCentroidAndBox(pt);
         if (pos) {
-          const rawId = String(pt.id || pt.name || `pt_${i}`).trim();
+          const rawId = String(pt.id || `pt_${i}`).trim();
           let uniqueId = rawId;
           let counter = 1;
           while (seenPointIds.has(uniqueId)) {
@@ -1525,55 +1391,54 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
 
           interestPoints.push({
             id: uniqueId,
-            label: pt.label || pt.name || '重点特征',
+            label: pt.label || '重点特征',
             x: pos.x,
             y: pos.y,
             importance: typeof pt.importance === 'number' ? pt.importance : 0.85,
             dwellSeconds: typeof pt.dwellSeconds === 'number' ? pt.dwellSeconds : 1.8,
             category: pt.category || 'highlight',
             box_2d: pos.box_2d,
-            _alreadyGlobal: true,
           });
         }
       }
 
-      // Process regions using Grounding Centroid Calculation
+      // Process regions using DeepSeek Grounding Centroid Calculation
+      const rawRegions = parsed.regions || {};
       const regions: any = {};
 
       if (rawRegions.head) {
-        const p = parseCentroidAndBox(rawRegions.head, 'head');
-        if (p) regions.head = { x: p.x, y: p.y, box_2d: p.box_2d, _alreadyGlobal: true };
+        const p = parseCentroidAndBox(rawRegions.head);
+        if (p) regions.head = { x: p.x, y: p.y, box_2d: p.box_2d };
       }
       if (rawRegions.eyes) {
-        const p = parseCentroidAndBox(rawRegions.eyes, 'eyes');
-        if (p) regions.eyes = { x: p.x, y: p.y, box_2d: p.box_2d, _alreadyGlobal: true };
+        const p = parseCentroidAndBox(rawRegions.eyes);
+        if (p) regions.eyes = { x: p.x, y: p.y, box_2d: p.box_2d };
       }
       if (rawRegions.chest) {
-        const p = parseCentroidAndBox(rawRegions.chest, 'chest');
-        if (p) regions.chest = { x: p.x, y: p.y, box_2d: p.box_2d, _alreadyGlobal: true };
+        const p = parseCentroidAndBox(rawRegions.chest);
+        if (p) regions.chest = { x: p.x, y: p.y, box_2d: p.box_2d };
       }
       if (rawRegions.legs) {
-        const p = parseCentroidAndBox(rawRegions.legs, 'legs');
-        if (p) regions.legs = { x: p.x, y: p.y, box_2d: p.box_2d, _alreadyGlobal: true };
+        const p = parseCentroidAndBox(rawRegions.legs);
+        if (p) regions.legs = { x: p.x, y: p.y, box_2d: p.box_2d };
       }
       if (Array.isArray(rawRegions.hands)) {
         regions.hands = rawRegions.hands
-          .map((h: any) => parseCentroidAndBox(h, 'hands'))
+          .map((h: any) => parseCentroidAndBox(h))
           .filter(Boolean)
-          .map((p: any) => ({ x: p.x, y: p.y, box_2d: p.box_2d, _alreadyGlobal: true }));
+          .map((p: any) => ({ x: p.x, y: p.y, box_2d: p.box_2d }));
       } else if (rawRegions.hands) {
-        const p = parseCentroidAndBox(rawRegions.hands, 'hands');
-        if (p) regions.hands = [{ x: p.x, y: p.y, box_2d: p.box_2d, _alreadyGlobal: true }];
+        const p = parseCentroidAndBox(rawRegions.hands);
+        if (p) regions.hands = [{ x: p.x, y: p.y, box_2d: p.box_2d }];
       }
       if (rawRegions.primaryObject) {
-        const p = parseCentroidAndBox(rawRegions.primaryObject, 'primaryObject');
+        const p = parseCentroidAndBox(rawRegions.primaryObject);
         if (p) {
           regions.primaryObject = {
             label: rawRegions.primaryObject.label || '核心主体焦点',
             x: p.x,
             y: p.y,
             box_2d: p.box_2d,
-            _alreadyGlobal: true,
           };
         }
       }
@@ -1589,7 +1454,6 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
             importance: 0.98,
             dwellSeconds: 2.2,
             category: 'face',
-            _alreadyGlobal: true,
           });
         }
         if (regions.chest) {
@@ -1601,7 +1465,6 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
             importance: 0.92,
             dwellSeconds: 1.8,
             category: 'clothing',
-            _alreadyGlobal: true,
           });
         }
         if (regions.hands?.[0]) {
@@ -1613,7 +1476,6 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
             importance: 0.85,
             dwellSeconds: 1.4,
             category: 'anatomy',
-            _alreadyGlobal: true,
           });
         }
         if (regions.legs) {
@@ -1625,7 +1487,6 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
             importance: 0.80,
             dwellSeconds: 1.3,
             category: 'anatomy',
-            _alreadyGlobal: true,
           });
         }
         if (regions.primaryObject) {
@@ -1637,7 +1498,6 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
             importance: 0.90,
             dwellSeconds: 2.0,
             category: 'highlight',
-            _alreadyGlobal: true,
           });
         }
       }
@@ -1656,7 +1516,6 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
             dwellSeconds: 2.0,
             category: 'anatomy',
             box_2d: regions.chest.box_2d,
-            _alreadyGlobal: true,
           });
         }
       }
@@ -1667,7 +1526,6 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
         shotType: parsed.shotType || 'medium_shot',
         interestPoints,
         regions,
-        isGlobalCoordinates: true,
         detectedAt: Date.now(),
         modelUsed: actualModel,
       });
@@ -1747,12 +1605,7 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        hmr: false,
-        ws: false,
-        watch: null,
-      },
+      server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);

@@ -3,7 +3,6 @@ export type AgentToolName =
   | 'page.inspect'
   | 'card.inspect'
   | 'card.generate'
-  | 'card.detectLandmarks'
   | 'ui.actAndObserve'
   | 'sys.updateState'
   | 'sys.endTask'

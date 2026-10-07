@@ -37,7 +37,6 @@ import {
   ScriptProp,
 } from '../types/script';
 import { assetExtractionService } from '../services/assetExtractionService';
-import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks, SquarePadInfo } from '../utils/squareImageLetterbox';
 
 interface SettingsPageProps {
   onClose: () => void;
@@ -137,7 +136,6 @@ const MODEL_OPTIONS: Array<{ value: ExtractionModelType; label: string }> = [
   { value: 'deepseek-v4-pro', label: 'V4 Pro' },
   { value: 'deepseek-v4.1-flash-expires-on-0910', label: 'V4.1 Flash (0910)' },
   { value: 'qwen3.8-flash', label: 'Qwen 3.8 Flash' },
-  { value: 'qwen3-vl-plus', label: 'Qwen3-VL-Plus (多模态视觉)' },
   { value: 'ZHIPU/GLM-5.3-Flash-low', label: 'GLM-5.3-Flash (Low 思考)' },
   { value: 'ZHIPU/GLM-5.3-Flash-high', label: 'GLM-5.3-Flash (High 思考)' },
   { value: 'ZHIPU/GLM-5.3-Flash-max', label: 'GLM-5.3-Flash (Max 思考)' },
@@ -218,7 +216,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
         speak: "正在为你分析画面中的复古奢侈质感..."
       }
     }, null, 2),
-    json_adapter: '{{调用 card.generate, { name: "金发女郎晚礼服", referenceCardIds: ["rshuewfmu", "yow33r73x"], targetCardId: "new", prompt: "A stunning blonde woman with a glamorous silver fringe necklace, wearing a sheer deep-V evening gown, lying on a luxurious bed in a sensual pose.", aspectRatio: "9:16" }}}',
+    json_adapter: '{{调用 card.generate, { referenceCardIds: ["rshuewfmu", "yow33r73x"], targetCardId: "new", prompt: "A stunning blonde woman with a glamorous silver fringe necklace, wearing a sheer deep-V evening gown, lying on a luxurious bed in a sensual pose.", aspectRatio: "9:16" }}}',
     subject_landmarks: JSON.stringify({
       imageUrl: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=512&auto=format&fit=crop&q=60",
       prompt: "一位戴着墨镜的时尚青年在都市街头特写肖像"
@@ -450,7 +448,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
     try {
       let endpoint = '/api/script-toc-pattern';
       let body: any = {};
-      let landmarkPadInfo: SquarePadInfo | null = null;
       const keyToUse = isDashscopeOrGlm(activeModel) ? qwenKey : deepseekKey;
       
       if (selectedNode === 'state_node') {
@@ -499,19 +496,8 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
             prompt: input,
           };
         }
-
-        if (parsedInput.imageUrl) {
-          const slicePkg = await createVerticalWidescreenSlices(parsedInput.imageUrl, 1280);
-          parsedInput.imageUrl = slicePkg.primaryPreviewUrl;
-          if (slicePkg.isSliced) {
-            parsedInput.slices = slicePkg.slices;
-          }
-          landmarkPadInfo = slicePkg.padInfo;
-        }
-
         body = {
           ...parsedInput,
-          ratio: '16:9',
           model: activeModel,
           apiKey: keyToUse
         };
@@ -528,10 +514,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
         const body = await response.json().catch(() => ({}));
         throw new Error(body.error || `HTTP ${response.status}`);
       }
-      let data = await response.json();
-      if (selectedNode === 'subject_landmarks' && landmarkPadInfo && landmarkPadInfo.isPadded) {
-        data = unpadLandmarks(data, landmarkPadInfo);
-      }
+      const data = await response.json();
 
       // Slice scenes if scenePattern exists
       if (data.scenePattern && onUpdateProject && currentProject) {

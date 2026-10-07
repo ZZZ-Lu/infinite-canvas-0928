@@ -206,61 +206,24 @@ function coerceResolutionForSchema(value: any, schema: any) {
   const enumValues = Array.isArray(schema?.enum) ? schema.enum : [];
   if (enumValues.includes(value)) return value;
 
-  const isNumericType = schema?.type === 'integer' || schema?.type === 'number' || (enumValues.length > 0 && enumValues.every((v: any) => typeof v === 'number'));
-  const normValue = String(value).toUpperCase().trim();
-
-  // 1. Exact match case-insensitive
-  const exactHit = enumValues.find((item: any) => String(item).toUpperCase().trim() === normValue);
-  if (exactHit !== undefined) return exactHit;
-
-  // 2. Comprehensive canonical mapping dictionary for WorkRally and standard AI models
-  const resolutionMap: Record<string, { numeric: number; aliases: string[] }> = {
-    '2K': {
-      numeric: 5,
-      aliases: ['5', '2k', '2048', '2560', '1440', 'hd', 'high', '2k_hd', 'qhd'],
-    },
-    '1K': {
-      numeric: 4,
-      aliases: ['4', '1k', '1080', '1080p', '1024', 'standard', 'medium', 'fullhd', 'fhd'],
-    },
-    '1080P': {
-      numeric: 4,
-      aliases: ['4', '1080p', '1080', '1k', '1024', 'standard', 'medium', 'high', 'fhd'],
-    },
-    '4K': {
-      numeric: 6,
-      aliases: ['6', '4k', '4096', '3840', '2160', 'uhd', 'ultra', 'ultra_hd', 'max'],
-    },
-    '720P': {
-      numeric: 3,
-      aliases: ['3', '720p', '720', 'low', 'standard', 'sd'],
-    },
-  };
-
-  const targetConfig = resolutionMap[normValue] || Object.values(resolutionMap).find(cfg => cfg.aliases.includes(String(value).toLowerCase().trim()));
+  const lowerValue = String(value).toLowerCase();
+  const hit = enumValues.find((item: any) => String(item).toLowerCase() === lowerValue);
+  if (hit !== undefined) return hit;
 
   if (enumValues.length > 0) {
-    if (targetConfig) {
-      // Match by numeric value in enum (e.g. 5 for 2K)
-      const numHit = enumValues.find((item: any) => Number(item) === targetConfig.numeric);
-      if (numHit !== undefined) return numHit;
-
-      // Match by string alias
-      const aliasHit = enumValues.find((item: any) => {
-        const itemStr = String(item).toLowerCase().trim();
-        return targetConfig.aliases.includes(itemStr) || targetConfig.aliases.some(a => itemStr === a || itemStr.includes(a));
-      });
-      if (aliasHit !== undefined) return aliasHit;
-    }
-  }
-
-  // If schema expects integer/number (with or without enum)
-  if (isNumericType && targetConfig) {
-    return targetConfig.numeric;
-  }
-
-  if (isNumericType && /^\d+$/.test(String(value))) {
-    return Number(value);
+    const rank: Record<string, string[]> = {
+      '1K': ['1k', 'low', 'standard', '720', '1024', '3'],
+      '2K': ['2k', 'hd', 'high', '1080', '2048'],
+      '4K': ['4k', 'uhd', 'ultra', '4096'],
+      '720p': ['720p', '720', '3', 'low', 'standard'],
+      '1080p': ['1080p', '1080', '2k', 'high', 'hd'],
+    };
+    const aliases = rank[String(value)] || [];
+    const aliasHit = enumValues.find((item: any) => {
+      const text = String(item).toLowerCase();
+      return aliases.some(alias => text === alias || text.includes(alias));
+    });
+    if (aliasHit !== undefined) return aliasHit;
   }
 
   return value;
@@ -293,40 +256,6 @@ function coerceModelForSchema(value: string, schema: any): string {
     return itemNorm.includes(targetNorm) || targetNorm.includes(itemNorm);
   });
   if (partialHit) return partialHit;
-
-  return value;
-}
-
-function coerceRatioForSchema(value: string, schema: any): string {
-  if (!value) return value;
-  const enumValues = Array.isArray(schema?.enum) ? schema.enum : [];
-  if (enumValues.includes(value)) return value;
-
-  const normalize = (s: string) => String(s).toLowerCase().replace(/[^a-z0-9]/g, '').trim();
-  const targetNorm = normalize(value);
-
-  // 1. Exact match case/delimiter insensitive (e.g. "9:16" matches "9/16" or "9:16")
-  const exactHit = enumValues.find((item: any) => normalize(String(item)) === targetNorm);
-  if (exactHit !== undefined) return exactHit;
-
-  // 2. Common alias mapping
-  const ratioAliases: Record<string, string[]> = {
-    '169': ['169', '16:9', '16/9', 'landscape', 'wide', 'horizontal'],
-    '916': ['916', '9:16', '9/16', 'portrait', 'vertical', 'tall'],
-    '11': ['11', '1:1', '1/1', 'square'],
-    '43': ['43', '4:3', '4/3'],
-    '34': ['34', '3:4', '3/4'],
-    '219': ['219', '21:9', '21/9', 'ultrawide'],
-  };
-
-  const matchedAliases = ratioAliases[targetNorm];
-  if (matchedAliases && enumValues.length > 0) {
-    const aliasHit = enumValues.find((item: any) => {
-      const itemNorm = normalize(String(item));
-      return matchedAliases.includes(itemNorm) || matchedAliases.some(a => itemNorm === a);
-    });
-    if (aliasHit !== undefined) return aliasHit;
-  }
 
   return value;
 }
@@ -1090,9 +1019,7 @@ function buildGenerationArgs(targetTool: any, input: {
   args[promptKey] = input.prompt;
 
   const ratioKey = chooseKey(schemaProps, RATIO_KEYS);
-  if (ratioKey) {
-    args[ratioKey] = coerceRatioForSchema(input.ratio, schemaProps[ratioKey]);
-  }
+  if (ratioKey) args[ratioKey] = input.ratio;
 
   const resolutionKey = chooseKey(schemaProps, RESOLUTION_KEYS);
   if (resolutionKey) {
@@ -1706,12 +1633,6 @@ mcpRouter.all('/proxy-media', async (req: Request, res: Response) => {
     res.setHeader('Cache-Control', 'public, max-age=3600');
     if (targetUrl) {
       res.setHeader('X-Refreshed-Media-Url', targetUrl);
-    }
-
-    const downloadFilename = String(req.query.filename || req.query.downloadName || '');
-    if (req.query.download === 'true' || downloadFilename) {
-      const safeFilename = downloadFilename || 'media_original';
-      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeFilename)}"; filename*=UTF-8''${encodeURIComponent(safeFilename)}`);
     }
 
     const contentType = fetchRes.headers.get('content-type') || 'video/mp4';
