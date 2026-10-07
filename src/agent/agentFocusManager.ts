@@ -176,7 +176,7 @@ class AgentFocusManager {
       this.primaryCardId = options.primary;
       this.focusedMap.set(options.primary, {
         cardId: options.primary,
-        role: role === 'working' ? 'working' : role,
+        role: role,
         sourceTool,
         timestamp: Date.now(),
       });
@@ -190,7 +190,7 @@ class AgentFocusManager {
           this.referenceCardIds.add(refId);
           this.focusedMap.set(refId, {
             cardId: refId,
-            role: 'reference',
+            role: role === 'inspect' ? 'inspect' : 'reference',
             sourceTool,
             timestamp: Date.now(),
           });
@@ -253,6 +253,13 @@ class AgentFocusManager {
       if (typeof cardId === 'string' && cardId) {
         this.setCursorMode('inspect');
         this.setPrimaryFocus(cardId, 'inspect', 'card.inspect');
+      }
+    } else if (call.name === 'card.detectLandmarks') {
+      const cardId = call.arguments?.cardId || call.arguments?.targetCardId;
+      if (typeof cardId === 'string' && cardId) {
+        const cleanCardId = cardId.startsWith('canvas.card.') ? cardId.replace('canvas.card.', '') : cardId;
+        this.setCursorMode('working');
+        this.setPrimaryFocus(cleanCardId, 'working', 'card.detectLandmarks');
       }
     } else if (call.name === 'card.generate') {
       const targetCardId = call.arguments?.targetCardId;

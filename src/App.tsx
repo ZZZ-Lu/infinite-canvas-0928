@@ -11,6 +11,7 @@ import { fastGetImageDimensions } from './utils/imageHeader';
 import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold } from './utils/viewportCulling';
 import { buildCardQuadTree, QuadTree, BoundingBox } from './utils/quadTree';
 import { getBottomPanelHeight } from './utils/cardLayout';
+import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
 import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp } from 'lucide-react';
 import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
 import { SettingsPage } from './components/SettingsPage';
@@ -929,6 +930,53 @@ export default function App() {
   cardsRef.current = cards;
   const clipboardRef = useRef<CardData[]>([]);
 
+  const toChineseNumber = (n: number): string => {
+    const digits = ['零', '一', '两', '三', '四', '五', '六', '七', '八', '九', '十'];
+    if (n <= 10) return digits[n];
+    return String(n);
+  };
+
+  const getSelectionPromptText = (selectedCards: CardData[] | null | undefined): string => {
+    if (!selectedCards || selectedCards.length === 0) {
+      return '我能帮什么忙？';
+    }
+
+    const count = selectedCards.length;
+    if (count === 1) {
+      const card = selectedCards[0];
+      const isVideo = Boolean(card.isVideo);
+      const mediaType = isVideo ? '视频' : '图片';
+      const rawName = (card.name || card.fileName || '').replace(/\.[^/.]+$/, '').trim();
+
+      if (rawName && rawName.length <= 14) {
+        return `看到了，选择了${mediaType}“${rawName}”，有什么想法？`;
+      }
+      return `看到了，选择了${isVideo ? '一个视频' : '一张图片'}，有什么想法？`;
+    }
+
+    const videoCount = selectedCards.filter(c => c.isVideo).length;
+    const imageCount = count - videoCount;
+
+    if (videoCount === 0) {
+      return `看到了，选择了${toChineseNumber(imageCount)}张图片，有什么想法？`;
+    }
+    if (imageCount === 0) {
+      return `看到了，选择了${toChineseNumber(videoCount)}个视频，有什么想法？`;
+    }
+    return `看到了，选择了${toChineseNumber(imageCount)}张图片和${toChineseNumber(videoCount)}个视频，有什么想法？`;
+  };
+
+  const isSelectionPromptSpeak = (speak?: string): boolean => {
+    if (!speak) return false;
+    return (
+      speak === '我能帮什么忙？' ||
+      speak.includes('有什么想法？') ||
+      speak.includes('要调整什么？') ||
+      speak.startsWith('看到了') ||
+      speak.startsWith('选中了')
+    );
+  };
+
   const handleStartAgentBoxSelect = useCallback((startX: number, startY: number) => {
     setAgentSelectionBox({
       startX,
@@ -949,7 +997,7 @@ export default function App() {
       const maxY = Math.max(next.startY, next.currentY);
 
       // Simple box intersection math against all cards
-      const newlySelectedIds = cardsRef.current.filter(card => {
+      const newlySelectedCards = cardsRef.current.filter(card => {
         const dim = getCardSize(card);
         return (
           card.x < maxX && 
@@ -957,7 +1005,21 @@ export default function App() {
           card.y < maxY && 
           card.y + dim.height > minY
         );
-      }).map(c => c.id);
+      });
+      const newlySelectedIds = newlySelectedCards.map(c => c.id);
+
+      // Sync focus seamlessly into agentFocusManager
+      if (newlySelectedIds.length > 0) {
+        agentFocusManager.batchSetFocus({
+          primary: newlySelectedIds[0],
+          references: newlySelectedIds.slice(1),
+          role: 'inspect',
+          sourceTool: 'user.box_select',
+          cursorMode: 'inspect',
+        });
+      } else {
+        agentFocusManager.clearAll();
+      }
 
       // Calculate screen position of the prompt bubble
       const screenX = next.startX * tScale.get() + tx.get();
@@ -966,7 +1028,7 @@ export default function App() {
       // Dynamically target these cards under the Agent!
       setAgentQuickInput(prevQuick => {
         const targetId = newlySelectedIds[0] || null;
-        const promptText = newlySelectedIds.length > 0 ? "选中了这组内容，要调整什么？" : "我能帮什么忙？";
+        const promptText = getSelectionPromptText(newlySelectedCards);
         
         setAgentState(prevAgent => ({
           ...prevAgent,
@@ -1018,7 +1080,9 @@ export default function App() {
 
     if (hitCard) {
       setSelectedCardIds([hitCard.id]);
-      const promptText = "选中了这组内容，要调整什么？";
+      agentFocusManager.setPrimaryFocus(hitCard.id, 'inspect', 'user.drag_agent');
+      agentFocusManager.setCursorMode('inspect');
+      const promptText = getSelectionPromptText([hitCard]);
       const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
         ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
         : undefined;
@@ -1044,7 +1108,8 @@ export default function App() {
       });
     } else {
       setSelectedCardIds([]);
-      const promptText = "我能帮什么忙？";
+      agentFocusManager.clearAll();
+      const promptText = getSelectionPromptText([]);
       setAgentState(prev => ({
         ...prev,
         x: finalCanvasX,
@@ -1079,6 +1144,7 @@ export default function App() {
       deleteDraft(currentTarget);
 
       setAgentQuickInput(null);
+      agentFocusManager.clearAll();
     } else {
       // If HUD is hidden, clicking restores it
       const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
@@ -1097,7 +1163,9 @@ export default function App() {
 
       if (hitCard) {
         setSelectedCardIds([hitCard.id]);
-        const promptText = "选中了这组内容，要调整什么？";
+        agentFocusManager.setPrimaryFocus(hitCard.id, 'inspect', 'user.click_pointer');
+        agentFocusManager.setCursorMode('inspect');
+        const promptText = getSelectionPromptText([hitCard]);
         const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
           ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
           : undefined;
@@ -1120,7 +1188,7 @@ export default function App() {
           focusTrigger: Date.now()
         });
       } else {
-        const promptText = "我能帮什么忙？";
+        const promptText = getSelectionPromptText([]);
         setAgentState(prev => ({
           ...prev,
           speak: promptText,
@@ -1139,7 +1207,7 @@ export default function App() {
         });
       }
     }
-  }, [agentState.speak, agentState.x, agentState.y, agentQuickInput?.isOpen, cards, tScale, tx, ty]);
+  }, [agentState.speak, agentState.x, agentState.y, agentQuickInput?.isOpen, agentQuickInput?.targetId, cards, deleteDraft, setCardDrafts, tScale, tx, ty]);
 
   // Canvas Reference Picker Session State
   const [pickerSession, setPickerSession] = useState<{
@@ -1433,29 +1501,55 @@ export default function App() {
   }, [centerCardOnScreen, currentProject]);
   processInspectQueueRef.current = processInspectQueue;
 
-  const detectAndSaveCardLandmarks = useCallback(async (targetCard: CardData, mediaUrl: string) => {
-    if (!mediaUrl || targetCard.landmarks) return;
+  const detectAndSaveCardLandmarks = useCallback(async (
+    targetCard: CardData,
+    mediaUrl?: string,
+    customPrompt?: string,
+    force: boolean = false
+  ) => {
+    if (!force && targetCard.landmarks) {
+      const detectedParts = Object.keys(targetCard.landmarks.regions || {});
+      const pointsCount = Array.isArray(targetCard.landmarks.interestPoints) ? targetCard.landmarks.interestPoints.length : 0;
+      return {
+        success: true,
+        alreadyHadLandmarks: true,
+        cardId: targetCard.id,
+        landmarks: targetCard.landmarks,
+        summary: targetCard.landmarks.summary || '已有主体标注产物',
+        interestPointsCount: pointsCount,
+        detectedParts,
+        regions: targetCard.landmarks.regions,
+        message: `卡片【${targetCard.name || targetCard.id}】已有主体与部位标注（共 ${pointsCount} 个关键点，覆盖: ${detectedParts.join('、') || '全身'}），无需重复计算。如需重新分析，请指定 force: true。`
+      };
+    }
+
     try {
-      let effectiveUrl = mediaUrl;
+      let effectiveUrl = mediaUrl || targetCard.imageUrl || (targetCard as any).url || (targetCard as any).originalUrl || '';
       const b64 = await extractCardImageBase64Ref.current(targetCard);
       if (b64) {
         effectiveUrl = b64;
       }
 
+      if (!effectiveUrl) {
+        throw new Error(`卡片【${targetCard.name || targetCard.id}】暂无可用图像内容（可能未出图或正在生成中）`);
+      }
+
+      // 直接全图传参（不使用切片机制，全画幅原生识别）
       const nodeModels = assetExtractionService.getNodeModels();
       const modelToUse = nodeModels.subjectLandmarksModel || 'deepseek-v4-flash';
       const deepseekKey = localStorage.getItem('deepseek_api_key') || '';
-      const qwenKey = localStorage.getItem('qwen_api_key') || '';
+      const qwenKey = localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || '';
+      const arkKey = localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || '';
+      const isArk = modelToUse.includes('doubao') || modelToUse.includes('seed-2-1') || modelToUse.includes('seed-2.1') || modelToUse.includes('ark') || modelToUse.includes('volces');
       const isDashscope = modelToUse.includes('qwen') || modelToUse.includes('GLM') || modelToUse.includes('ZHIPU');
-      const apiKeyToSend = isDashscope ? (qwenKey || deepseekKey) : (deepseekKey || qwenKey);
+      const apiKeyToSend = isArk ? (arkKey || deepseekKey || qwenKey) : isDashscope ? (qwenKey || deepseekKey) : (deepseekKey || qwenKey);
 
       const res = await fetch('/api/agent/detect-landmarks', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           imageUrl: effectiveUrl,
-          prompt: targetCard.prompt || targetCard.lastGeneratedPrompt || '',
-          ratio: targetCard.ratio || '1:1',
+          prompt: customPrompt || targetCard.prompt || targetCard.lastGeneratedPrompt || '',
           model: modelToUse,
           apiKey: apiKeyToSend || undefined,
         })
@@ -1464,17 +1558,34 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         if (data && data.regions) {
+          const restoredLandmarks = unpadLandmarks(data, null);
+
           setCards(prev => prev.map(c => {
             if (c.id !== targetCard.id) return c;
             return {
               ...c,
-              landmarks: data
+              landmarks: restoredLandmarks
             };
           }), false);
+
+          const detectedParts = Object.keys(restoredLandmarks.regions || {});
+          const pointsCount = Array.isArray(restoredLandmarks.interestPoints) ? restoredLandmarks.interestPoints.length : 0;
+
+          return {
+            success: true,
+            cardId: targetCard.id,
+            summary: restoredLandmarks.summary || '识别完成',
+            interestPointsCount: pointsCount,
+            detectedParts,
+            regions: restoredLandmarks.regions,
+            message: `成功完成卡片【${targetCard.name || targetCard.id}】的主体识别与部位标注（共提取 ${pointsCount} 个关键解剖兴趣点，覆盖部位: ${detectedParts.join('、') || '全身'}）。`
+          };
         }
       }
+      throw new Error(`主体识别节点未返回有效的部位标注数据`);
     } catch (err) {
       console.warn('[LandmarksNode] Auto-detection error:', err);
+      throw err;
     }
   }, []);
 
@@ -3205,6 +3316,22 @@ export default function App() {
         : undefined;
       const lastReply = lastReplyObj ? (lastReplyObj.shortText || lastReplyObj.text) : undefined;
 
+      // Sync focus into agentFocusManager
+      if (targetIds && targetIds.length > 0) {
+        agentFocusManager.batchSetFocus({
+          primary: targetIds[0],
+          references: targetIds.slice(1),
+          role: 'inspect',
+          sourceTool: 'user.context_menu',
+          cursorMode: 'inspect',
+        });
+      } else if (targetId) {
+        agentFocusManager.setPrimaryFocus(targetId, 'inspect', 'user.context_menu');
+        agentFocusManager.setCursorMode('inspect');
+      } else {
+        agentFocusManager.clearAll();
+      }
+
       setAgentQuickInput({
         isOpen: true,
         targetId,
@@ -3214,6 +3341,7 @@ export default function App() {
       });
     } else {
       setAgentQuickInput(null);
+      agentFocusManager.clearAll();
     }
 
     const menuWidth = 260;
@@ -3242,7 +3370,10 @@ export default function App() {
     }
 
     if (ownerId === 'user' && !isAgentRunning) {
-      const promptText = targetId ? "选中了这组内容，要调整什么？" : "我能帮什么忙？";
+      const selectedCards = targetIds && targetIds.length > 0
+        ? cardsRef.current.filter(c => targetIds.includes(c.id))
+        : (targetId ? (cardsRef.current.find(c => c.id === targetId) ? [cardsRef.current.find(c => c.id === targetId)!] : []) : (selectedCardIds.length > 0 ? cardsRef.current.filter(c => selectedCardIds.includes(c.id)) : []));
+      const promptText = getSelectionPromptText(selectedCards);
       const yOffset = targetId ? 40 : 82;
       setAgentState(prev => ({
         ...prev,
@@ -3980,11 +4111,39 @@ export default function App() {
 
       return response;
     }
+    if (call.name === 'card.detectLandmarks') {
+      const cardId = String(call.arguments.cardId || call.arguments.targetCardId || '');
+      const cleanCardId = cardId.startsWith('canvas.card.') ? cardId.replace('canvas.card.', '') : cardId;
+      const customPrompt = typeof call.arguments.prompt === 'string' ? call.arguments.prompt.trim() : undefined;
+      const force = call.arguments.force !== false; // 默认 true: 强制执行重新识别
+
+      const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+      const card = allCards.find(c => c.id === cleanCardId);
+
+      if (!card) {
+        throw new Error(`未找到 ID 为 ${cardId} 的卡片。请核对当前页面观察可见卡片。`);
+      }
+
+      agentFocusManager.setCursorMode('working');
+      agentFocusManager.setPrimaryFocus(cleanCardId, 'working', 'card.detectLandmarks');
+      await animateMoveToTarget('canvas.card.' + cleanCardId);
+
+      const mediaUrl = card.imageUrl || card.url || card.originalUrl || '';
+      const result = await detectAndSaveCardLandmarks(card, mediaUrl, customPrompt, force);
+      return result;
+    }
     if (call.name === 'card.generate') {
       const rawTargetCardId = String(call.arguments.targetCardId || call.arguments.cardId || '');
       const prompt = typeof call.arguments.prompt === 'string' ? call.arguments.prompt.trim() : '';
       const aspectRatio = typeof call.arguments.aspectRatio === 'string' ? call.arguments.aspectRatio : undefined;
       const autoStart = call.arguments.autoStart !== false; // Defaults to true unless explicitly set to false
+
+      // 提取规范的卡片名称（短小精炼、辨识度高）
+      const rawName = typeof call.arguments.name === 'string' ? call.arguments.name.trim() :
+                      typeof call.arguments.cardName === 'string' ? call.arguments.cardName.trim() :
+                      typeof call.arguments.title === 'string' ? call.arguments.title.trim() : '';
+      const fallbackName = prompt ? prompt.slice(0, 10).replace(/[^\w\u4e00-\u9fa5]/g, '') : '生图卡片';
+      const cardName = rawName || fallbackName || '生图卡片';
 
       // Extract referenceCardIds array from tool arguments
       let rawRefIds: string[] = [];
@@ -4049,6 +4208,8 @@ export default function App() {
           // Inherit sourceForPos parameters (prompt, ratio, res, mcpModel, referenceImages)
           // UNLESS Agent explicitly provided custom overrides in arguments!
           const forkConfig: Partial<CardData> = {
+            name: cardName,
+            fileName: cardName,
             prompt: prompt || sourceForPos.prompt || '基于参考素材创作的生图卡片',
             ratio: aspectRatio || sourceForPos.ratio || '16:9',
             res: sourceForPos.res || '2K',
@@ -4071,6 +4232,8 @@ export default function App() {
           const newId = `card_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
           const newCardObj: CardData = {
             id: newId,
+            name: cardName,
+            fileName: cardName,
             x: 200,
             y: 200,
             imageUrl: '',
@@ -4091,6 +4254,8 @@ export default function App() {
         activeCard = targetCard;
         if (activeCard && (collectedRefImages.length > 0 || collectedRefSourceIds.length > 0)) {
           handleUpdateCard(activeCard.id, {
+            name: cardName,
+            fileName: cardName,
             referenceSourceIds: Array.from(new Set([...(activeCard.referenceSourceIds || []), ...collectedRefSourceIds])),
             referenceImages: dedupeReferenceImages([...(activeCard.referenceImages || []), ...collectedRefImages]),
           }, false);
@@ -4103,6 +4268,8 @@ export default function App() {
 
       if (activeCard) {
         handleUpdateCard(activeCard.id, {
+          name: cardName,
+          fileName: cardName,
           prompt: effectivePrompt,
           ratio: effectiveRatio,
         }, false);
@@ -4132,14 +4299,15 @@ export default function App() {
         return {
           success: true,
           cardId: activeCardId,
+          cardName: cardName,
           cardState: 'draft',
           isForked,
           autoStarted: false,
           prompt: effectivePrompt,
           referenceCount: collectedRefImages.length,
           message: isForked
-            ? `从卡片【${cleanTargetId || '源卡片'}】复刻衍生出生图卡片【${activeCardId}】，参考图与新提示词已就位（处于草稿待生成状态）。`
-            : `生图卡片【${activeCardId}】已配置完成，参考图与提示词已就位（处于草稿待生成状态）。`
+            ? `从卡片【${cleanTargetId || '源卡片'}】复刻衍生出生图卡片【${cardName} (${activeCardId})】，参考图与新提示词已就位（处于草稿待生成状态）。`
+            : `生图卡片【${cardName} (${activeCardId})】已配置完成，参考图与提示词已就位（处于草稿待生成状态）。`
         };
       }
 
@@ -4200,14 +4368,15 @@ export default function App() {
             success: true,
             status: 'pending',
             cardId: activeCardId,
+            cardName: cardName,
             cardState: 'generating',
             isForked,
             autoStarted: true,
             mcpTaskId: taskId,
             prompt: effectivePrompt,
             message: isForked
-              ? `已从【${cleanTargetId || '源卡片'}】复刻衍生新卡片【${activeCardId}】并在界面启动排队渲染，任务句柄 [${taskId}]。`
-              : `生图卡片【${activeCardId}】已在界面启动加载渲染，任务句柄 [${taskId}] 正在排队中。`
+              ? `已从【${cleanTargetId || '源卡片'}】复刻衍生新卡片【${cardName} (${activeCardId})】并在界面启动排队渲染，任务句柄 [${taskId}]。`
+              : `生图卡片【${cardName} (${activeCardId})】已在界面启动加载渲染，任务句柄 [${taskId}] 正在排队中。`
           };
         }
 
@@ -4244,12 +4413,13 @@ export default function App() {
         return {
           success: true,
           cardId: activeCard.id,
+          cardName: cardName,
           cardState: 'completed',
           imageUrl: newMediaUrl,
           prompt: effectivePrompt,
           message: isNewTarget
-            ? `已自动新建独立生图卡片【${activeCard.id}】并绑定 ${collectedRefImages.length} 张参考图素材，画面已成功渲染发布！`
-            : '画面已成功生成并实时更新挂载到画布卡片上！'
+            ? `已自动新建独立生图卡片【${cardName} (${activeCard.id})】并绑定 ${collectedRefImages.length} 张参考图素材，画面已成功渲染发布！`
+            : `卡片【${cardName}】画面已成功生成并实时更新挂载到画布卡片上！`
         };
       } catch (err) {
         handleUpdateCard(activeCard.id, {
@@ -4372,12 +4542,11 @@ export default function App() {
       return await compressImageToJpegBase64(url);
     };
 
-    // 1. Check raw binary data on the card (Rule 3: trueOriginalFileData > originalFileData > fileData)
+    // 1. Check raw binary data on the card's OWN image (Rule 3: trueOriginalFileData > originalFileData > fileData)
     const directBlobs = [
       card.trueOriginalFileData,
       card.originalFileData,
       card.fileData,
-      card.referenceImageFileData,
     ];
     for (const b of directBlobs) {
       if (b instanceof Blob && b.size > 0) {
@@ -4388,13 +4557,12 @@ export default function App() {
       }
     }
 
-    // 2. Check direct card image URLs
+    // 2. Check direct card own image URLs (trueOriginalImageUrl > originalImageUrl > imageUrl > thumbnailUrl)
     const candidateUrls = [
       card.trueOriginalImageUrl,
       card.originalImageUrl,
       card.imageUrl,
       card.thumbnailUrl,
-      card.referenceImageUrl,
     ].filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
 
     for (const url of candidateUrls) {
@@ -4402,27 +4570,7 @@ export default function App() {
       if (res) return res;
     }
 
-    // 3. Check referenceImages array (e.g. prompt card with reference image attached)
-    if (Array.isArray(card.referenceImages) && card.referenceImages.length > 0) {
-      for (const ref of card.referenceImages) {
-        if (ref.fileData instanceof Blob && ref.fileData.size > 0) {
-          try {
-            const res = await convertBlobToBase64(ref.fileData);
-            if (res) return res;
-          } catch {}
-        }
-        if (ref.url) {
-          const res = await convertUrlToBase64(ref.url);
-          if (res) return res;
-        }
-        if (ref.thumbnailUrl) {
-          const res = await convertUrlToBase64(ref.thumbnailUrl);
-          if (res) return res;
-        }
-      }
-    }
-
-    // 4. Check global thumbnail cache
+    // 3. Check global thumbnail cache for card's own image
     const cachedThumb = thumbCache.get(card.id) || (card.imageUrl ? thumbCache.get(card.imageUrl) : undefined);
     if (cachedThumb && cachedThumb.startsWith('data:image/')) {
       return cachedThumb;
@@ -4508,11 +4656,25 @@ export default function App() {
     }
 
     try {
-      const agentModel = assetExtractionService.getNodeModels().agentModel;
+      const nodeModels = assetExtractionService.getNodeModels();
+      const agentModel = nodeModels.agentModel;
+      const isArkModel = agentModel.includes('doubao') || agentModel.includes('seed-2-1') || agentModel.includes('seed-2.1') || agentModel.includes('ark') || agentModel.includes('volces');
       const isDashscopeModel = agentModel.startsWith('qwen') || agentModel.includes('glm') || agentModel.includes('ZHIPU') || agentModel.includes('zhipu');
-      const savedKey = isDashscopeModel
+      const savedKey = isArkModel
+        ? (localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key'))
+        : isDashscopeModel
         ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key'))
         : localStorage.getItem('deepseek_api_key');
+
+      const jsonAdapterModel = nodeModels.jsonAdapterModel || 'deepseek-v4-flash';
+      const isArkAdapter = jsonAdapterModel.includes('doubao') || jsonAdapterModel.includes('seed-2-1') || jsonAdapterModel.includes('seed-2.1') || jsonAdapterModel.includes('ark') || jsonAdapterModel.includes('volces');
+      const isDashscopeAdapter = jsonAdapterModel.startsWith('qwen') || jsonAdapterModel.includes('glm') || jsonAdapterModel.includes('ZHIPU') || jsonAdapterModel.includes('zhipu');
+      const jsonAdapterKey = isArkAdapter
+        ? (localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key'))
+        : isDashscopeAdapter
+        ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key'))
+        : localStorage.getItem('deepseek_api_key');
+
       const toolConfig = getAgentToolConfig();
       const enabledTools = AGENT_TOOL_REGISTRY.filter((tool) => toolConfig[tool.id]).map((tool) => tool.id);
 
@@ -4553,7 +4715,12 @@ export default function App() {
               },
               images: task.images || overrideImages,
               cardContext: task.cardContext || effectiveCardContext,
-              apiKey: savedKey, modelType: agentModel, enabledTools, requireTool,
+              apiKey: savedKey, 
+              modelType: agentModel, 
+              enabledTools, 
+              requireTool,
+              jsonAdapterModel,
+              jsonAdapterKey,
             };
             updateAgentRuntimeTrace(task, trace => ({
               ...trace,
@@ -4675,8 +4842,11 @@ export default function App() {
 
             try {
               const agentModel = assetExtractionService.getNodeModels().agentModel;
+              const isArkModel = agentModel.includes('doubao') || agentModel.includes('seed-2-1') || agentModel.includes('seed-2.1') || agentModel.includes('ark') || agentModel.includes('volces');
               const isDashscopeModel = agentModel.startsWith('qwen') || agentModel.includes('glm') || agentModel.includes('ZHIPU') || agentModel.includes('zhipu');
-              const savedKey = isDashscopeModel
+              const savedKey = isArkModel
+                ? (localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key') || '')
+                : isDashscopeModel
                 ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key') || '')
                 : (localStorage.getItem('deepseek_api_key') || '');
 
@@ -4782,6 +4952,9 @@ export default function App() {
 
             if (status === 'completed' || status === 'cancelled' || status === 'failed') {
               if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
+              if (!isProcessingInspectQueueRef.current) {
+                agentFocusManager.clearAll();
+              }
             }
 
             // If task is bound to a specific card context, sync answer events to that card's chat history
@@ -4965,6 +5138,7 @@ export default function App() {
 
   const handleCancelTask = () => {
     inspectQueueRef.current = [];
+    agentFocusManager.clearAll();
     if (!runtimeRef.current || !activeTaskIdRef.current) return;
     runtimeRef.current.cancel(activeTaskIdRef.current);
     setIsAgentRunning(false);
@@ -4998,7 +5172,7 @@ export default function App() {
           if (agentQuickInput?.isOpen) {
             return prev;
           }
-          if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
+          if (isSelectionPromptSpeak(prev.speak)) {
             return { ...prev, speak: undefined };
           }
           return prev;
@@ -6147,7 +6321,7 @@ export default function App() {
         }}
       />
 
-      {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.60 or during staggered DOM loading) */}
+      {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.40 or during staggered DOM loading) */}
       <NanoLodCanvas
         cards={cards}
         selectedCardIds={selectedCardIds}
@@ -6189,7 +6363,7 @@ export default function App() {
         style={{ transformOrigin: '0 0', x: tx, y: ty, scale: tScale }}
       >
 
-        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.60), unmount all DOM cards for ultra-fast Hybrid Canvas rendering */}
+        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.40), unmount all DOM cards for ultra-fast Hybrid Canvas rendering */}
         {!isOverviewMode && isDomCardsActive && visibleCards.map(card => {
           if (!renderedCardIds.has(card.id)) return null;
           const hasImage = Boolean(card.imageUrl || card.originalImageUrl || card.thumbnailUrl);
@@ -6210,7 +6384,7 @@ export default function App() {
           const isQcInspectTarget = Boolean(focusItem?.sourceTool?.includes('qc'));
           const agentInspectScenario: 'qc' | 'quickInput' | 'compare' = isQcInspectTarget
             ? 'qc'
-            : (isQuickInputTarget ? 'quickInput' : (focusItem?.sourceTool?.includes('compare') ? 'compare' : 'qc'));
+            : (focusItem?.sourceTool?.includes('compare') ? 'compare' : 'quickInput');
 
           return (
             <GenerationCard 
@@ -6392,9 +6566,24 @@ export default function App() {
                 },
                 onSubmit: async (prompt: string) => {
                   const currentTarget = agentQuickInput.targetId;
+                  const targetIds = agentQuickInput.targetIds || (currentTarget ? [currentTarget] : []);
                   const currentKey = currentTarget || 'global';
                   setCardDrafts(prev => ({ ...prev, [currentKey]: '' }));
                   deleteDraft(currentKey); // Delete draft from IndexedDB on submit
+
+                  // Unbroken Focus Relay: seamlessly retain focus on targeted cards while Agent thinks
+                  if (targetIds.length > 0) {
+                    agentFocusManager.batchSetFocus({
+                      primary: targetIds[0],
+                      references: targetIds.slice(1),
+                      role: 'inspect',
+                      sourceTool: 'user.prompt.thinking',
+                      cursorMode: 'inspect',
+                    });
+                  } else if (currentTarget) {
+                    agentFocusManager.setPrimaryFocus(currentTarget, 'inspect', 'user.prompt.thinking');
+                  }
+
                   setAgentQuickInput(null);
                   if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
                   setAgentState(prev => ({
@@ -6415,8 +6604,9 @@ export default function App() {
                   setCardDrafts(prev => ({ ...prev, [currentTarget]: '' }));
                   deleteDraft(currentTarget); // Delete draft from IndexedDB on close
                   setAgentQuickInput(null);
+                  agentFocusManager.clearAll();
                   setAgentState(prev => {
-                    if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
+                    if (isSelectionPromptSpeak(prev.speak)) {
                       return { ...prev, speak: undefined };
                     }
                     return prev;
@@ -6606,8 +6796,11 @@ export default function App() {
                 const prompt = agentPrompt.trim();
                 setAgentPrompt('');
                 setContextMenus(prev => { const next = {...prev}; delete next['user']; return next; });
+                if (currentTarget) {
+                  agentFocusManager.setPrimaryFocus(currentTarget, 'inspect', 'user.prompt.thinking');
+                }
                 setAgentState(prev => {
-                  if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
+                  if (isSelectionPromptSpeak(prev.speak)) {
                     return { ...prev, speak: undefined };
                   }
                   return prev;
@@ -6622,8 +6815,9 @@ export default function App() {
               onClose={() => {
                 setContextMenus(prev => { const next = {...prev}; delete next['user']; return next; });
                 setAgentQuickInput(null);
+                agentFocusManager.clearAll();
                 setAgentState(prev => {
-                  if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
+                  if (isSelectionPromptSpeak(prev.speak)) {
                     return { ...prev, speak: undefined };
                   }
                   return prev;
@@ -6631,7 +6825,7 @@ export default function App() {
               }}
               onAction={async (action, targetId) => {
                 setAgentState(prev => {
-                  if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
+                  if (isSelectionPromptSpeak(prev.speak)) {
                     return { ...prev, speak: undefined };
                   }
                   return prev;

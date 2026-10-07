@@ -37,6 +37,7 @@ import {
   ScriptProp,
 } from '../types/script';
 import { assetExtractionService } from '../services/assetExtractionService';
+import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks, SquarePadInfo } from '../utils/squareImageLetterbox';
 
 interface SettingsPageProps {
   onClose: () => void;
@@ -136,6 +137,8 @@ const MODEL_OPTIONS: Array<{ value: ExtractionModelType; label: string }> = [
   { value: 'deepseek-v4-pro', label: 'V4 Pro' },
   { value: 'deepseek-v4.1-flash-expires-on-0910', label: 'V4.1 Flash (0910)' },
   { value: 'qwen3.8-flash', label: 'Qwen 3.8 Flash' },
+  { value: 'qwen3-vl-plus', label: 'Qwen3-VL-Plus (多模态视觉)' },
+  { value: 'doubao-seed-2-1-pro-260915', label: 'Doubao Seed 2.1 Pro (火山方舟/多模态)' },
   { value: 'ZHIPU/GLM-5.3-Flash-low', label: 'GLM-5.3-Flash (Low 思考)' },
   { value: 'ZHIPU/GLM-5.3-Flash-high', label: 'GLM-5.3-Flash (High 思考)' },
   { value: 'ZHIPU/GLM-5.3-Flash-max', label: 'GLM-5.3-Flash (Max 思考)' },
@@ -216,7 +219,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
         speak: "正在为你分析画面中的复古奢侈质感..."
       }
     }, null, 2),
-    json_adapter: '{{调用 card.generate, { referenceCardIds: ["rshuewfmu", "yow33r73x"], targetCardId: "new", prompt: "A stunning blonde woman with a glamorous silver fringe necklace, wearing a sheer deep-V evening gown, lying on a luxurious bed in a sensual pose.", aspectRatio: "9:16" }}}',
+    json_adapter: '{{调用 card.generate, { name: "金发女郎晚礼服", referenceCardIds: ["rshuewfmu", "yow33r73x"], targetCardId: "new", prompt: "A stunning blonde woman with a glamorous silver fringe necklace, wearing a sheer deep-V evening gown, lying on a luxurious bed in a sensual pose.", aspectRatio: "9:16" }}}',
     subject_landmarks: JSON.stringify({
       imageUrl: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=512&auto=format&fit=crop&q=60",
       prompt: "一位戴着墨镜的时尚青年在都市街头特写肖像"
@@ -227,6 +230,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
   const [nodeModels, setNodeModels] = useState<NodeModelConfig>(() => assetExtractionService.getNodeModels());
   const [deepseekKey, setDeepseekKey] = useState(() => localStorage.getItem('deepseek_api_key') || '');
   const [qwenKey, setQwenKey] = useState(() => localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || '');
+  const [arkKey, setArkKey] = useState(() => localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || '');
   const [showKeys, setShowKeys] = useState(false);
   const [showModels, setShowModels] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<{ state: 'testing' | 'success' | 'error'; message: string } | null>(null);
@@ -380,17 +384,28 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
     localStorage.setItem('deepseek_api_key', deepseekKey);
     localStorage.setItem('qwen_api_key', qwenKey);
     localStorage.setItem('glm_api_key', qwenKey);
+    localStorage.setItem('ark_api_key', arkKey);
+    localStorage.setItem('volcengine_api_key', arkKey);
     setShowKeys(false);
   };
 
-  const isDashscopeOrGlm = (model?: string) =>
-    Boolean(model && (model.startsWith('qwen') || model.includes('glm') || model.includes('ZHIPU') || model.includes('zhipu')));
+  const getKeyForModel = (model?: string) => {
+    if (!model) return deepseekKey || qwenKey || arkKey;
+    const m = model.toLowerCase();
+    if (m.includes('doubao') || m.includes('seed-2-1') || m.includes('seed-2.1') || m.includes('ark') || m.includes('volces')) {
+      return arkKey || deepseekKey || qwenKey;
+    }
+    if (m.startsWith('qwen') || m.includes('glm') || m.includes('zhipu') || m.includes('dashscope')) {
+      return qwenKey || deepseekKey || arkKey;
+    }
+    return deepseekKey || qwenKey || arkKey;
+  };
 
   const testConnection = async () => {
     setConnectionStatus({ state: 'testing', message: '正在测试连接…' });
     try {
       const activeModel = nodeModels.agentModel || 'deepseek-v4-flash';
-      const keyToTest = isDashscopeOrGlm(activeModel) ? qwenKey : deepseekKey;
+      const keyToTest = getKeyForModel(activeModel);
       const response = await fetch('/api/generate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -448,7 +463,8 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
     try {
       let endpoint = '/api/script-toc-pattern';
       let body: any = {};
-      const keyToUse = isDashscopeOrGlm(activeModel) ? qwenKey : deepseekKey;
+      let landmarkPadInfo: SquarePadInfo | null = null;
+      const keyToUse = getKeyForModel(activeModel);
       
       if (selectedNode === 'state_node') {
         endpoint = '/api/agent/update-state-node';
@@ -464,6 +480,15 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
         body = {
           ...parsedInput,
           model: activeModel,
+          apiKey: keyToUse
+        };
+      } else if (selectedNode === 'json_adapter') {
+        endpoint = '/api/agent/json-adapter';
+        body = {
+          input,
+          sampleText: input,
+          systemPrompt: activePrompt,
+          modelType: activeModel,
           apiKey: keyToUse
         };
       } else if (selectedNode === 'change_assess') {
@@ -496,6 +521,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
             prompt: input,
           };
         }
+
         body = {
           ...parsedInput,
           model: activeModel,
@@ -514,7 +540,10 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
         const body = await response.json().catch(() => ({}));
         throw new Error(body.error || `HTTP ${response.status}`);
       }
-      const data = await response.json();
+      let data = await response.json();
+      if (selectedNode === 'subject_landmarks' && landmarkPadInfo && landmarkPadInfo.isPadded) {
+        data = unpadLandmarks(data, landmarkPadInfo);
+      }
 
       // Slice scenes if scenePattern exists
       if (data.scenePattern && onUpdateProject && currentProject) {
@@ -939,6 +968,9 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
 
             <div className="mt-4 flex items-center"><label className="text-xs font-medium">Qwen / GLM API Key (DashScope)</label></div>
             <input type="password" value={qwenKey} onChange={(event) => setQwenKey(event.target.value)} placeholder="sk-..." className="mt-2 h-10 w-full rounded-lg border border-slate-200 bg-transparent px-3 text-sm outline-none focus:border-violet-400 dark:border-white/10" />
+
+            <div className="mt-4 flex items-center"><label className="text-xs font-medium">Doubao / Ark API Key (火山引擎方舟)</label></div>
+            <input type="password" value={arkKey} onChange={(event) => setArkKey(event.target.value)} placeholder="sk-..." className="mt-2 h-10 w-full rounded-lg border border-slate-200 bg-transparent px-3 text-sm outline-none focus:border-violet-400 dark:border-white/10" />
 
             <div className="mt-4 flex items-center justify-between">
               <span className="text-[11px] text-slate-400">将测试当前选择的 Agent 模型的可用性</span>

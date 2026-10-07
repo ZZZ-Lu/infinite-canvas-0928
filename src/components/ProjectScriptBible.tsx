@@ -329,9 +329,12 @@ export function ProjectScriptBible({
         const deepseekKey = localStorage.getItem('deepseek_api_key') || '';
         const qwenKey = localStorage.getItem('qwen_api_key') || '';
         const glmKey = localStorage.getItem('glm_api_key') || '';
+        const arkKey = localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || '';
         
         let apiKey = deepseekKey;
-        if (activeModel.includes('qwen') || activeModel.includes('dashscope')) {
+        if (activeModel.includes('doubao') || activeModel.includes('seed-2-1') || activeModel.includes('seed-2.1') || activeModel.includes('ark') || activeModel.includes('volces')) {
+          apiKey = arkKey || deepseekKey || qwenKey;
+        } else if (activeModel.includes('qwen') || activeModel.includes('dashscope')) {
           apiKey = qwenKey;
         } else if (activeModel.includes('glm')) {
           apiKey = glmKey;

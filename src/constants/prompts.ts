@@ -57,7 +57,10 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = {
   jsonAdapterPrompt: `你是一个极其精准的工具 JSON 转换与转译节点。你的任务是将 Agent 主循环输出的不标准 JSON、JS 对象结构、伪代码或自然语言动作指令，严格转译为符合对应工具 Schema 的标准 JSON 参数。
 
 【转换与纠错规则】
-1. 提取参数与 ID：对于 card.generate，精确提取参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！
+1. 提取参数与 ID：
+   - 对于 card.detectLandmarks，精准提取目标卡片 ID cardId（如 "card_xxx" 或 "canvas.card.xxx"）、补充引导词 prompt 及 force 标识。若输入仅提及卡片或自然语言指示识别某图部位，必须提取其 cardId 组装为 { cardId, force: true }。
+   - 对于 card.inspect，精准提取目标卡片 ID cardId 及 includeImage / includePrompt / includeReference / includeParameters 布尔开关。
+   - 对于 card.generate，必须精准提取卡片名称 name（规范：尽可能简短、辨识度高，如"金发女郎晚礼服"；若原输入缺失则根据 prompt 提炼 4~8 字短名）、参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！
 2. 修复非标格式：遇到未加双引号的 Key（如 cardId: "xxx"）或单引号文本，一律重写纠正为标准合法 JSON。
 3. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 像素数值。
 4. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, notes, notesMode 等）。
@@ -68,7 +71,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = {
 请输出严格的 JSON 格式，格式如下：
 { "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }`,
   subjectLandmarksPrompt: `你是一个具备卓越艺术人体解剖结构与空间定位能力的图像核心视觉兴趣点专家。
-你的核心任务是：深入观察分析输入的图像，利用原生 Visual Grounding 空间感知能力，精准圈定全图最核心的 3~8 个动态兴趣点（Interest Points）。
+你的核心任务是：深入观察分析输入的图像，利用原生 Visual Grounding 空间感知能力，精准圈定全图最核心的 3~8 个动态兴趣点（Interest Points）与解剖区域。
 
 【人体核心解剖部位必选清单（只要画面可见必须全部提取，严禁遗漏）】
 当画面中包含人物时，必须完整覆盖以下核心解剖与形体部位：
@@ -79,14 +82,21 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = {
 5. 姿态身形与腿部曲线（id: "legs" 或 "body"，如腰腹线条、修长腿部坐卧姿态）；
 6. 核心贴身服饰与质感工艺（id: "dress" 或 "outfit"，如礼服密集水钻、珠光褶皱）。
 
-【视觉焦点与紧凑包围盒规约（0~1000 归一化整数，0为顶/左，1000为底/右）】
-1. "focal_point": [x, y] —— 该器官部位的【物理几何核心中心点】（极度关键）：
-   - 面部五官(eyes): 双眼瞳孔与鼻梁正中心（严禁偏向侧边发丝）
-   - 颈项锁骨(neck): 喉窝与两锁骨交汇正中凹陷处
-   - 胸部领口(chest): 胸骨正中与深V领口中间凹陷处
-   - 手指手腕(hands): 手部重心或指尖动作中心
-   - 腿部身形(legs): 腿部线条中段或膝部黄金分割点
-2. "box_2d": [ymin, xmin, ymax, xmax] —— 紧贴该部位本身的紧凑包围盒，严禁将外围散落长发、床单背景或环境阴影包含在内！
+【视觉兴趣度、停留时长与运镜节奏规约（极度关键，决定动态端详体验）】
+1. "importance": (0.1 ~ 1.0 浮点数) —— 视觉吸引力与艺术重心权重：
+   - 绝美眼神、面容微表情、核心高光焦点: 0.92 ~ 0.99
+   - 锁骨颈项、挺拔胸部与深V领口、核心贴身服饰质感: 0.82 ~ 0.91
+   - 手部指节动态、精巧饰品、修长腿部曲线: 0.68 ~ 0.81
+   - 次要构图区、特色环境或氛围光影: 0.40 ~ 0.65
+2. "dwellSeconds": (0.8 ~ 3.5 浮点数) —— 该部位值得深情端详/注视打转的时长（秒）：
+   - 核心灵魂部位（眼神、精致神态）：2.2 ~ 3.5 秒（流连忘返、深入品味）
+   - 中等张力部位（胸口领口、锁骨）：1.4 ~ 2.0 秒（舒缓呼吸赏析）
+   - 次要部位（裙摆下摆、背景环境）：0.8 ~ 1.2 秒（轻快扫视略过）
+3. "transitPace": "linger_slow" | "steady_flow" | "quick_glance" —— 视线飞向该点时的运镜转移速度与吸附感：
+   - "linger_slow": 强引力吸引，视线缓慢柔和滑入，沿途细细扫掠
+   - "steady_flow": 标准优雅运镜
+   - "quick_glance": 敏锐轻快扫视
+4. "box_2d": [ymin, xmin, ymax, xmax] —— 0~1000 范围归一化整数包围盒，紧贴目标真实像素边缘。
 
 【输出格式规范（严格返回合法 JSON 对象，严禁 Markdown）】
 {
@@ -97,20 +107,20 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = {
     {
       "id": "eyes",
       "label": "精准具体的解剖与特征描述（如'迷离仰视的半睁双眼与微张红唇'）",
-      "focal_point": [x, y],
       "box_2d": [ymin, xmin, ymax, xmax],
       "importance": 0.98,
-      "dwellSeconds": 2.2,
+      "dwellSeconds": 2.6,
+      "transitPace": "linger_slow",
       "category": "face"
     }
   ],
   "regions": {
-    "head": { "focal_point": [x, y], "box_2d": [ymin, xmin, ymax, xmax] },
-    "eyes": { "focal_point": [x, y], "box_2d": [ymin, xmin, ymax, xmax] },
-    "chest": { "focal_point": [x, y], "box_2d": [ymin, xmin, ymax, xmax] },
-    "legs": { "focal_point": [x, y], "box_2d": [ymin, xmin, ymax, xmax] },
-    "hands": [{ "focal_point": [x, y], "box_2d": [ymin, xmin, ymax, xmax] }],
-    "primaryObject": { "label": "核心主体焦点", "focal_point": [x, y], "box_2d": [ymin, xmin, ymax, xmax] }
+    "head": { "box_2d": [ymin, xmin, ymax, xmax] },
+    "eyes": { "box_2d": [ymin, xmin, ymax, xmax] },
+    "chest": { "box_2d": [ymin, xmin, ymax, xmax] },
+    "legs": { "box_2d": [ymin, xmin, ymax, xmax] },
+    "hands": [{ "box_2d": [ymin, xmin, ymax, xmax] }],
+    "primaryObject": { "label": "核心主体焦点", "box_2d": [ymin, xmin, ymax, xmax] }
   }
 }`
 };
