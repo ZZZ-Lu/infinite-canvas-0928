@@ -11,7 +11,7 @@ import { fastGetImageDimensions } from './utils/imageHeader';
 import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold } from './utils/viewportCulling';
 import { buildCardQuadTree, QuadTree, BoundingBox } from './utils/quadTree';
 import { getBottomPanelHeight } from './utils/cardLayout';
-import { createSquareLetterboxImage, unpadLandmarks } from './utils/squareImageLetterbox';
+import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
 import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp } from 'lucide-react';
 import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
 import { SettingsPage } from './components/SettingsPage';
@@ -1434,17 +1434,41 @@ export default function App() {
   }, [centerCardOnScreen, currentProject]);
   processInspectQueueRef.current = processInspectQueue;
 
-  const detectAndSaveCardLandmarks = useCallback(async (targetCard: CardData, mediaUrl: string) => {
-    if (!mediaUrl || targetCard.landmarks) return;
+  const detectAndSaveCardLandmarks = useCallback(async (
+    targetCard: CardData,
+    mediaUrl?: string,
+    customPrompt?: string,
+    force: boolean = false
+  ) => {
+    if (!force && targetCard.landmarks) {
+      const detectedParts = Object.keys(targetCard.landmarks.regions || {});
+      const pointsCount = Array.isArray(targetCard.landmarks.interestPoints) ? targetCard.landmarks.interestPoints.length : 0;
+      return {
+        success: true,
+        alreadyHadLandmarks: true,
+        cardId: targetCard.id,
+        landmarks: targetCard.landmarks,
+        summary: targetCard.landmarks.summary || '已有主体标注产物',
+        interestPointsCount: pointsCount,
+        detectedParts,
+        regions: targetCard.landmarks.regions,
+        message: `卡片【${targetCard.name || targetCard.id}】已有主体与部位标注（共 ${pointsCount} 个关键点，覆盖: ${detectedParts.join('、') || '全身'}），无需重复计算。如需重新分析，请指定 force: true。`
+      };
+    }
+
     try {
-      let effectiveUrl = mediaUrl;
+      let effectiveUrl = mediaUrl || targetCard.imageUrl || targetCard.url || targetCard.originalUrl || '';
       const b64 = await extractCardImageBase64Ref.current(targetCard);
       if (b64) {
         effectiveUrl = b64;
       }
 
-      // 🌟 核心机制：竖向/横向比例图像发送给主体识别节点前，先在前端扩展成 1:1 正方形垫边图，以彻底消除 ViT 空间注意力畸变
-      const { paddedUrl, padInfo } = await createSquareLetterboxImage(effectiveUrl, 1024);
+      if (!effectiveUrl) {
+        throw new Error(`卡片【${targetCard.name || targetCard.id}】暂无可用图像内容（可能未出图或正在生成中）`);
+      }
+
+      // 🌟 核心机制：全画幅无损纵向 16:9 分块漫游（0黑边，300% Token 密度提升）
+      const slicePkg = await createVerticalWidescreenSlices(effectiveUrl, 1280);
 
       const nodeModels = assetExtractionService.getNodeModels();
       const modelToUse = nodeModels.subjectLandmarksModel || 'deepseek-v4-flash';
@@ -1457,9 +1481,10 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          imageUrl: paddedUrl,
-          prompt: targetCard.prompt || targetCard.lastGeneratedPrompt || '',
-          ratio: padInfo.isPadded ? '1:1' : (targetCard.ratio || '16:9'),
+          imageUrl: slicePkg.primaryPreviewUrl,
+          slices: slicePkg.isSliced ? slicePkg.slices : undefined,
+          prompt: customPrompt || targetCard.prompt || targetCard.lastGeneratedPrompt || '',
+          ratio: '16:9',
           model: modelToUse,
           apiKey: apiKeyToSend || undefined,
         })
@@ -1468,8 +1493,8 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         if (data && data.regions) {
-          // 🌟 逆向映射：将 1:1 正方形空间模型坐标无损反解还原回原图真实几何百分比坐标
-          const restoredLandmarks = unpadLandmarks(data, padInfo);
+          // 🌟 逆向映射：将 16:9 纵向切片局部坐标无损反解还原回原图全局几何百分比坐标
+          const restoredLandmarks = unpadLandmarks(data, slicePkg.padInfo);
 
           setCards(prev => prev.map(c => {
             if (c.id !== targetCard.id) return c;
@@ -1478,10 +1503,25 @@ export default function App() {
               landmarks: restoredLandmarks
             };
           }), false);
+
+          const detectedParts = Object.keys(restoredLandmarks.regions || {});
+          const pointsCount = Array.isArray(restoredLandmarks.interestPoints) ? restoredLandmarks.interestPoints.length : 0;
+
+          return {
+            success: true,
+            cardId: targetCard.id,
+            summary: restoredLandmarks.summary || '识别完成',
+            interestPointsCount: pointsCount,
+            detectedParts,
+            regions: restoredLandmarks.regions,
+            message: `成功完成卡片【${targetCard.name || targetCard.id}】的主体识别与部位标注（共提取 ${pointsCount} 个关键解剖兴趣点，覆盖部位: ${detectedParts.join('、') || '全身'}）。`
+          };
         }
       }
+      throw new Error(`主体识别节点未返回有效的部位标注数据`);
     } catch (err) {
       console.warn('[LandmarksNode] Auto-detection error:', err);
+      throw err;
     }
   }, []);
 
@@ -3987,6 +4027,27 @@ export default function App() {
 
       return response;
     }
+    if (call.name === 'card.detectLandmarks') {
+      const cardId = String(call.arguments.cardId || call.arguments.targetCardId || '');
+      const cleanCardId = cardId.startsWith('canvas.card.') ? cardId.replace('canvas.card.', '') : cardId;
+      const customPrompt = typeof call.arguments.prompt === 'string' ? call.arguments.prompt.trim() : undefined;
+      const force = call.arguments.force !== false; // 默认 true: 强制执行重新识别
+
+      const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+      const card = allCards.find(c => c.id === cleanCardId);
+
+      if (!card) {
+        throw new Error(`未找到 ID 为 ${cardId} 的卡片。请核对当前页面观察可见卡片。`);
+      }
+
+      agentFocusManager.setCursorMode('working');
+      agentFocusManager.setPrimaryFocus(cleanCardId, 'working', 'card.detectLandmarks');
+      await animateMoveToTarget('canvas.card.' + cleanCardId);
+
+      const mediaUrl = card.imageUrl || card.url || card.originalUrl || '';
+      const result = await detectAndSaveCardLandmarks(card, mediaUrl, customPrompt, force);
+      return result;
+    }
     if (call.name === 'card.generate') {
       const rawTargetCardId = String(call.arguments.targetCardId || call.arguments.cardId || '');
       const prompt = typeof call.arguments.prompt === 'string' ? call.arguments.prompt.trim() : '';
@@ -6172,7 +6233,7 @@ export default function App() {
         }}
       />
 
-      {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.60 or during staggered DOM loading) */}
+      {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.40 or during staggered DOM loading) */}
       <NanoLodCanvas
         cards={cards}
         selectedCardIds={selectedCardIds}
@@ -6214,7 +6275,7 @@ export default function App() {
         style={{ transformOrigin: '0 0', x: tx, y: ty, scale: tScale }}
       >
 
-        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.60), unmount all DOM cards for ultra-fast Hybrid Canvas rendering */}
+        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.40), unmount all DOM cards for ultra-fast Hybrid Canvas rendering */}
         {!isOverviewMode && isDomCardsActive && visibleCards.map(card => {
           if (!renderedCardIds.has(card.id)) return null;
           const hasImage = Boolean(card.imageUrl || card.originalImageUrl || card.thumbnailUrl);

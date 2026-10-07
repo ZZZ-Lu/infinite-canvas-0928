@@ -37,7 +37,7 @@ import {
   ScriptProp,
 } from '../types/script';
 import { assetExtractionService } from '../services/assetExtractionService';
-import { createSquareLetterboxImage, unpadLandmarks, SquarePadInfo } from '../utils/squareImageLetterbox';
+import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks, SquarePadInfo } from '../utils/squareImageLetterbox';
 
 interface SettingsPageProps {
   onClose: () => void;
@@ -137,6 +137,7 @@ const MODEL_OPTIONS: Array<{ value: ExtractionModelType; label: string }> = [
   { value: 'deepseek-v4-pro', label: 'V4 Pro' },
   { value: 'deepseek-v4.1-flash-expires-on-0910', label: 'V4.1 Flash (0910)' },
   { value: 'qwen3.8-flash', label: 'Qwen 3.8 Flash' },
+  { value: 'qwen3-vl-plus', label: 'Qwen3-VL-Plus (多模态视觉)' },
   { value: 'ZHIPU/GLM-5.3-Flash-low', label: 'GLM-5.3-Flash (Low 思考)' },
   { value: 'ZHIPU/GLM-5.3-Flash-high', label: 'GLM-5.3-Flash (High 思考)' },
   { value: 'ZHIPU/GLM-5.3-Flash-max', label: 'GLM-5.3-Flash (Max 思考)' },
@@ -500,14 +501,17 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
         }
 
         if (parsedInput.imageUrl) {
-          const padded = await createSquareLetterboxImage(parsedInput.imageUrl, 1024);
-          parsedInput.imageUrl = padded.paddedUrl;
-          landmarkPadInfo = padded.padInfo;
+          const slicePkg = await createVerticalWidescreenSlices(parsedInput.imageUrl, 1280);
+          parsedInput.imageUrl = slicePkg.primaryPreviewUrl;
+          if (slicePkg.isSliced) {
+            parsedInput.slices = slicePkg.slices;
+          }
+          landmarkPadInfo = slicePkg.padInfo;
         }
 
         body = {
           ...parsedInput,
-          ratio: landmarkPadInfo && landmarkPadInfo.isPadded ? '1:1' : (parsedInput.ratio || '原始画幅'),
+          ratio: '16:9',
           model: activeModel,
           apiKey: keyToUse
         };

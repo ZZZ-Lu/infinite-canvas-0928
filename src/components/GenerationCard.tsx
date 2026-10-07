@@ -1137,11 +1137,12 @@ export function InfiniteRealtimeQCGaze({
       let curY = Math.max(10, Math.min(90, firstTarget.y));
       let lastPointId: string | null = firstTarget.id;
 
-      await gazeControls.set({
+      await gazeControls.start({
         left: `${curX}%`,
         top: `${curY}%`,
         scale: 1.08,
         opacity: 0,
+        transition: { duration: 0 },
       });
 
       if (!isMounted) return;
@@ -1521,16 +1522,18 @@ export function AdaptiveDwellGaze({
       let curY = initialTarget.y;
 
       await Promise.all([
-        gazeControls.set({
+        gazeControls.start({
           left: `${curX}%`,
           top: `${curY}%`,
           scale: 0.96,
           opacity: 0,
+          transition: { duration: 0 },
         }),
-        catchlightControls.set({
+        catchlightControls.start({
           left: `${curX}%`,
           top: `${curY}%`,
           opacity: 0,
+          transition: { duration: 0 },
         }),
       ]);
 
@@ -1929,41 +1932,68 @@ export function LandmarkSpatialAnnotations({
     return makeUnique(result);
   }, [landmarks]);
 
+  const renderedPoints = useMemo(() => {
+    // 1. Calculate base object-cover mapped coordinates
+    const mapped = points.map((pt, idx) => {
+      let renderX = pt.x;
+      let renderY = pt.y;
+
+      if (naturalDim && cardWidth && cardHeight && cardWidth > 0 && cardHeight > 0) {
+        const { nw, nh } = naturalDim;
+        const imgAspect = nw / nh;
+        const cardAspect = cardWidth / cardHeight;
+
+        if (imgAspect > cardAspect) {
+          // 画面比卡片更宽，左右发生裁剪
+          const sw = nh * cardAspect;
+          const sx = (nw - sw) / 2;
+          const pixelX = (pt.x / 100) * nw;
+          renderX = Math.max(0, Math.min(100, ((pixelX - sx) / sw) * 100));
+        } else if (imgAspect < cardAspect) {
+          // 画面比卡片更高，上下发生裁剪（如竖图比例微差）
+          const sh = nw / cardAspect;
+          const sy = (nh - sh) / 2;
+          const pixelY = (pt.y / 100) * nh;
+          renderY = Math.max(0, Math.min(100, ((pixelY - sy) / sh) * 100));
+        }
+      }
+
+      // If point is on the right half, label displays to the left to avoid card edge clipping
+      const isRightSide = renderX > 52;
+      return { pt, idx, renderX, renderY, isRightSide, offsetY: 0 };
+    });
+
+    // 2. Resolve Y-axis collisions for points on the same side
+    const MIN_GAP_Y = 3.6; // 3.6% vertical gap threshold (~23px on a 640px card)
+    const sides = [
+      mapped.filter(m => !m.isRightSide).sort((a, b) => a.renderY - b.renderY),
+      mapped.filter(m => m.isRightSide).sort((a, b) => a.renderY - b.renderY),
+    ];
+
+    for (const group of sides) {
+      for (let i = 1; i < group.length; i++) {
+        const prev = group[i - 1];
+        const curr = group[i];
+        const effectivePrevY = prev.renderY + prev.offsetY;
+        const effectiveCurrY = curr.renderY;
+        const diff = effectiveCurrY - effectivePrevY;
+        if (diff < MIN_GAP_Y) {
+          const shift = (MIN_GAP_Y - diff) / 2;
+          prev.offsetY -= shift;
+          curr.offsetY += shift;
+        }
+      }
+    }
+
+    return mapped;
+  }, [points, naturalDim, cardWidth, cardHeight]);
+
   if (!visible || points.length === 0) return null;
 
   return (
     <div className="absolute inset-0 pointer-events-none z-25 overflow-hidden squircle">
       <AnimatePresence>
-        {points.map((pt, idx) => {
-          // Object-cover 反向映射计算，确保在不同比例裁剪下 100% 精准对齐
-          let renderX = pt.x;
-          let renderY = pt.y;
-
-          const isVertical = Boolean(
-            (naturalDim && naturalDim.nw < naturalDim.nh) ||
-            (cardWidth && cardHeight && cardHeight > cardWidth)
-          );
-
-          if (naturalDim && cardWidth && cardHeight && cardWidth > 0 && cardHeight > 0) {
-            const { nw, nh } = naturalDim;
-            const imgAspect = nw / nh;
-            const cardAspect = cardWidth / cardHeight;
-
-            if (imgAspect > cardAspect) {
-              // 画面比卡片更宽，左右发生裁剪
-              const sw = nh * cardAspect;
-              const sx = (nw - sw) / 2;
-              const pixelX = (pt.x / 100) * nw;
-              renderX = Math.max(0, Math.min(100, ((pixelX - sx) / sw) * 100));
-            } else if (imgAspect < cardAspect) {
-              // 画面比卡片更高，上下发生裁剪（如竖图比例微差）
-              const sh = nw / cardAspect;
-              const sy = (nh - sh) / 2;
-              const pixelY = (pt.y / 100) * nh;
-              renderY = Math.max(0, Math.min(100, ((pixelY - sy) / sh) * 100));
-            }
-          }
-
+        {renderedPoints.map(({ pt, idx, renderX, renderY, isRightSide, offsetY }) => {
           return (
             <motion.div
               key={pt.id ? `${pt.id}-${idx}` : `landmark-${idx}`}
@@ -1979,7 +2009,11 @@ export function LandmarkSpatialAnnotations({
                 left: `${renderX}%`,
                 top: `${renderY}%`,
               }}
-              className="absolute -translate-x-1 -translate-y-1/2 pointer-events-auto group/landmark cursor-pointer flex items-center select-none"
+              className={`absolute pointer-events-auto group/landmark cursor-pointer flex items-center select-none ${
+                isRightSide
+                  ? 'flex-row-reverse -translate-x-[calc(100%-4px)] -translate-y-1/2'
+                  : 'flex-row -translate-x-1 -translate-y-1/2'
+              }`}
               onClick={(e) => {
                 e.stopPropagation();
                 onSelectPoint?.(pt);
@@ -1991,8 +2025,13 @@ export function LandmarkSpatialAnnotations({
                 <span className="relative w-2 h-2 rounded-full bg-purple-500 border-1.5 border-white dark:border-neutral-900 shadow-[0_0_8px_rgba(168,85,247,0.95)] transition-transform duration-200 group-hover/landmark:scale-130" />
               </div>
 
-              {/* 2. 文字：无底色、无描边，直接显示在点的右侧，字号不变 (11px) */}
-              <span className="ml-1.5 text-[11px] font-medium tracking-wide text-white drop-shadow-[0_1px_3px_rgba(0,0,0,0.95)] whitespace-nowrap">
+              {/* 2. 文字：无底色、无描边，根据左右侧自适应贴边显示，带防撞错位微调 */}
+              <span
+                style={offsetY !== 0 ? { transform: `translateY(${offsetY * 6.4}px)` } : undefined}
+                className={`${
+                  isRightSide ? 'mr-1.5 text-right' : 'ml-1.5 text-left'
+                } text-[11px] font-medium tracking-wide text-white drop-shadow-[0_1px_3px_rgba(0,0,0,0.95)] whitespace-nowrap transition-transform duration-200`}
+              >
                 {pt.label}
               </span>
             </motion.div>
@@ -2079,6 +2118,42 @@ export const GenerationCard = React.memo(function GenerationCard({
       setCurrentScale(scale.get());
     }
   }, [isZooming, scale]);
+
+  // 🔍 动态探针：准确获取并缓存真实返回图片/视频的物理像素尺寸
+  const [actualDimensions, setActualDimensions] = useState<{ width: number; height: number } | null>(() => {
+    if (data.nativeWidth && data.nativeHeight) {
+      return { width: data.nativeWidth, height: data.nativeHeight };
+    }
+    return null;
+  });
+
+  useEffect(() => {
+    if (data.nativeWidth && data.nativeHeight) {
+      setActualDimensions({ width: data.nativeWidth, height: data.nativeHeight });
+      return;
+    }
+
+    const srcToProbe = data.trueOriginalImageUrl || data.originalImageUrl || imageUrl;
+    if (!srcToProbe || data.isVideo) return;
+
+    let isMounted = true;
+    const img = new Image();
+    img.referrerPolicy = 'no-referrer';
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      if (!isMounted) return;
+      if (img.naturalWidth && img.naturalHeight) {
+        setActualDimensions({ width: img.naturalWidth, height: img.naturalHeight });
+        onUpdate(id, { nativeWidth: img.naturalWidth, nativeHeight: img.naturalHeight }, false);
+      }
+    };
+    img.src = srcToProbe;
+
+    return () => {
+      isMounted = false;
+      img.onload = null;
+    };
+  }, [imageUrl, data.originalImageUrl, data.trueOriginalImageUrl, data.nativeWidth, data.nativeHeight, data.isVideo, id, onUpdate]);
 
   // If we don't render CardImageCanvas (which is when !imageUrl or isVideo is true),
   // we must manually manage __paintedCardIds for Zero-Flicker Handoff so that
@@ -3384,8 +3459,10 @@ export const GenerationCard = React.memo(function GenerationCard({
 
     const isVideo = Boolean(data.isVideo);
     const ext = isVideo ? 'mp4' : 'png';
+    const cardTitle = data.name || data.fileName || '';
     const cleanPrompt = data.prompt ? data.prompt.slice(0, 24).replace(/[^\w\u4e00-\u9fa5]/g, '_') : 'media';
-    const filename = `${data.fileName ? data.fileName.replace(/\.[^/.]+$/, "") : cleanPrompt}_${Date.now()}.${ext}`;
+    const baseName = cardTitle ? cardTitle.replace(/\.[^/.]+$/, "") : cleanPrompt;
+    const filename = `${baseName}_${Date.now()}.${ext}`;
 
     const triggerDownload = (url: string, downloadName: string) => {
       const a = document.createElement('a');
@@ -3397,56 +3474,76 @@ export const GenerationCard = React.memo(function GenerationCard({
       document.body.removeChild(a);
     };
 
-    // 1. Direct local Blob in data.fileData
+    // 🌟 优先级 1：无损原始二进制数据（trueOriginalFileData 4K/8K 原始文件 > originalFileData 4K 代理）
+    const trueOriginalBlob = (data.trueOriginalFileData instanceof Blob && data.trueOriginalFileData.size > 0)
+      ? data.trueOriginalFileData
+      : (data.originalFileData instanceof Blob && data.originalFileData.size > 0)
+        ? data.originalFileData
+        : null;
+
+    if (trueOriginalBlob) {
+      const blobUrl = URL.createObjectURL(trueOriginalBlob);
+      triggerDownload(blobUrl, filename);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 3000);
+      return;
+    }
+
+    // 🌟 优先级 2：AI 渲染高清原图 / 远程高清资源（通过代理端无损拉取原始二进制流）
+    const targetMediaUrl = data.trueOriginalImageUrl || data.originalImageUrl || imageUrl || data.imageUrl || videoPlaySrc || blobVideoUrl;
+    if (targetMediaUrl) {
+      if (targetMediaUrl.startsWith('blob:')) {
+        triggerDownload(targetMediaUrl, filename);
+        return;
+      }
+
+      if (/^https?:\/\//i.test(targetMediaUrl)) {
+        try {
+          const activeToken = localStorage.getItem('workrally_mcp_token') || '';
+          const taskId = data.mcpTaskId || targetMediaUrl.match(/(2k[a-z0-9]{6,16})/i)?.[1] || targetMediaUrl.match(/\/(2k[a-z0-9]+)_MAIN_/i)?.[1] || '';
+          const proxyUrl = `/api/mcp/workrally/proxy-media?url=${encodeURIComponent(targetMediaUrl)}${taskId ? `&taskId=${encodeURIComponent(taskId)}` : ''}${activeToken ? `&token=${encodeURIComponent(activeToken)}` : ''}&download=true&filename=${encodeURIComponent(filename)}`;
+
+          const response = await fetch(proxyUrl);
+          if (response.ok) {
+            const blob = await response.blob();
+            if (blob && blob.size > 0) {
+              const blobUrl = URL.createObjectURL(blob);
+              triggerDownload(blobUrl, filename);
+              setTimeout(() => URL.revokeObjectURL(blobUrl), 3000);
+              return;
+            }
+          }
+        } catch (err) {
+          console.warn('[handleDownloadMedia] Proxy fetch download error:', err);
+        }
+
+        // Direct fetch fallback for CORS-enabled CDNs
+        try {
+          const directRes = await fetch(targetMediaUrl);
+          if (directRes.ok) {
+            const blob = await directRes.blob();
+            if (blob && blob.size > 0) {
+              const blobUrl = URL.createObjectURL(blob);
+              triggerDownload(blobUrl, filename);
+              setTimeout(() => URL.revokeObjectURL(blobUrl), 3000);
+              return;
+            }
+          }
+        } catch {}
+      }
+    }
+
+    // 🌟 优先级 3：本地草稿 / 预览数据托底
     if (data.fileData instanceof Blob) {
       const blobUrl = URL.createObjectURL(data.fileData);
       triggerDownload(blobUrl, filename);
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 3000);
       return;
     }
 
-    // 2. Active video or image source
-    const mediaSrc = blobVideoUrl || videoPlaySrc || imageUrl || data.originalImageUrl;
-    if (!mediaSrc) return;
-
-    if (mediaSrc.startsWith('blob:')) {
-      triggerDownload(mediaSrc, filename);
-      return;
+    // 🌟 兜底：直接触发下载链接
+    if (targetMediaUrl) {
+      triggerDownload(targetMediaUrl, filename);
     }
-
-    // 3. Try direct fetch for same-origin or CORS-enabled URLs
-    try {
-      const response = await fetch(mediaSrc);
-      if (response.ok) {
-        const blob = await response.blob();
-        const blobUrl = URL.createObjectURL(blob);
-        triggerDownload(blobUrl, filename);
-        setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
-        return;
-      }
-    } catch {
-      // Direct fetch failed (likely CORS restriction on external domain)
-    }
-
-    // 4. Fallback: Fetch via same-origin media proxy endpoint
-    if (/^https?:\/\//i.test(mediaSrc)) {
-      try {
-        const proxyUrl = `/api/mcp/workrally/proxy-media?url=${encodeURIComponent(mediaSrc)}`;
-        const response = await fetch(proxyUrl);
-        if (response.ok) {
-          const blob = await response.blob();
-          const blobUrl = URL.createObjectURL(blob);
-          triggerDownload(blobUrl, filename);
-          setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
-          return;
-        }
-      } catch {
-        // Proxy fetch failed
-      }
-    }
-
-    // 5. Direct link download fallback
-    triggerDownload(mediaSrc, filename);
   };
 
   // Asset list items (Only computed when Asset Picker modal is opened)
@@ -3898,30 +3995,24 @@ export const GenerationCard = React.memo(function GenerationCard({
     });
   };
 
+  // 🌟 角标展示规则：必须根据真实返回图片/视频的实际物理像素精确标记，不再基于选择器的预设值瞎猜
+  const effWidth = actualDimensions?.width || data.nativeWidth;
+  const effHeight = actualDimensions?.height || data.nativeHeight;
+  const hasLoadedMedia = Boolean(imageUrl || data.originalImageUrl || data.fileData || data.thumbnailUrl);
+
   let resolutionTag = '';
-  if (data.nativeWidth && data.nativeHeight) {
-    const maxDim = Math.max(data.nativeWidth, data.nativeHeight);
-    const minDim = Math.min(data.nativeWidth, data.nativeHeight);
+  if (hasLoadedMedia && effWidth && effHeight) {
+    const maxDim = Math.max(effWidth, effHeight);
+    const minDim = Math.min(effWidth, effHeight);
     if (data.isVideo) {
       if (minDim >= 2160 || maxDim >= 3840) resolutionTag = '4K';
-      else if (minDim >= 1080) resolutionTag = '1080p';
-      else if (minDim >= 720) resolutionTag = '720p';
+      else if (minDim >= 1080 || maxDim >= 1920) resolutionTag = '1080p';
+      else if (minDim >= 720 || maxDim >= 1280) resolutionTag = '720p';
       else resolutionTag = '480p';
     } else {
       if (maxDim >= 4000) resolutionTag = '4K+';
-      else if (maxDim >= 3840) resolutionTag = '4K';
-      else if (maxDim >= 2048) resolutionTag = '2K';
-      else resolutionTag = '1K';
-    }
-  } else {
-    // Fallback based on data.res
-    if (data.isVideo) {
-      if (data.res === '4K') resolutionTag = '4K';
-      else if (data.res === '2K') resolutionTag = '1080p';
-      else resolutionTag = '720p';
-    } else {
-      if (data.res === '4K') resolutionTag = '4K';
-      else if (data.res === '2K') resolutionTag = '2K';
+      else if (maxDim >= 3840 || minDim >= 2160) resolutionTag = '4K';
+      else if (maxDim >= 2048 || minDim >= 1440) resolutionTag = '2K';
       else resolutionTag = '1K';
     }
   }
@@ -4357,6 +4448,12 @@ export const GenerationCard = React.memo(function GenerationCard({
                     const video = e.currentTarget;
                     const dur = video.duration || 0;
                     setDuration(dur);
+                    const vWidth = video.videoWidth;
+                    const vHeight = video.videoHeight;
+                    if (vWidth && vHeight && (!data.nativeWidth || !data.nativeHeight)) {
+                      setActualDimensions({ width: vWidth, height: vHeight });
+                      onUpdate(id, { nativeWidth: vWidth, nativeHeight: vHeight }, false);
+                    }
                     const savedPos = getStoredVideoProgress();
                     if (savedPos > 0 && dur > 0 && savedPos < (dur - 0.4)) {
                       video.currentTime = savedPos;

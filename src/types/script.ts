@@ -51,6 +51,8 @@ export type ExtractionModelType =
   | 'deepseek-v4-pro' 
   | 'deepseek-v4.1-flash-expires-on-0910'
   | 'qwen3.8-flash'
+  | 'qwen3-vl-plus'
+  | 'qwen-vl-plus'
   | 'glm-5.3-flash'
   | 'glm-5.3-flash-low'
   | 'glm-5.3-flash-high'

@@ -64,14 +64,12 @@ export function isCardIntersectingRectangle(
 }
 
 /**
- * Nano-LOD Scale Threshold: 0.55 (55%)
- * Scale < 0.55 renders via NanoLodCanvas (2D Canvas mode).
- * Scale >= 0.55 renders via DOM cards mode.
- * 
- * Merged prompt area color block LOD into a single tier switching strictly at 55% (scale 0.55).
+ * Nano-LOD Scale Threshold: 0.40 (40%)
+ * Scale < 0.40 renders via NanoLodCanvas (2D Canvas mode with color blocks).
+ * Scale >= 0.40 renders via DOM cards mode (interactive prompt component).
  */
 export function getNanoLodThreshold(): number {
-  return 0.55;
+  return 0.40;
 }
 
 /**

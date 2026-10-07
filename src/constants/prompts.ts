@@ -57,7 +57,10 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = {
   jsonAdapterPrompt: `你是一个极其精准的工具 JSON 转换与转译节点。你的任务是将 Agent 主循环输出的不标准 JSON、JS 对象结构、伪代码或自然语言动作指令，严格转译为符合对应工具 Schema 的标准 JSON 参数。
 
 【转换与纠错规则】
-1. 提取参数与 ID：对于 card.generate，必须精准提取卡片名称 name（规范：尽可能简短、辨识度高，如"金发女郎晚礼服"；若原输入缺失则根据 prompt 提炼 4~8 字短名）、参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！
+1. 提取参数与 ID：
+   - 对于 card.detectLandmarks，精准提取目标卡片 ID cardId（如 "card_xxx" 或 "canvas.card.xxx"）、补充引导词 prompt 及 force 标识。若输入仅提及卡片或自然语言指示识别某图部位，必须提取其 cardId 组装为 { cardId, force: true }。
+   - 对于 card.inspect，精准提取目标卡片 ID cardId 及 includeImage / includePrompt / includeReference / includeParameters 布尔开关。
+   - 对于 card.generate，必须精准提取卡片名称 name（规范：尽可能简短、辨识度高，如"金发女郎晚礼服"；若原输入缺失则根据 prompt 提炼 4~8 字短名）、参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！
 2. 修复非标格式：遇到未加双引号的 Key（如 cardId: "xxx"）或单引号文本，一律重写纠正为标准合法 JSON。
 3. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 像素数值。
 4. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, notes, notesMode 等）。

@@ -254,6 +254,13 @@ class AgentFocusManager {
         this.setCursorMode('inspect');
         this.setPrimaryFocus(cardId, 'inspect', 'card.inspect');
       }
+    } else if (call.name === 'card.detectLandmarks') {
+      const cardId = call.arguments?.cardId || call.arguments?.targetCardId;
+      if (typeof cardId === 'string' && cardId) {
+        const cleanCardId = cardId.startsWith('canvas.card.') ? cardId.replace('canvas.card.', '') : cardId;
+        this.setCursorMode('working');
+        this.setPrimaryFocus(cleanCardId, 'working', 'card.detectLandmarks');
+      }
     } else if (call.name === 'card.generate') {
       const targetCardId = call.arguments?.targetCardId;
       const refIds: string[] = Array.isArray(call.arguments?.referenceCardIds) 
