@@ -930,53 +930,6 @@ export default function App() {
   cardsRef.current = cards;
   const clipboardRef = useRef<CardData[]>([]);
 
-  const toChineseNumber = (n: number): string => {
-    const digits = ['零', '一', '两', '三', '四', '五', '六', '七', '八', '九', '十'];
-    if (n <= 10) return digits[n];
-    return String(n);
-  };
-
-  const getSelectionPromptText = (selectedCards: CardData[] | null | undefined): string => {
-    if (!selectedCards || selectedCards.length === 0) {
-      return '我能帮什么忙？';
-    }
-
-    const count = selectedCards.length;
-    if (count === 1) {
-      const card = selectedCards[0];
-      const isVideo = Boolean(card.isVideo);
-      const mediaType = isVideo ? '视频' : '图片';
-      const rawName = (card.name || card.fileName || '').replace(/\.[^/.]+$/, '').trim();
-
-      if (rawName && rawName.length <= 14) {
-        return `看到了，选择了${mediaType}“${rawName}”，有什么想法？`;
-      }
-      return `看到了，选择了${isVideo ? '一个视频' : '一张图片'}，有什么想法？`;
-    }
-
-    const videoCount = selectedCards.filter(c => c.isVideo).length;
-    const imageCount = count - videoCount;
-
-    if (videoCount === 0) {
-      return `看到了，选择了${toChineseNumber(imageCount)}张图片，有什么想法？`;
-    }
-    if (imageCount === 0) {
-      return `看到了，选择了${toChineseNumber(videoCount)}个视频，有什么想法？`;
-    }
-    return `看到了，选择了${toChineseNumber(imageCount)}张图片和${toChineseNumber(videoCount)}个视频，有什么想法？`;
-  };
-
-  const isSelectionPromptSpeak = (speak?: string): boolean => {
-    if (!speak) return false;
-    return (
-      speak === '我能帮什么忙？' ||
-      speak.includes('有什么想法？') ||
-      speak.includes('要调整什么？') ||
-      speak.startsWith('看到了') ||
-      speak.startsWith('选中了')
-    );
-  };
-
   const handleStartAgentBoxSelect = useCallback((startX: number, startY: number) => {
     setAgentSelectionBox({
       startX,
@@ -997,7 +950,7 @@ export default function App() {
       const maxY = Math.max(next.startY, next.currentY);
 
       // Simple box intersection math against all cards
-      const newlySelectedCards = cardsRef.current.filter(card => {
+      const newlySelectedIds = cardsRef.current.filter(card => {
         const dim = getCardSize(card);
         return (
           card.x < maxX && 
@@ -1005,21 +958,7 @@ export default function App() {
           card.y < maxY && 
           card.y + dim.height > minY
         );
-      });
-      const newlySelectedIds = newlySelectedCards.map(c => c.id);
-
-      // Sync focus seamlessly into agentFocusManager
-      if (newlySelectedIds.length > 0) {
-        agentFocusManager.batchSetFocus({
-          primary: newlySelectedIds[0],
-          references: newlySelectedIds.slice(1),
-          role: 'inspect',
-          sourceTool: 'user.box_select',
-          cursorMode: 'inspect',
-        });
-      } else {
-        agentFocusManager.clearAll();
-      }
+      }).map(c => c.id);
 
       // Calculate screen position of the prompt bubble
       const screenX = next.startX * tScale.get() + tx.get();
@@ -1028,7 +967,7 @@ export default function App() {
       // Dynamically target these cards under the Agent!
       setAgentQuickInput(prevQuick => {
         const targetId = newlySelectedIds[0] || null;
-        const promptText = getSelectionPromptText(newlySelectedCards);
+        const promptText = newlySelectedIds.length > 0 ? "选中了这组内容，要调整什么？" : "我能帮什么忙？";
         
         setAgentState(prevAgent => ({
           ...prevAgent,
@@ -1080,9 +1019,7 @@ export default function App() {
 
     if (hitCard) {
       setSelectedCardIds([hitCard.id]);
-      agentFocusManager.setPrimaryFocus(hitCard.id, 'inspect', 'user.drag_agent');
-      agentFocusManager.setCursorMode('inspect');
-      const promptText = getSelectionPromptText([hitCard]);
+      const promptText = "选中了这组内容，要调整什么？";
       const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
         ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
         : undefined;
@@ -1108,8 +1045,7 @@ export default function App() {
       });
     } else {
       setSelectedCardIds([]);
-      agentFocusManager.clearAll();
-      const promptText = getSelectionPromptText([]);
+      const promptText = "我能帮什么忙？";
       setAgentState(prev => ({
         ...prev,
         x: finalCanvasX,
@@ -1144,7 +1080,6 @@ export default function App() {
       deleteDraft(currentTarget);
 
       setAgentQuickInput(null);
-      agentFocusManager.clearAll();
     } else {
       // If HUD is hidden, clicking restores it
       const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
@@ -1163,9 +1098,7 @@ export default function App() {
 
       if (hitCard) {
         setSelectedCardIds([hitCard.id]);
-        agentFocusManager.setPrimaryFocus(hitCard.id, 'inspect', 'user.click_pointer');
-        agentFocusManager.setCursorMode('inspect');
-        const promptText = getSelectionPromptText([hitCard]);
+        const promptText = "选中了这组内容，要调整什么？";
         const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
           ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
           : undefined;
@@ -1188,7 +1121,7 @@ export default function App() {
           focusTrigger: Date.now()
         });
       } else {
-        const promptText = getSelectionPromptText([]);
+        const promptText = "我能帮什么忙？";
         setAgentState(prev => ({
           ...prev,
           speak: promptText,
@@ -1207,7 +1140,7 @@ export default function App() {
         });
       }
     }
-  }, [agentState.speak, agentState.x, agentState.y, agentQuickInput?.isOpen, agentQuickInput?.targetId, cards, deleteDraft, setCardDrafts, tScale, tx, ty]);
+  }, [agentState.speak, agentState.x, agentState.y, agentQuickInput?.isOpen, cards, tScale, tx, ty]);
 
   // Canvas Reference Picker Session State
   const [pickerSession, setPickerSession] = useState<{
@@ -3316,22 +3249,6 @@ export default function App() {
         : undefined;
       const lastReply = lastReplyObj ? (lastReplyObj.shortText || lastReplyObj.text) : undefined;
 
-      // Sync focus into agentFocusManager
-      if (targetIds && targetIds.length > 0) {
-        agentFocusManager.batchSetFocus({
-          primary: targetIds[0],
-          references: targetIds.slice(1),
-          role: 'inspect',
-          sourceTool: 'user.context_menu',
-          cursorMode: 'inspect',
-        });
-      } else if (targetId) {
-        agentFocusManager.setPrimaryFocus(targetId, 'inspect', 'user.context_menu');
-        agentFocusManager.setCursorMode('inspect');
-      } else {
-        agentFocusManager.clearAll();
-      }
-
       setAgentQuickInput({
         isOpen: true,
         targetId,
@@ -3341,7 +3258,6 @@ export default function App() {
       });
     } else {
       setAgentQuickInput(null);
-      agentFocusManager.clearAll();
     }
 
     const menuWidth = 260;
@@ -3370,10 +3286,7 @@ export default function App() {
     }
 
     if (ownerId === 'user' && !isAgentRunning) {
-      const selectedCards = targetIds && targetIds.length > 0
-        ? cardsRef.current.filter(c => targetIds.includes(c.id))
-        : (targetId ? (cardsRef.current.find(c => c.id === targetId) ? [cardsRef.current.find(c => c.id === targetId)!] : []) : (selectedCardIds.length > 0 ? cardsRef.current.filter(c => selectedCardIds.includes(c.id)) : []));
-      const promptText = getSelectionPromptText(selectedCards);
+      const promptText = targetId ? "选中了这组内容，要调整什么？" : "我能帮什么忙？";
       const yOffset = targetId ? 40 : 82;
       setAgentState(prev => ({
         ...prev,
@@ -4542,11 +4455,12 @@ export default function App() {
       return await compressImageToJpegBase64(url);
     };
 
-    // 1. Check raw binary data on the card's OWN image (Rule 3: trueOriginalFileData > originalFileData > fileData)
+    // 1. Check raw binary data on the card (Rule 3: trueOriginalFileData > originalFileData > fileData)
     const directBlobs = [
       card.trueOriginalFileData,
       card.originalFileData,
       card.fileData,
+      card.referenceImageFileData,
     ];
     for (const b of directBlobs) {
       if (b instanceof Blob && b.size > 0) {
@@ -4557,12 +4471,13 @@ export default function App() {
       }
     }
 
-    // 2. Check direct card own image URLs (trueOriginalImageUrl > originalImageUrl > imageUrl > thumbnailUrl)
+    // 2. Check direct card image URLs
     const candidateUrls = [
       card.trueOriginalImageUrl,
       card.originalImageUrl,
       card.imageUrl,
       card.thumbnailUrl,
+      card.referenceImageUrl,
     ].filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
 
     for (const url of candidateUrls) {
@@ -4570,7 +4485,27 @@ export default function App() {
       if (res) return res;
     }
 
-    // 3. Check global thumbnail cache for card's own image
+    // 3. Check referenceImages array (e.g. prompt card with reference image attached)
+    if (Array.isArray(card.referenceImages) && card.referenceImages.length > 0) {
+      for (const ref of card.referenceImages) {
+        if (ref.fileData instanceof Blob && ref.fileData.size > 0) {
+          try {
+            const res = await convertBlobToBase64(ref.fileData);
+            if (res) return res;
+          } catch {}
+        }
+        if (ref.url) {
+          const res = await convertUrlToBase64(ref.url);
+          if (res) return res;
+        }
+        if (ref.thumbnailUrl) {
+          const res = await convertUrlToBase64(ref.thumbnailUrl);
+          if (res) return res;
+        }
+      }
+    }
+
+    // 4. Check global thumbnail cache
     const cachedThumb = thumbCache.get(card.id) || (card.imageUrl ? thumbCache.get(card.imageUrl) : undefined);
     if (cachedThumb && cachedThumb.startsWith('data:image/')) {
       return cachedThumb;
@@ -4952,9 +4887,6 @@ export default function App() {
 
             if (status === 'completed' || status === 'cancelled' || status === 'failed') {
               if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
-              if (!isProcessingInspectQueueRef.current) {
-                agentFocusManager.clearAll();
-              }
             }
 
             // If task is bound to a specific card context, sync answer events to that card's chat history
@@ -5138,7 +5070,6 @@ export default function App() {
 
   const handleCancelTask = () => {
     inspectQueueRef.current = [];
-    agentFocusManager.clearAll();
     if (!runtimeRef.current || !activeTaskIdRef.current) return;
     runtimeRef.current.cancel(activeTaskIdRef.current);
     setIsAgentRunning(false);
@@ -5172,7 +5103,7 @@ export default function App() {
           if (agentQuickInput?.isOpen) {
             return prev;
           }
-          if (isSelectionPromptSpeak(prev.speak)) {
+          if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
             return { ...prev, speak: undefined };
           }
           return prev;
@@ -6384,7 +6315,7 @@ export default function App() {
           const isQcInspectTarget = Boolean(focusItem?.sourceTool?.includes('qc'));
           const agentInspectScenario: 'qc' | 'quickInput' | 'compare' = isQcInspectTarget
             ? 'qc'
-            : (focusItem?.sourceTool?.includes('compare') ? 'compare' : 'quickInput');
+            : (isQuickInputTarget ? 'quickInput' : (focusItem?.sourceTool?.includes('compare') ? 'compare' : 'qc'));
 
           return (
             <GenerationCard 
@@ -6566,24 +6497,9 @@ export default function App() {
                 },
                 onSubmit: async (prompt: string) => {
                   const currentTarget = agentQuickInput.targetId;
-                  const targetIds = agentQuickInput.targetIds || (currentTarget ? [currentTarget] : []);
                   const currentKey = currentTarget || 'global';
                   setCardDrafts(prev => ({ ...prev, [currentKey]: '' }));
                   deleteDraft(currentKey); // Delete draft from IndexedDB on submit
-
-                  // Unbroken Focus Relay: seamlessly retain focus on targeted cards while Agent thinks
-                  if (targetIds.length > 0) {
-                    agentFocusManager.batchSetFocus({
-                      primary: targetIds[0],
-                      references: targetIds.slice(1),
-                      role: 'inspect',
-                      sourceTool: 'user.prompt.thinking',
-                      cursorMode: 'inspect',
-                    });
-                  } else if (currentTarget) {
-                    agentFocusManager.setPrimaryFocus(currentTarget, 'inspect', 'user.prompt.thinking');
-                  }
-
                   setAgentQuickInput(null);
                   if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
                   setAgentState(prev => ({
@@ -6604,9 +6520,8 @@ export default function App() {
                   setCardDrafts(prev => ({ ...prev, [currentTarget]: '' }));
                   deleteDraft(currentTarget); // Delete draft from IndexedDB on close
                   setAgentQuickInput(null);
-                  agentFocusManager.clearAll();
                   setAgentState(prev => {
-                    if (isSelectionPromptSpeak(prev.speak)) {
+                    if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
                       return { ...prev, speak: undefined };
                     }
                     return prev;
@@ -6796,11 +6711,8 @@ export default function App() {
                 const prompt = agentPrompt.trim();
                 setAgentPrompt('');
                 setContextMenus(prev => { const next = {...prev}; delete next['user']; return next; });
-                if (currentTarget) {
-                  agentFocusManager.setPrimaryFocus(currentTarget, 'inspect', 'user.prompt.thinking');
-                }
                 setAgentState(prev => {
-                  if (isSelectionPromptSpeak(prev.speak)) {
+                  if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
                     return { ...prev, speak: undefined };
                   }
                   return prev;
@@ -6815,9 +6727,8 @@ export default function App() {
               onClose={() => {
                 setContextMenus(prev => { const next = {...prev}; delete next['user']; return next; });
                 setAgentQuickInput(null);
-                agentFocusManager.clearAll();
                 setAgentState(prev => {
-                  if (isSelectionPromptSpeak(prev.speak)) {
+                  if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
                     return { ...prev, speak: undefined };
                   }
                   return prev;
@@ -6825,7 +6736,7 @@ export default function App() {
               }}
               onAction={async (action, targetId) => {
                 setAgentState(prev => {
-                  if (isSelectionPromptSpeak(prev.speak)) {
+                  if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
                     return { ...prev, speak: undefined };
                   }
                   return prev;

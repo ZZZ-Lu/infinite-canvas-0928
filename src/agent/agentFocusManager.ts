@@ -176,7 +176,7 @@ class AgentFocusManager {
       this.primaryCardId = options.primary;
       this.focusedMap.set(options.primary, {
         cardId: options.primary,
-        role: role,
+        role: role === 'working' ? 'working' : role,
         sourceTool,
         timestamp: Date.now(),
       });
@@ -190,7 +190,7 @@ class AgentFocusManager {
           this.referenceCardIds.add(refId);
           this.focusedMap.set(refId, {
             cardId: refId,
-            role: role === 'inspect' ? 'inspect' : 'reference',
+            role: 'reference',
             sourceTool,
             timestamp: Date.now(),
           });

@@ -1260,7 +1260,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       let landmarksPromptTemplate = getPrompt('landmarks');
       if (!landmarksPromptTemplate || !landmarksPromptTemplate.trim()) {
         landmarksPromptTemplate = `你是一个具备卓越艺术人体解剖结构与空间定位能力的图像核心视觉兴趣点专家。
-你的核心任务是：深入观察分析输入的图像，利用原生 Visual Grounding 空间感知能力，精准圈定全图最核心的 3~8 个动态兴趣点（Interest Points）与解剖区域。
+你的核心任务是：深入观察分析输入的图像，利用原生 Visual Grounding 空间感知能力，精准圈定全图最核心的 3~8 个动态兴趣点（Interest Points）与关键解剖区域。
 
 【人体核心解剖部位必选清单（只要画面可见必须全部提取，严禁遗漏）】
 当画面中包含人物时，必须完整覆盖以下核心解剖与形体部位：
@@ -1276,16 +1276,16 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
    - 绝美眼神、面容微表情、核心高光焦点: 0.92 ~ 0.99
    - 锁骨颈项、挺拔胸部与深V领口、核心贴身服饰质感: 0.82 ~ 0.91
    - 手部指节动态、精巧饰品、修长腿部曲线: 0.68 ~ 0.81
-   - 次要构图区、特色环境或氛围光影: 0.40 ~ 0.65
+   - 次要构图区或环境光影: 0.40 ~ 0.65
 2. "dwellSeconds": (0.8 ~ 3.5 浮点数) —— 该部位值得深情端详/注视打转的时长（秒）：
    - 核心灵魂部位（眼神、精致神态）：2.2 ~ 3.5 秒（流连忘返、深入品味）
    - 中等张力部位（胸口领口、锁骨）：1.4 ~ 2.0 秒（舒缓呼吸赏析）
-   - 次要部位（裙摆下摆、背景环境）：0.8 ~ 1.2 秒（轻快扫视略过）
+   - 次要部位（裙摆下摆、背景）：0.8 ~ 1.2 秒（轻快扫视略过）
 3. "transitPace": "linger_slow" | "steady_flow" | "quick_glance" —— 视线飞向该点时的运镜转移速度与吸附感：
    - "linger_slow": 强引力吸引，视线缓慢柔和滑入，沿途细细扫掠
    - "steady_flow": 标准优雅运镜
    - "quick_glance": 敏锐轻快扫视
-4. "box_2d": [ymin, xmin, ymax, xmax] —— 0~1000 范围归一化整数包围盒，紧贴目标真实像素边缘。
+4. "box_2d": [ymin, xmin, ymax, xmax] —— 0~1000 范围内的归一化整数（0为最顶/最左边缘，1000为最底/最右边缘），紧贴目标真实像素边缘。
 
 【输出格式规范（严格返回合法 JSON 对象，严禁 Markdown）】
 {
