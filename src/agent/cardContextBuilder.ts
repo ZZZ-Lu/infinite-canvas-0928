@@ -322,9 +322,34 @@ export async function buildAutoInjectedCardContext(
     lines.push(`- **下游衍生卡片 (Children)**: ${lineage.childNodes.map(cn => `\`${cn.id}\`(${cn.title})`).join(', ')}`);
   }
 
+  // 3. Existing Visual Element Annotations / Landmarks (if available)
+  const landmarks = targetCard.landmarks;
+  const elements = landmarks?.elements || landmarks?.interestPoints || [];
+
+  if (elements.length > 0 || landmarks?.summary) {
+    lines.push(``);
+    lines.push(`## 3. 已有画面元素标注与空间坐标 (Existing Visual Annotations)`);
+    if (landmarks?.requirement) {
+      lines.push(`- 历史标注需求: "${landmarks.requirement}"`);
+    }
+    if (landmarks?.summary) {
+      lines.push(`- 视觉语义摘要: ${landmarks.summary}`);
+    }
+    if (landmarks?.shotType) {
+      lines.push(`- 景别分类: ${landmarks.shotType}`);
+    }
+    lines.push(`- 已标注元素清单 (${elements.length} 项):`);
+    elements.forEach((el: any) => {
+      const coordStr = el.point ? `坐标 [${el.point.x}, ${el.point.y}]` : (el.box ? `检测框 [${el.box.join(', ')}]` : '');
+      const descStr = el.description ? ` - ${el.description}` : '';
+      lines.push(`  * ID: \`${el.id}\` | 标签: **${el.label}** (${el.category || '元素'}${coordStr ? ` | ${coordStr}` : ''})${descStr}`);
+    });
+    lines.push(`*提示：可直接利用已有标注元素 ID 进行 \`card.detectLandmarks\` 的 update / delete，或在 mode="append" 下追加新元素。*`);
+  }
+
   if (imageLabels.length > 0) {
     lines.push(``);
-    lines.push(`## 3. 多模态视觉图像对照 (Visual Images Injected)`);
+    lines.push(`## 4. 多模态视觉图像对照 (Visual Images Injected)`);
     imageLabels.forEach(label => lines.push(`- ${label}`));
     lines.push(`*提示：仅精准注入当前聚焦卡片及其关联参考图，无需在 UI 上重复打开弹窗即可直接观察分析。*`);
   }
@@ -338,6 +363,15 @@ export async function buildAutoInjectedCardContext(
     ratio: targetCard.ratio,
     res: targetCard.res,
     model: targetCard.mcpModel,
+    annotations: elements,
+    landmarks: landmarks ? {
+      detectedAt: landmarks.detectedAt,
+      requirement: landmarks.requirement,
+      summary: landmarks.summary,
+      shotType: landmarks.shotType,
+      elementCount: elements.length,
+      elements,
+    } : undefined,
     lineage: {
       roots: lineage.rootNodes.map(n => ({ id: n.id, title: n.title, prompt: n.prompt })),
       parents: lineage.parentNodes.map(n => ({ id: n.id, title: n.title, prompt: n.prompt })),
@@ -346,6 +380,154 @@ export async function buildAutoInjectedCardContext(
       children: lineage.childNodes.map(n => ({ id: n.id, title: n.title })),
       evolutionSummary: lineage.evolutionSummary,
     },
+    imageLabels,
+  };
+
+  return {
+    markdownSummary,
+    structuredContext,
+    images,
+    imageLabels,
+  };
+}
+
+/**
+ * Builds auto-injected context when multiple cards are selected
+ */
+export async function buildMultiCardInjectedContext(
+  selectedCards: CardData[],
+  allCards: CardData[],
+  extractCardImageBase64: (card: CardData) => Promise<string | undefined>
+): Promise<InjectedCardContextResult> {
+  const images: string[] = [];
+  const imageLabels: string[] = [];
+  const seenB64 = new Set<string>();
+
+  const cardDetails: Array<{
+    card: CardData;
+    imageB64?: string;
+    imageLabelIndex?: number;
+    refImages: { label: string; b64: string }[];
+  }> = [];
+
+  for (let idx = 0; idx < selectedCards.length; idx++) {
+    const card = selectedCards[idx];
+    const b64 = await extractCardImageBase64(card);
+    let imageLabelIndex: number | undefined = undefined;
+
+    if (b64 && !seenB64.has(b64)) {
+      seenB64.add(b64);
+      images.push(b64);
+      imageLabelIndex = images.length;
+      imageLabels.push(`图 ${imageLabelIndex} (选中卡片 #${idx + 1} 画面 - ${card.fileName || '卡片 #' + card.id.slice(-6)})`);
+    }
+
+    // Extract reference images for this card if any
+    const refImages: { label: string; b64: string }[] = [];
+    if (Array.isArray(card.referenceImages) && card.referenceImages.length > 0) {
+      for (let i = 0; i < card.referenceImages.length; i++) {
+        const ref = card.referenceImages[i];
+        let refB64: string | undefined = undefined;
+        if (ref.sourceCardId) {
+          const sourceCard = allCards.find(c => c.id === ref.sourceCardId);
+          if (sourceCard) {
+            refB64 = await extractCardImageBase64(sourceCard);
+          }
+        }
+        if (!refB64 && ref.url && ref.url.startsWith('data:image/')) {
+          refB64 = ref.url;
+        }
+        if (!refB64 && (ref.url || ref.thumbnailUrl)) {
+          const mockRefCard: Partial<CardData> = {
+            id: `ref_${card.id}_${i}`,
+            imageUrl: ref.url || ref.thumbnailUrl,
+          };
+          refB64 = await extractCardImageBase64(mockRefCard as CardData);
+        }
+
+        if (refB64 && !seenB64.has(refB64)) {
+          seenB64.add(refB64);
+          images.push(refB64);
+          const refIndex = images.length;
+          const refName = ref.name || `参考图 ${i + 1}`;
+          const label = `图 ${refIndex} (卡片 #${idx + 1} 关联参考图: ${refName})`;
+          imageLabels.push(label);
+          refImages.push({ label, b64: refB64 });
+        }
+      }
+    }
+
+    cardDetails.push({
+      card,
+      imageB64: b64,
+      imageLabelIndex,
+      refImages,
+    });
+  }
+
+  // Format rich Markdown summary
+  const lines: string[] = [
+    `# 🎯 画布多选卡片批量自动注入 (Multi-Selected Cards Context - 共 ${selectedCards.length} 张)`,
+    ``,
+    `当前选中的卡片包含以下 ${selectedCards.length} 张焦点卡片及其多模态画面与标注，请综合这些卡片的信息进行分析或调整：`,
+    ``,
+  ];
+
+  selectedCards.forEach((card, idx) => {
+    const detail = cardDetails[idx];
+    const cardTitle = card.fileName ? `**[${card.fileName}]**` : `卡片 #${card.id.slice(-6)}`;
+    const imgRefStr = detail.imageLabelIndex ? ` (对应 [图 ${detail.imageLabelIndex}])` : '';
+
+    lines.push(`## 📌 卡片 ${idx + 1}: ${cardTitle}${imgRefStr}`);
+    lines.push(`- 卡片ID: \`${card.id}\``);
+    lines.push(`- 类型: ${card.isVideo ? '视频生成卡片' : (card.isAsset ? '素材/参考资产' : '生图卡片')}`);
+    lines.push(`- 提示词 (Prompt): ${card.prompt ? `"${card.prompt}"` : '(空)'}`);
+    if (card.lastGeneratedPrompt && card.lastGeneratedPrompt !== card.prompt) {
+      lines.push(`- 历史生成提示词: "${card.lastGeneratedPrompt}"`);
+    }
+    lines.push(`- 画幅比例与分辨率: ${card.ratio || '9:16'} · ${card.res || '2K'}`);
+    if (card.mcpModel) {
+      lines.push(`- 关联模型: ${card.mcpModel}`);
+    }
+    lines.push(`- 画布坐标: (X: ${Math.round(card.x)}, Y: ${Math.round(card.y)})`);
+
+    // Landmarks / Annotations
+    const landmarks = card.landmarks;
+    const elements = landmarks?.elements || landmarks?.interestPoints || [];
+    if (elements.length > 0 || landmarks?.summary) {
+      lines.push(`- **已存标注与语义**: ${landmarks?.summary || `${elements.length} 项标注`}`);
+      elements.forEach((el: any) => {
+        const coordStr = el.point ? `坐标 [${el.point.x}, ${el.point.y}]` : (el.box ? `检测框 [${el.box.join(', ')}]` : '');
+        lines.push(`  * 标注 \`${el.id}\`: **${el.label}** (${el.category || '元素'}${coordStr ? ` | ${coordStr}` : ''})`);
+      });
+    }
+    lines.push(``);
+  });
+
+  if (imageLabels.length > 0) {
+    lines.push(`## 🖼️ 多模态视觉图像对照 (Visual Images Injected)`);
+    imageLabels.forEach(label => lines.push(`- ${label}`));
+    lines.push(`*提示：已将当前所有选中卡片的画面自动拼接注入至多模态上下文供多视角对比分析。*`);
+  }
+
+  const markdownSummary = lines.join('\n');
+
+  const structuredContext = {
+    isMultiSelect: true,
+    selectedCardsCount: selectedCards.length,
+    selectedCardIds: selectedCards.map(c => c.id),
+    cards: selectedCards.map(c => ({
+      id: c.id,
+      title: c.fileName || '未命名卡片',
+      prompt: c.prompt,
+      ratio: c.ratio,
+      res: c.res,
+      model: c.mcpModel,
+      x: c.x,
+      y: c.y,
+      annotations: c.landmarks?.elements || c.landmarks?.interestPoints || [],
+      landmarks: c.landmarks,
+    })),
     imageLabels,
   };
 

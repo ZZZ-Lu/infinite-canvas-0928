@@ -1323,7 +1323,7 @@ export function ProjectScriptBible({
             exit={{ opacity: 0, scale: 0.97, y: -8 }}
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
             data-prevent-canvas-wheel="true"
-            className="fixed top-[58px] bottom-6 left-4 w-[520px] max-w-[calc(100vw-32px)] z-50 flex flex-col select-none pointer-events-auto transform-gpu bg-[#f3f4f6] dark:bg-[#1C1C1E] border border-gray-200/50 dark:border-white/10 rounded-[24px] corner-squircle shadow-2xl overflow-hidden"
+            className="fixed top-[58px] bottom-6 left-4 w-[520px] max-w-[calc(100vw-32px)] z-50 flex flex-col select-text pointer-events-auto transform-gpu bg-[#f3f4f6] dark:bg-[#1C1C1E] border border-gray-200/50 dark:border-white/10 rounded-[24px] corner-squircle shadow-2xl overflow-hidden"
             onPointerDown={(e) => e.stopPropagation()}
             onWheel={(e) => e.stopPropagation()}
           >

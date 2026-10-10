@@ -1,6 +1,65 @@
-import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useMemo } from 'react';
 import { motion, MotionValue, useTransform, useMotionValue, animate, AnimatePresence } from 'motion/react';
 import { ArrowUp } from 'lucide-react';
+import { CardData } from './GenerationCard';
+
+export function buildDynamicSelectionPrompt(cards: CardData[]): string {
+  if (!cards || cards.length === 0) {
+    return "我能帮什么忙？";
+  }
+
+  if (cards.length === 1) {
+    const card = cards[0];
+    const rawName = (card.name || card.fileName || card.prompt || '')
+      .replace(/\.(png|jpg|jpeg|webp|gif|mp4|mov|webm)$/i, '')
+      .trim();
+    const cleanName = rawName.replace(/[\r\n]+/g, ' ').trim();
+
+    if (cleanName && cleanName.length <= 12) {
+      return `选了【${cleanName}】，需要我做什么？`;
+    }
+
+    if (card.isVideo) {
+      return "选了 1 个视频，需要我做什么？";
+    }
+    if (card.imageUrl || card.fileData || card.isAsset || card.thumbnailUrl) {
+      return "选了 1 张图片，需要我做什么？";
+    }
+    return "选了 1 个卡片，需要我做什么？";
+  }
+
+  let videoCount = 0;
+  let imageCount = 0;
+  let otherCount = 0;
+
+  for (const c of cards) {
+    if (c.isVideo) {
+      videoCount++;
+    } else if (c.imageUrl || c.fileData || c.isAsset || c.thumbnailUrl) {
+      imageCount++;
+    } else {
+      otherCount++;
+    }
+  }
+
+  const total = cards.length;
+
+  if (imageCount === total) {
+    return `选了 ${total} 张图片，需要我做什么？`;
+  }
+  if (videoCount === total) {
+    return `选了 ${total} 个视频，需要我做什么？`;
+  }
+  if (otherCount === total) {
+    return `选了 ${total} 个卡片，需要我做什么？`;
+  }
+
+  if (imageCount > 0 && videoCount > 0 && otherCount === 0) {
+    return `选了 ${imageCount} 张图片和 ${videoCount} 个视频，需要我做什么？`;
+  }
+
+  return `选了 ${total} 个卡片，需要我做什么？`;
+}
 
 export interface QuickInputConfig {
   isOpen: boolean;
@@ -32,6 +91,8 @@ interface AgentCursorProps {
   };
   isIdle?: boolean;
   isZooming?: boolean;
+  isAgentRunning?: boolean;
+  selectedCards?: CardData[];
   quickInput?: QuickInputConfig | null;
   onClickPointer?: () => void;
   onDragAgent?: (newCanvasX: number, newCanvasY: number) => void;
@@ -62,21 +123,41 @@ const CURSOR_FLOAT_VARIANTS = {
   },
 };
 
+function isThinkingPhrase(text?: string): boolean {
+  if (!text) return true;
+  const clean = text.trim();
+  if (!clean) return true;
+  return (
+    clean === '...' ||
+    clean === 'thinking' ||
+    clean === 'loading' ||
+    clean === '正在思考...' ||
+    clean === '图生好了，我先看下...' ||
+    clean.endsWith('...') ||
+    clean.endsWith('…') ||
+    clean.includes('正在思考') ||
+    clean.includes('排队渲染') ||
+    clean.includes('正在拉取')
+  );
+}
+
 function SingleLineMarquee({ 
   text, 
   isDarkMode, 
-  isHistory = false 
+  isHistory = false,
+  speaker = 'agent',
 }: { 
   text: string; 
   isDarkMode?: boolean; 
   isHistory?: boolean; 
+  speaker?: 'user' | 'agent';
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const textRef = useRef<HTMLSpanElement>(null);
   const [overflow, setOverflow] = useState(0);
 
   const cleanText = (text || '').trim();
-  const isThinking = !cleanText || cleanText === '...' || cleanText === 'thinking' || cleanText === 'loading';
+  const isThinking = isThinkingPhrase(cleanText);
 
   useLayoutEffect(() => {
     if (containerRef.current && textRef.current) {
@@ -90,17 +171,25 @@ function SingleLineMarquee({
     }
   }, [text]);
 
-  const textStyleClass = isHistory
-    ? (isDarkMode 
-        ? "inline-block text-[12px] font-medium leading-none text-[#a45cf8]/55 tracking-wide antialiased"
-        : "inline-block text-[12px] font-medium leading-none text-purple-600/55 tracking-wide antialiased")
-    : (isDarkMode 
-        ? "inline-block text-[13px] font-semibold leading-none text-[#a45cf8] tracking-wide antialiased"
-        : "inline-block text-[13px] font-semibold leading-none text-purple-600 tracking-wide antialiased");
+  const textStyleClass = speaker === 'user'
+    ? (isHistory
+        ? (isDarkMode 
+            ? "inline-block text-[12px] font-medium leading-none text-white/70 tracking-wide antialiased"
+            : "inline-block text-[12px] font-medium leading-none text-slate-800/70 tracking-wide antialiased")
+        : (isDarkMode 
+            ? "inline-block text-[13px] font-semibold leading-none text-white tracking-wide antialiased"
+            : "inline-block text-[13px] font-semibold leading-none text-slate-900 tracking-wide antialiased"))
+    : (isHistory
+        ? (isDarkMode 
+            ? "inline-block text-[12px] font-medium leading-none text-[#a45cf8]/70 tracking-wide antialiased"
+            : "inline-block text-[12px] font-medium leading-none text-purple-600/70 tracking-wide antialiased")
+        : (isDarkMode 
+            ? "inline-block text-[13px] font-semibold leading-none text-[#a45cf8] tracking-wide antialiased"
+            : "inline-block text-[13px] font-semibold leading-none text-purple-600 tracking-wide antialiased"));
 
-  const dotColorClass = isHistory
-    ? (isDarkMode ? 'bg-[#a45cf8]/40' : 'bg-purple-600/40')
-    : (isDarkMode ? 'bg-[#a45cf8]' : 'bg-purple-600');
+  const dotColorClass = speaker === 'user'
+    ? (isHistory ? (isDarkMode ? 'bg-white/60' : 'bg-slate-800/60') : (isDarkMode ? 'bg-white' : 'bg-slate-900'))
+    : (isHistory ? (isDarkMode ? 'bg-[#a45cf8]/60' : 'bg-purple-600/60') : (isDarkMode ? 'bg-[#a45cf8]' : 'bg-purple-600'));
 
   return (
     <div
@@ -172,6 +261,8 @@ export function AgentCursor({
   transform, 
   isIdle = true, 
   isZooming = false, 
+  isAgentRunning,
+  selectedCards = [],
   quickInput, 
   onClickPointer, 
   onDragAgent, 
@@ -195,7 +286,12 @@ export function AgentCursor({
   const [submitStep, setSubmitStep] = useState<'idle' | 'user-at-row2' | 'user-at-row1'>('idle');
   const [submittedUserPrompt, setSubmittedUserPrompt] = useState<string | null>(null);
 
-  const isThinkingMode = agentState.speak === '正在思考...' || agentState.speak === '...' || agentState.speak === 'thinking' || agentState.speak === 'loading';
+  const rawIsThinking = isThinkingPhrase(agentState.speak);
+  const isActuallyThinking = (isAgentRunning !== false) && rawIsThinking;
+
+  const dynamicPromptText = useMemo(() => {
+    return buildDynamicSelectionPrompt(selectedCards || []);
+  }, [selectedCards]);
 
   // When quickInput opens or target card changes, settle state and clear any old transient submitted prompt
   useEffect(() => {
@@ -226,8 +322,25 @@ export function AgentCursor({
           : (submittedUserPrompt || agentState.lastPrompt || null)
       );
 
+  const isDefaultOrSelectionSpeak = !agentState.speak ||
+    rawIsThinking ||
+    agentState.speak.startsWith('选了') ||
+    agentState.speak === '我能帮什么忙？';
+
+  // When quickInput is open and waiting for user input, the agent shouldn't be "thinking"
+  // It should show a ready dynamic prompt unless actively executing
+  const effectiveAgentSpeak = (quickInput?.isOpen && submitStep === 'idle' && isDefaultOrSelectionSpeak)
+    ? dynamicPromptText
+    : (rawIsThinking && isAgentRunning === false)
+      ? undefined
+      : (agentState.speak || (quickInput?.isOpen ? dynamicPromptText : undefined));
+
+  const effectiveIsThinking = (quickInput?.isOpen && submitStep === 'idle' && rawIsThinking)
+    ? false
+    : isActuallyThinking;
+
   // Deduplication guard: Never display identical text simultaneously in Row 1 and Row 2
-  const historyText = rawHistoryText && rawHistoryText.trim() !== (agentState.speak || '').trim()
+  const historyText = rawHistoryText && rawHistoryText.trim() !== (effectiveAgentSpeak || '').trim()
     ? rawHistoryText
     : null;
 
@@ -250,7 +363,7 @@ export function AgentCursor({
 
   const row2Content = submitStep === 'user-at-row2'
     ? { type: 'user' as const, text: submittedUserPrompt || '' }
-    : (agentState.speak ? { type: 'agent' as const, text: agentState.speak, isThinking: isThinkingMode } : null);
+    : (effectiveAgentSpeak ? { type: 'agent' as const, text: effectiveAgentSpeak, isThinking: effectiveIsThinking } : null);
 
   // Tracks horizontal breathing morphing (squeeze & expand) for text updates within the single persistent bubble
   const [morphTrigger, setMorphTrigger] = useState(0);
@@ -278,11 +391,11 @@ export function AgentCursor({
   const historyBubbleBgClass = isDarkMode 
     ? 'bg-[#141417]/85 border border-[#a45cf8]/15 shadow-[0_2px_12px_rgba(0,0,0,0.55)]' 
     : 'bg-white/85 border border-purple-200/50 shadow-[0_2px_10px_rgba(0,0,0,0.06)]';
-  const textClass = isDarkMode ? 'text-[#a45cf8] font-semibold' : 'text-purple-600 font-semibold';
-  const placeholderClass = isDarkMode ? 'placeholder-[#a45cf8]/45' : 'placeholder-purple-500/45';
-  const inputClass = isDarkMode ? 'text-[#a45cf8]' : 'text-purple-600';
-  const buttonClassActive = isDarkMode ? 'bg-[#a45cf8]/15 hover:bg-[#a45cf8]/25 text-[#a45cf8]' : 'bg-purple-500/10 hover:bg-purple-500/20 text-purple-600';
-  const buttonClassInactive = isDarkMode ? 'text-[#a45cf8]/30' : 'text-purple-500/35';
+  const textClass = isDarkMode ? 'text-white font-semibold' : 'text-slate-900 font-semibold';
+  const placeholderClass = isDarkMode ? 'placeholder-white/40' : 'placeholder-slate-400';
+  const inputClass = isDarkMode ? 'text-white' : 'text-slate-900';
+  const buttonClassActive = isDarkMode ? 'bg-[#a45cf8]/20 hover:bg-[#a45cf8]/35 text-[#a45cf8]' : 'bg-purple-500/15 hover:bg-purple-500/25 text-purple-600';
+  const buttonClassInactive = isDarkMode ? 'text-white/30' : 'text-slate-400';
 
   const isOpen = quickInput?.isOpen;
   const focusTrigger = quickInput?.focusTrigger;
@@ -367,6 +480,7 @@ export function AgentCursor({
   );
 
   const handlePointerDown = (e: React.PointerEvent) => {
+    if (isAgentRunning) return;
     e.stopPropagation();
     e.preventDefault();
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
@@ -496,7 +610,7 @@ export function AgentCursor({
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
         >
-          {agentState.cursorMode === 'working' ? (
+          {agentState.cursorMode === 'working' && isAgentRunning !== false ? (
             <svg
               width="36"
               height="36"
@@ -571,7 +685,7 @@ export function AgentCursor({
                 >
                   <div className="relative px-3 py-1 flex items-center">
                     <div 
-                      className={`absolute inset-0 rounded-full ${historyBubbleBgClass}`} 
+                      className={`absolute inset-0 rounded-xl corner-squircle ${historyBubbleBgClass}`} 
                       style={{
                         willChange: 'transform',
                         transform: 'translate3d(0,0,0)',
@@ -579,7 +693,7 @@ export function AgentCursor({
                       }}
                     />
                     <div className="relative z-10 flex items-center max-w-[340px]" style={{ transform: 'translateZ(0)' }}>
-                      <SingleLineMarquee text={historyText} isDarkMode={isDarkMode} isHistory={true} />
+                      <SingleLineMarquee text={historyText} isDarkMode={isDarkMode} isHistory={true} speaker={quickInput?.isOpen ? 'agent' : 'user'} />
                     </div>
                   </div>
                 </motion.div>
@@ -604,7 +718,7 @@ export function AgentCursor({
                 >
                   <div className="relative px-3.5 py-1.5 flex items-center origin-left">
                     <div 
-                      className={`absolute inset-0 rounded-full ${bubbleBgClass}`} 
+                      className={`absolute inset-0 rounded-xl corner-squircle ${bubbleBgClass}`} 
                       style={{
                         willChange: 'transform',
                         transform: 'translate3d(0,0,0)',
@@ -612,7 +726,7 @@ export function AgentCursor({
                       }}
                     />
                     <div className="relative z-10 flex items-center" style={{ transform: 'translateZ(0)' }}>
-                      <SingleLineMarquee text={row2Content.text} isDarkMode={isDarkMode} />
+                      <SingleLineMarquee text={row2Content.text} isDarkMode={isDarkMode} speaker={row2Content.type} />
                     </div>
                   </div>
                 </motion.div>
@@ -633,7 +747,7 @@ export function AgentCursor({
               >
                 <div className="relative flex items-center w-[290px]">
                   <div 
-                    className={`absolute inset-0 rounded-full ${bubbleBgClass}`} 
+                    className={`absolute inset-0 rounded-xl corner-squircle ${bubbleBgClass}`} 
                     style={{
                       willChange: 'transform',
                       transform: 'translate3d(0,0,0)',

@@ -356,9 +356,11 @@ export class AgentRuntime {
       } else {
         task.status = 'completed';
         const response = typeof call.arguments.finalResponse === 'string' ? call.arguments.finalResponse : '任务完成。';
-        const hasAnswer = task.events.some(e => e.turnId === turnId && e.type === 'answer');
-        if (!hasAnswer) {
+        const existingAnswer = task.events.find(e => e.turnId === turnId && e.type === 'answer');
+        if (!existingAnswer) {
           this.addEvent(task, { turnId, type: 'answer', text: response });
+        } else if (response && response !== '任务完成。') {
+          existingAnswer.text = response;
         }
         task.summary = response || task.summary;
       }

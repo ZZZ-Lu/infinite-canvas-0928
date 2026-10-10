@@ -301,19 +301,34 @@ export interface InterestPoint {
   box?: [number, number, number, number];
 }
 
+export interface VisualElementAnnotation {
+  id: string;
+  label: string;
+  category?: string;
+  point: { x: number; y: number }; // 0 - 100%
+  box?: [number, number, number, number]; // [ymin, xmin, ymax, xmax] in 0-100%
+  description?: string;
+  importance?: number;
+  source?: 'ai_detected' | 'user_created' | 'agent_updated';
+  createdAt?: number;
+}
+
 export interface SubjectLandmarks {
   detectedAt: number;
+  requirement?: string;
   summary?: string;
-  hasPerson: boolean;
-  shotType?: 'close_up' | 'medium_shot' | 'full_shot' | 'landscape' | 'macro' | 'object';
+  elements?: VisualElementAnnotation[];
+  hasPerson?: boolean;
+  shotType?: 'close_up' | 'medium_shot' | 'full_shot' | 'landscape' | 'macro' | 'object' | string;
   interestPoints?: InterestPoint[];
-  regions: {
+  regions?: {
     head?: { x: number; y: number; box?: [number, number, number, number] };
     eyes?: { x: number; y: number };
     chest?: { x: number; y: number; box?: [number, number, number, number] };
     hands?: Array<{ x: number; y: number }>;
     legs?: { x: number; y: number; box?: [number, number, number, number] };
     primaryObject?: { label: string; x: number; y: number; box?: [number, number, number, number] };
+    [key: string]: any;
   };
   modelUsed?: string;
   fallbackNotice?: string;
@@ -368,7 +383,7 @@ export interface CardData {
   generationError?: string;
   lastGeneratedPrompt?: string;
   baselineConfig?: CardBaselineConfig;
-  landmarks?: SubjectLandmarks; // 图像主体定位节点模型产物
+  landmarks?: SubjectLandmarks; // 画面元素标注节点模型产物
   chatHistory?: Array<{
     id: string;
     role: 'user' | 'assistant';
@@ -465,7 +480,7 @@ const ReferenceThumbItem = React.memo(function ReferenceThumbItem({
           className="absolute top-0.5 left-0.5 right-0.5 z-20 pointer-events-auto hover:bg-blue-500/20 dark:hover:bg-blue-400/20 rounded px-0.5 transition-colors cursor-pointer text-left block"
           title="点击在提示词中@此参考图"
         >
-          <span className="text-[6.5px] font-bold text-[#3b82f6] dark:text-blue-400 select-none block truncate leading-none text-left tracking-tight hover:underline">
+          <span className="text-[6.5px] font-bold text-[#3b82f6] dark:text-blue-400 select-none block truncate leading-normal text-left tracking-tight hover:underline">
             @{item.name || `图 ${idx + 1}`}
           </span>
         </button>
@@ -959,6 +974,35 @@ export async function detectCharacterRegion(
 }
 
 /**
+ * Safely trigger Framer Motion animation controls preventing unmounted subscriber invariant errors.
+ */
+async function safeAnimate(
+  controls: ReturnType<typeof useAnimationControls>,
+  definition: any,
+  isMounted: () => boolean
+) {
+  if (!isMounted()) return;
+  try {
+    await controls.start(definition);
+  } catch (err: any) {
+    const isUnmountedError =
+      typeof err?.message === 'string' &&
+      (err.message.includes('should only be called after a component has mounted') ||
+       err.message.includes('controls.start'));
+
+    if (isUnmountedError && isMounted()) {
+      await new Promise((r) => requestAnimationFrame(r));
+      if (!isMounted()) return;
+      try {
+        await controls.start(definition);
+      } catch {
+        // Suppress unmounted/race condition error safely
+      }
+    }
+  }
+}
+
+/**
  * 实时无限自定义端详眼动漫游机 (Infinite Real-Time Gaze Walk)
  * - 结合方案一：纯前端精准人物/人脸定位（Native GPU + Biometric Skin-Tone Analyzer）
  * - 结合方案二：视觉显著性热点检测（Canvas Salience Heatmap）
@@ -1138,22 +1182,22 @@ export function InfiniteRealtimeQCGaze({
       let curY = Math.max(10, Math.min(90, firstTarget.y));
       let lastPointId: string | null = firstTarget.id;
 
-      await gazeControls.start({
+      await safeAnimate(gazeControls, {
         left: `${curX}%`,
         top: `${curY}%`,
         scale: 1.08,
         opacity: 0,
         transition: { duration: 0 },
-      });
+      }, () => isMounted);
 
       if (!isMounted) return;
 
       // Soft entrance fade-in
-      await gazeControls.start({
+      await safeAnimate(gazeControls, {
         opacity: 0.92,
         scale: 1.0,
         transition: { duration: 0.45, ease: 'easeOut' },
-      });
+      }, () => isMounted);
 
       // 2. 连续自适应动态打转漫游（本地模型先行端详 -> 节点返回数据后平滑无缝切换）
       const startTime = Date.now();
@@ -1284,7 +1328,7 @@ export function InfiniteRealtimeQCGaze({
           const midY = Math.max(8, Math.min(92, (curY + entryY) / 2 + ny * arcMagnitude));
 
           // 阶段一：顺着形体与光影弧度优雅掠向中途观察区
-          await gazeControls.start({
+          await safeAnimate(gazeControls, {
             left: `${midX}%`,
             top: `${midY}%`,
             scale: [1.0, 1.08],
@@ -1293,12 +1337,12 @@ export function InfiniteRealtimeQCGaze({
               duration: totalTravelDuration * 0.45,
               ease: [0.35, 0, 0.65, 0.5], // 弧线加速带出
             },
-          });
+          }, () => isMounted);
 
           if (!isMounted) break;
 
           // 阶段二：受目标高兴趣点强引力牵引，柔和吸附滑入
-          await gazeControls.start({
+          await safeAnimate(gazeControls, {
             left: `${entryX}%`,
             top: `${entryY}%`,
             scale: [1.08, 1.0],
@@ -1307,10 +1351,10 @@ export function InfiniteRealtimeQCGaze({
               duration: totalTravelDuration * 0.55,
               ease: [0.16, 1, 0.3, 1], // 电影级引力吸附缓入
             },
-          });
+          }, () => isMounted);
         } else {
           // 短距离微位移：单段柔滑掠过
-          await gazeControls.start({
+          await safeAnimate(gazeControls, {
             left: `${entryX}%`,
             top: `${entryY}%`,
             scale: [1.02, 1.08, 1.0],
@@ -1319,7 +1363,7 @@ export function InfiniteRealtimeQCGaze({
               duration: totalTravelDuration,
               ease: [0.22, 1, 0.36, 1],
             },
-          });
+          }, () => isMounted);
         }
 
         if (!isMounted) break;
@@ -1383,7 +1427,7 @@ export function InfiniteRealtimeQCGaze({
           curX = stepX;
           curY = stepY;
 
-          await gazeControls.start({
+          await safeAnimate(gazeControls, {
             left: `${stepX}%`,
             top: `${stepY}%`,
             scale: 1.0 + 0.04 * Math.sin(s * 1.2),
@@ -1392,7 +1436,7 @@ export function InfiniteRealtimeQCGaze({
               duration: stepDuration,
               ease: 'easeInOut',
             },
-          });
+          }, () => isMounted);
         }
       }
     }
@@ -1401,7 +1445,7 @@ export function InfiniteRealtimeQCGaze({
 
     return () => {
       isMounted = false;
-      gazeControls.stop();
+      try { gazeControls.stop(); } catch {}
     };
   }, [imageUrl, isPortrait, isLandscape, isTall, isWide, prompt, gazeControls, ratio, h, w]);
 
@@ -1579,34 +1623,34 @@ export function AdaptiveDwellGaze({
       let curY = initialTarget.y;
 
       await Promise.all([
-        gazeControls.start({
+        safeAnimate(gazeControls, {
           left: `${curX}%`,
           top: `${curY}%`,
           scale: 0.96,
           opacity: 0,
           transition: { duration: 0 },
-        }),
-        catchlightControls.start({
+        }, () => isMounted),
+        safeAnimate(catchlightControls, {
           left: `${curX}%`,
           top: `${curY}%`,
           opacity: 0,
           transition: { duration: 0 },
-        }),
+        }, () => isMounted),
       ]);
 
       if (!isMounted) return;
 
       // Organic entrance fade-in
       await Promise.all([
-        gazeControls.start({
+        safeAnimate(gazeControls, {
           opacity: 0.88,
           scale: 1.0,
           transition: { duration: 0.55 * Math.min(1.8, timeFactor), ease: 'easeOut' },
-        }),
-        catchlightControls.start({
+        }, () => isMounted),
+        safeAnimate(catchlightControls, {
           opacity: 0.85,
           transition: { duration: 0.55 * Math.min(1.8, timeFactor), ease: 'easeOut' },
-        }),
+        }, () => isMounted),
       ]);
 
       // 2. Continuous Real-Time Waypoint Decision Engine with Organic Time-Decay & Settling
@@ -1731,7 +1775,7 @@ export function AdaptiveDwellGaze({
 
           // 阶段一：顺着形体与光影弧度优雅掠向中途观察区
           await Promise.all([
-            gazeControls.start({
+            safeAnimate(gazeControls, {
               left: `${midX}%`,
               top: `${midY}%`,
               scale: [1.0, 1.08],
@@ -1740,8 +1784,8 @@ export function AdaptiveDwellGaze({
                 duration: totalTravelDuration * 0.45,
                 ease: [0.35, 0, 0.65, 0.5],
               },
-            }),
-            catchlightControls.start({
+            }, () => isMounted),
+            safeAnimate(catchlightControls, {
               left: `${midX}%`,
               top: `${midY}%`,
               opacity: 0.80,
@@ -1749,14 +1793,14 @@ export function AdaptiveDwellGaze({
                 duration: totalTravelDuration * 0.45,
                 ease: [0.35, 0, 0.65, 0.5],
               },
-            }),
+            }, () => isMounted),
           ]);
 
           if (!isMounted) break;
 
           // 阶段二：受目标高兴趣点强引力牵引，柔和吸附滑入
           await Promise.all([
-            gazeControls.start({
+            safeAnimate(gazeControls, {
               left: `${entryX}%`,
               top: `${entryY}%`,
               scale: [1.08, 1.0],
@@ -1765,8 +1809,8 @@ export function AdaptiveDwellGaze({
                 duration: totalTravelDuration * 0.55,
                 ease: [0.16, 1, 0.3, 1], // 电影级引力吸附缓入
               },
-            }),
-            catchlightControls.start({
+            }, () => isMounted),
+            safeAnimate(catchlightControls, {
               left: `${entryX}%`,
               top: `${entryY}%`,
               opacity: 0.88,
@@ -1774,12 +1818,12 @@ export function AdaptiveDwellGaze({
                 duration: totalTravelDuration * 0.55,
                 ease: [0.16, 1, 0.3, 1],
               },
-            }),
+            }, () => isMounted),
           ]);
         } else {
           // 短距离微位移：单段柔滑掠过
           await Promise.all([
-            gazeControls.start({
+            safeAnimate(gazeControls, {
               left: `${entryX}%`,
               top: `${entryY}%`,
               scale: [1.02, 1.08, 1.0],
@@ -1788,8 +1832,8 @@ export function AdaptiveDwellGaze({
                 duration: totalTravelDuration,
                 ease: [0.22, 1, 0.36, 1],
               },
-            }),
-            catchlightControls.start({
+            }, () => isMounted),
+            safeAnimate(catchlightControls, {
               left: `${entryX}%`,
               top: `${entryY}%`,
               opacity: 0.84,
@@ -1797,7 +1841,7 @@ export function AdaptiveDwellGaze({
                 duration: totalTravelDuration,
                 ease: [0.22, 1, 0.36, 1],
               },
-            }),
+            }, () => isMounted),
           ]);
         }
 
@@ -1863,7 +1907,7 @@ export function AdaptiveDwellGaze({
           curY = stepY;
 
           await Promise.all([
-            gazeControls.start({
+            safeAnimate(gazeControls, {
               left: `${stepX}%`,
               top: `${stepY}%`,
               scale: 1.0 + 0.04 * Math.sin(s * 1.2),
@@ -1872,8 +1916,8 @@ export function AdaptiveDwellGaze({
                 duration: stepDuration,
                 ease: 'easeInOut',
               },
-            }),
-            catchlightControls.start({
+            }, () => isMounted),
+            safeAnimate(catchlightControls, {
               left: `${stepX}%`,
               top: `${stepY}%`,
               opacity: 0.78 + 0.16 * Math.sin(s * 1.5),
@@ -1881,7 +1925,7 @@ export function AdaptiveDwellGaze({
                 duration: stepDuration,
                 ease: 'easeInOut',
               },
-            }),
+            }, () => isMounted),
           ]);
         }
       }
@@ -1891,8 +1935,8 @@ export function AdaptiveDwellGaze({
 
     return () => {
       isMounted = false;
-      gazeControls.stop();
-      catchlightControls.stop();
+      try { gazeControls.stop(); } catch {}
+      try { catchlightControls.stop(); } catch {}
     };
   }, [catchlightControls, gazeControls, points, speedMultiplier]);
 
@@ -1958,6 +2002,7 @@ export function LandmarkSpatialAnnotations({
   cardHeight,
   imageUrl,
   onSelectPoint,
+  onDeletePoint,
 }: {
   landmarks?: SubjectLandmarks;
   visible?: boolean;
@@ -1965,6 +2010,7 @@ export function LandmarkSpatialAnnotations({
   cardHeight?: number;
   imageUrl?: string;
   onSelectPoint?: (point: InterestPoint) => void;
+  onDeletePoint?: (id: string) => void;
 }) {
   const [naturalDim, setNaturalDim] = useState<{ nw: number; nh: number } | null>(() => {
     if (!imageUrl) return null;
@@ -1991,7 +2037,7 @@ export function LandmarkSpatialAnnotations({
     };
   }, [imageUrl]);
 
-    const points = useMemo<InterestPoint[]>(() => {
+  const points = useMemo<InterestPoint[]>(() => {
     if (!landmarks) return [];
     const seenIds = new Set<string>();
 
@@ -2008,8 +2054,23 @@ export function LandmarkSpatialAnnotations({
       });
     };
 
+    if (landmarks.elements && landmarks.elements.length > 0) {
+      return makeUnique(landmarks.elements.map((el, i) => ({
+        id: el.id || `elem_${i}`,
+        label: el.label,
+        x: el.point.x,
+        y: el.point.y,
+        category: (el.category as any) || 'detail',
+        box: el.box,
+        importance: el.importance || 0.9,
+      })));
+    }
+
     if (landmarks.interestPoints && landmarks.interestPoints.length > 0) {
-      return makeUnique(landmarks.interestPoints);
+      return makeUnique(landmarks.interestPoints.map(p => ({
+        ...p,
+        box: p.box || (p as any).box_2d,
+      })));
     }
     const result: InterestPoint[] = [];
     const r = landmarks.regions || {};
@@ -2019,6 +2080,7 @@ export function LandmarkSpatialAnnotations({
         label: '眼神光与面部表情',
         x: r.eyes?.x ?? r.head?.x ?? 50,
         y: r.eyes?.y ?? (r.head ? r.head.y - 2 : 25),
+        box: r.head?.box || (r.head as any)?.box_2d || (r.eyes as any)?.box || (r.eyes as any)?.box_2d,
         importance: 0.95,
         category: 'face',
       });
@@ -2029,6 +2091,7 @@ export function LandmarkSpatialAnnotations({
         label: '服饰质感与领口',
         x: r.chest.x,
         y: r.chest.y,
+        box: r.chest.box || (r.chest as any)?.box_2d,
         importance: 0.8,
         category: 'clothing',
       });
@@ -2039,6 +2102,7 @@ export function LandmarkSpatialAnnotations({
         label: '手部细节',
         x: r.hands[0].x,
         y: r.hands[0].y,
+        box: (r.hands[0] as any)?.box || (r.hands[0] as any)?.box_2d,
         importance: 0.75,
         category: 'anatomy',
       });
@@ -2049,6 +2113,7 @@ export function LandmarkSpatialAnnotations({
         label: '腿部与身形',
         x: r.legs.x,
         y: r.legs.y,
+        box: r.legs.box || (r.legs as any)?.box_2d,
         importance: 0.7,
         category: 'anatomy',
       });
@@ -2059,6 +2124,7 @@ export function LandmarkSpatialAnnotations({
         label: r.primaryObject.label || '核心主体焦点',
         x: r.primaryObject.x,
         y: r.primaryObject.y,
+        box: r.primaryObject.box || (r.primaryObject as any)?.box_2d,
         importance: 0.9,
         category: 'highlight',
       });
@@ -2066,11 +2132,13 @@ export function LandmarkSpatialAnnotations({
     return makeUnique(result);
   }, [landmarks]);
 
+  const [hoveredPointId, setHoveredPointId] = useState<string | null>(null);
+
   const renderedPoints = useMemo(() => {
-    // 1. Calculate base object-cover mapped coordinates
-    const mapped = points.map((pt, idx) => {
-      let renderX = pt.x;
-      let renderY = pt.y;
+    // 1. Calculate base object-cover mapped coordinates for any percentage point (0-100)
+    const mapPointToCard = (xPercent: number, yPercent: number) => {
+      let rx = xPercent;
+      let ry = yPercent;
 
       if (naturalDim && cardWidth && cardHeight && cardWidth > 0 && cardHeight > 0) {
         const { nw, nh } = naturalDim;
@@ -2081,20 +2149,77 @@ export function LandmarkSpatialAnnotations({
           // 画面比卡片更宽，左右发生裁剪
           const sw = nh * cardAspect;
           const sx = (nw - sw) / 2;
-          const pixelX = (pt.x / 100) * nw;
-          renderX = Math.max(0, Math.min(100, ((pixelX - sx) / sw) * 100));
+          const pixelX = (xPercent / 100) * nw;
+          rx = Math.max(0, Math.min(100, ((pixelX - sx) / sw) * 100));
         } else if (imgAspect < cardAspect) {
           // 画面比卡片更高，上下发生裁剪（如竖图比例微差）
           const sh = nw / cardAspect;
           const sy = (nh - sh) / 2;
-          const pixelY = (pt.y / 100) * nh;
-          renderY = Math.max(0, Math.min(100, ((pixelY - sy) / sh) * 100));
+          const pixelY = (yPercent / 100) * nh;
+          ry = Math.max(0, Math.min(100, ((pixelY - sy) / sh) * 100));
         }
       }
 
+      return { rx, ry };
+    };
+
+    const mapped = points.map((pt, idx) => {
+      const { rx: renderX, ry: renderY } = mapPointToCard(pt.x, pt.y);
+
+      // Parse or synthesize bounding box [ymin, xmin, ymax, xmax]
+      let rawYmin: number | null = null;
+      let rawXmin: number | null = null;
+      let rawYmax: number | null = null;
+      let rawXmax: number | null = null;
+
+      if (pt.box && Array.isArray(pt.box) && pt.box.length === 4) {
+        const [b0, b1, b2, b3] = pt.box.map((v: any) => typeof v === 'number' ? v : parseFloat(v) || 0);
+        const maxVal = Math.max(b0, b1, b2, b3);
+        let scale = 1;
+        if (maxVal > 100) {
+          scale = 10;
+        } else if (maxVal <= 1.0 && maxVal > 0) {
+          scale = 0.01;
+        }
+        rawYmin = Math.min(b0, b2) / scale;
+        rawYmax = Math.max(b0, b2) / scale;
+        rawXmin = Math.min(b1, b3) / scale;
+        rawXmax = Math.max(b1, b3) / scale;
+      }
+
+      if (
+        rawYmin === null ||
+        rawXmin === null ||
+        rawYmax === null ||
+        rawXmax === null ||
+        (rawXmin === 0 && rawXmax === 0 && rawYmin === 0 && rawYmax === 0)
+      ) {
+        // Fallback: target box around center point (4% margin)
+        const halfSize = 4;
+        rawXmin = Math.max(0, pt.x - halfSize);
+        rawXmax = Math.min(100, pt.x + halfSize);
+        rawYmin = Math.max(0, pt.y - halfSize);
+        rawYmax = Math.min(100, pt.y + halfSize);
+      }
+
+      const pTopLeft = mapPointToCard(rawXmin, rawYmin);
+      const pBottomRight = mapPointToCard(rawXmax, rawYmax);
+
+      const bLeft = Math.min(pTopLeft.rx, pBottomRight.rx);
+      const bTop = Math.min(pTopLeft.ry, pBottomRight.ry);
+      const bRight = Math.max(pTopLeft.rx, pBottomRight.rx);
+      const bBottom = Math.max(pTopLeft.ry, pBottomRight.ry);
+
+      const boxRect = {
+        left: Math.max(0, Math.min(99, bLeft)),
+        top: Math.max(0, Math.min(99, bTop)),
+        width: Math.max(1, Math.min(100 - bLeft, bRight - bLeft)),
+        height: Math.max(1, Math.min(100 - bTop, bBottom - bTop)),
+      };
+
       // If point is on the right half, label displays to the left to avoid card edge clipping
       const isRightSide = renderX > 52;
-      return { pt, idx, renderX, renderY, isRightSide, offsetY: 0 };
+      return { pt, idx, renderX, renderY, isRightSide, offsetY: 0, boxRect };
     });
 
     // 2. Resolve Y-axis collisions for points on the same side
@@ -2127,7 +2252,50 @@ export function LandmarkSpatialAnnotations({
   return (
     <div className="absolute inset-0 pointer-events-none z-25 overflow-hidden squircle">
       <AnimatePresence>
+        {/* 1. 位置点方框 (Bounding Boxes) */}
+        {renderedPoints.map(({ pt, idx, boxRect }) => {
+          const isHovered = hoveredPointId === pt.id;
+          return (
+            <motion.div
+              key={`box-${pt.id ? `${pt.id}-${idx}` : idx}`}
+              initial={{ opacity: 0, scale: 0.96 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.96, transition: { duration: 0.2 } }}
+              transition={{
+                delay: idx * 0.04,
+                duration: 0.35,
+                ease: [0.16, 1, 0.3, 1],
+              }}
+              style={{
+                left: `${boxRect.left}%`,
+                top: `${boxRect.top}%`,
+                width: `${boxRect.width}%`,
+                height: `${boxRect.height}%`,
+              }}
+              className={`absolute pointer-events-auto cursor-pointer rounded transition-all duration-200 border ${
+                isHovered
+                  ? 'border-purple-400 bg-purple-500/20 shadow-[0_0_12px_rgba(168,85,247,0.55)] ring-1 ring-purple-400/60 z-28'
+                  : 'border-purple-500/70 bg-purple-500/10 shadow-[0_0_6px_rgba(168,85,247,0.25)] hover:border-purple-400 hover:bg-purple-500/18 z-26'
+              }`}
+              onMouseEnter={() => setHoveredPointId(pt.id)}
+              onMouseLeave={() => setHoveredPointId(null)}
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelectPoint?.(pt);
+              }}
+            >
+              {/* 四角视觉定位锚点 (Corner Brackets) */}
+              <span className="absolute -top-[1px] -left-[1px] w-1.5 h-1.5 border-t-2 border-l-2 border-purple-300 pointer-events-none rounded-tl-[2px]" />
+              <span className="absolute -top-[1px] -right-[1px] w-1.5 h-1.5 border-t-2 border-r-2 border-purple-300 pointer-events-none rounded-tr-[2px]" />
+              <span className="absolute -bottom-[1px] -left-[1px] w-1.5 h-1.5 border-b-2 border-l-2 border-purple-300 pointer-events-none rounded-bl-[2px]" />
+              <span className="absolute -bottom-[1px] -right-[1px] w-1.5 h-1.5 border-b-2 border-r-2 border-purple-300 pointer-events-none rounded-br-[2px]" />
+            </motion.div>
+          );
+        })}
+
+        {/* 2. 位置点与文字标签 (Pin Dots & Labels) */}
         {renderedPoints.map(({ pt, idx, renderX, renderY, isRightSide, offsetY }) => {
+          const isHovered = hoveredPointId === pt.id;
           return (
             <motion.div
               key={pt.id ? `${pt.id}-${idx}` : `landmark-${idx}`}
@@ -2143,11 +2311,13 @@ export function LandmarkSpatialAnnotations({
                 left: `${renderX}%`,
                 top: `${renderY}%`,
               }}
-              className={`absolute pointer-events-auto group/landmark cursor-pointer flex items-center select-none ${
+              className={`absolute pointer-events-auto group/landmark cursor-pointer flex items-center select-none z-30 ${
                 isRightSide
                   ? 'flex-row-reverse -translate-x-[calc(100%-4px)] -translate-y-1/2'
                   : 'flex-row -translate-x-1 -translate-y-1/2'
               }`}
+              onMouseEnter={() => setHoveredPointId(pt.id)}
+              onMouseLeave={() => setHoveredPointId(null)}
               onClick={(e) => {
                 e.stopPropagation();
                 onSelectPoint?.(pt);
@@ -2156,17 +2326,33 @@ export function LandmarkSpatialAnnotations({
               {/* 1. 唯一的一个点 (Single Pin Dot) */}
               <div className="relative flex items-center justify-center shrink-0">
                 <span className="absolute w-4 h-4 rounded-full bg-purple-500/35 animate-ping pointer-events-none" />
-                <span className="relative w-2 h-2 rounded-full bg-purple-500 border-1.5 border-white dark:border-neutral-900 shadow-[0_0_8px_rgba(168,85,247,0.95)] transition-transform duration-200 group-hover/landmark:scale-130" />
+                <span className={`relative w-2 h-2 rounded-full bg-purple-500 border-1.5 border-white dark:border-neutral-900 shadow-[0_0_8px_rgba(168,85,247,0.95)] transition-transform duration-200 ${
+                  isHovered ? 'scale-130 ring-2 ring-purple-300' : 'group-hover/landmark:scale-130'
+                }`} />
               </div>
 
-              {/* 2. 文字：无底色、无描边，根据左右侧自适应贴边显示，带防撞错位微调 */}
+              {/* 2. 文字：无底色、无描边，根据左右侧自适应贴边显示，带防撞错位微调与删除交互 */}
               <span
                 style={offsetY !== 0 ? { transform: `translateY(${offsetY * 6.4}px)` } : undefined}
                 className={`${
-                  isRightSide ? 'mr-1.5 text-right' : 'ml-1.5 text-left'
-                } text-[11px] font-medium tracking-wide text-white drop-shadow-[0_1px_3px_rgba(0,0,0,0.95)] whitespace-nowrap transition-transform duration-200`}
+                  isRightSide ? 'mr-1.5 flex-row-reverse text-right' : 'ml-1.5 flex-row text-left'
+                } inline-flex items-center gap-1 text-[11px] font-medium tracking-wide text-white drop-shadow-[0_1px_3px_rgba(0,0,0,0.95)] whitespace-nowrap transition-transform duration-200`}
               >
-                {pt.label}
+                <span>{pt.label}</span>
+                {onDeletePoint && (
+                  <button
+                    type="button"
+                    title="删除此标注"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      e.preventDefault();
+                      onDeletePoint(pt.id);
+                    }}
+                    className="opacity-0 group-hover/landmark:opacity-100 p-0.5 hover:bg-red-500/80 rounded transition-opacity duration-150 text-white/70 hover:text-white cursor-pointer"
+                  >
+                    <X size={10} />
+                  </button>
+                )}
               </span>
             </motion.div>
           );
@@ -2185,7 +2371,7 @@ export interface GenerationCardProps {
   isSelected?: boolean;
   isAgentTarget?: boolean;
   agentFocusRole?: 'primary' | 'reference' | 'inspect' | 'interact' | 'working' | null;
-  agentInspectScenario?: 'qc' | 'quickInput' | 'compare';
+  agentInspectScenario?: 'qc' | 'quickInput' | 'compare' | 'inspect';
   isZooming?: boolean;
   allCards?: CardData[];
   currentProject?: ScriptProject;
@@ -2210,7 +2396,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   isSelected, 
   isAgentTarget,
   agentFocusRole,
-  agentInspectScenario = 'quickInput',
+  agentInspectScenario = 'inspect',
   isZooming,
   allCards,
   currentProject,
@@ -2252,6 +2438,15 @@ export const GenerationCard = React.memo(function GenerationCard({
       setCurrentScale(scale.get());
     }
   }, [isZooming, scale]);
+
+  // Initial mount transition state: triggers a one-time smooth fade-in for text tags upon entering viewport (culling) or mounting
+  const [isMountFading, setIsMountFading] = useState(true);
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setIsMountFading(false);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, []);
 
   // 🔍 动态探针：准确获取并缓存真实返回图片/视频的物理像素尺寸
   const [actualDimensions, setActualDimensions] = useState<{ width: number; height: number } | null>(() => {
@@ -2718,6 +2913,23 @@ export const GenerationCard = React.memo(function GenerationCard({
   const lastSavedTimeRef = useRef<number>(currentTime || 0);
   const menuContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const rightTagRef = useRef<HTMLDivElement>(null);
+  const [rightTagWidth, setRightTagWidth] = useState<number>(0);
+  const miraTagRef = useRef<HTMLDivElement>(null);
+  const [miraTagWidth, setMiraTagWidth] = useState<number>(0);
+
+  useLayoutEffect(() => {
+    if (rightTagRef.current) {
+      setRightTagWidth(rightTagRef.current.offsetWidth);
+    } else {
+      setRightTagWidth(0);
+    }
+    if (miraTagRef.current) {
+      setMiraTagWidth(miraTagRef.current.offsetWidth);
+    } else {
+      setMiraTagWidth(0);
+    }
+  });
 
   // Intent-driven lazy restoration for Video Mounting:
   // When canvas zoom/pan/gesture ends and styles/tags restore, if mouse is inside the video card,
@@ -4287,7 +4499,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                 {data.landmarks && (
                   <button
                     type="button"
-                    title={showLandmarksHUD ? "隐藏部位标注" : "显示部位标注"}
+                    title={showLandmarksHUD ? "隐藏元素标注" : "显示元素标注"}
                     onPointerDown={(e) => {
                       e.stopPropagation();
                     }}
@@ -4296,7 +4508,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                     }}
                     onClick={(e) => {
                       e.stopPropagation();
-                      e.preventDefault();
+                       e.preventDefault();
                       setShowLandmarksHUD(!showLandmarksHUD);
                     }}
                     className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-[10px] corner-squircle text-xs font-medium transition-all duration-150 active:scale-95 cursor-pointer select-none ${
@@ -4306,7 +4518,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                     }`}
                   >
                     <Eye className="w-3.5 h-3.5 text-purple-500 dark:text-purple-400" />
-                    <span>部位标注</span>
+                    <span>元素标注</span>
                   </button>
                 )}
 
@@ -4416,41 +4628,38 @@ export const GenerationCard = React.memo(function GenerationCard({
           }}
           onPointerDown={onPointerDown}
         >
-        {/* Agent Collaborator Badge (Figma Multiplayer Style) */}
-        {isAgentTarget && (
+        {/* Card / File Name Tag */}
+        {(data.name || data.fileName) && (
           <div 
-            className="absolute z-[70] pointer-events-none select-none transition-opacity duration-200"
+            className={`absolute z-[60] pointer-events-none asset-heavy-dom card-header-tag flex justify-start ${isMountFading ? 'card-tag-fade-in' : ''}`}
             style={{
-              top: 'calc(10px / var(--current-scale, 1))',
-              left: data.fileName ? 'auto' : 'calc(10px / var(--current-scale, 1))',
-              right: data.fileName ? 'calc(10px / var(--current-scale, 1))' : 'auto',
-              transform: 'scale(calc(1 / var(--current-scale, 1)))',
-              transformOrigin: data.fileName ? 'top right' : 'top left',
+              top: '12px',
+              left: '12px',
+              right: isAgentTarget
+                ? `calc(50% + ${Math.round((miraTagWidth || 100) / 2) + 8}px)`
+                : (resolutionTag 
+                    ? `calc(12px + ${(rightTagWidth || (resolutionTag.length > 3 ? 58 : 46))}px + 10px)`
+                    : '12px')
             }}
           >
-            <div className="bg-[#a45cf8] px-2 py-0.5 rounded-full shadow-md flex items-center gap-1 border border-white/20">
-              <span className="w-1.5 h-1.5 rounded-full bg-white animate-ping" />
-              <span className="text-white text-[10px] font-bold tracking-wide">
-                {agentFocusRole === 'working' ? 'Mira 正在生成' : agentFocusRole === 'reference' ? 'Mira 参考素材' : agentFocusRole === 'inspect' ? (agentInspectScenario === 'qc' ? 'Mira 正在质检' : agentInspectScenario === 'compare' ? 'Mira 正在对照' : 'Mira 正在端详') : 'Mira'}
+            <div className="bg-white/80 dark:bg-black/60 h-[26px] px-2.5 rounded-xl corner-squircle border border-black/10 dark:border-white/10 shadow-sm flex items-center justify-center max-w-full min-w-0">
+              <span className="text-gray-900 dark:text-white/95 text-[11px] font-medium truncate leading-normal tracking-wide">
+                {(data.name || data.fileName || '').replace(/\.[^/.]+$/, "")}
               </span>
             </div>
           </div>
         )}
-        {/* Card / File Name Tag */}
-        {(data.name || data.fileName) && (
+
+        {/* Agent Collaborator Badge (Figma Multiplayer Style - Centered) */}
+        {isAgentTarget && (
           <div 
-            className="absolute z-[60] pointer-events-none asset-heavy-dom"
-            style={{
-              top: 'calc(12px / var(--current-scale, 1))',
-              left: 'calc(12px / var(--current-scale, 1))',
-              transform: 'scale(calc(1 / var(--current-scale, 1)))',
-              transformOrigin: 'top left',
-              maxWidth: 'calc(var(--current-scale, 1) * 100% - 24px)'
-            }}
+            ref={miraTagRef}
+            className={`absolute top-[12px] left-1/2 -translate-x-1/2 z-[70] pointer-events-none asset-heavy-dom card-header-tag select-none ${isMountFading ? 'card-tag-fade-in' : ''}`}
           >
-            <div className="bg-black/60 px-2.5 py-1.5 rounded-lg border border-white/10 shadow-sm flex items-center">
-              <span className="text-white/95 text-[13px] font-medium truncate leading-none tracking-wide">
-                {(data.name || data.fileName || '').replace(/\.[^/.]+$/, "")}
+            <div className="bg-[#a45cf8] h-[26px] px-2.5 rounded-xl corner-squircle shadow-md flex items-center gap-1.5 border border-white/20">
+              <span className="w-1.5 h-1.5 rounded-full bg-white animate-ping" />
+              <span className="text-white text-[10px] font-bold tracking-wide whitespace-nowrap">
+                {agentFocusRole === 'working' ? 'Mira 正在生成' : agentFocusRole === 'reference' ? 'Mira 参考素材' : agentFocusRole === 'inspect' ? (agentInspectScenario === 'qc' ? 'Mira 正在质检' : agentInspectScenario === 'compare' ? 'Mira 正在对照' : 'Mira 正在查看') : 'Mira'}
               </span>
             </div>
           </div>
@@ -4459,16 +4668,15 @@ export const GenerationCard = React.memo(function GenerationCard({
         {/* Resolution Tag */}
         {resolutionTag && (
           <div 
-            className="absolute z-[60] pointer-events-none asset-heavy-dom"
+            ref={rightTagRef}
+            className={`absolute z-[60] pointer-events-none asset-heavy-dom card-header-tag ${isMountFading ? 'card-tag-fade-in' : ''}`}
             style={{
-              top: 'calc(12px / var(--current-scale, 1))',
-              right: 'calc(12px / var(--current-scale, 1))',
-              transform: 'scale(calc(1 / var(--current-scale, 1)))',
-              transformOrigin: 'top right',
+              top: '12px',
+              right: '12px',
             }}
           >
-            <div className="bg-black/60 px-2 py-1.5 rounded-lg border border-white/10 shadow-sm flex items-center">
-              <span className="text-white/90 text-[10px] font-bold tracking-wider leading-none">{resolutionTag}</span>
+            <div className="bg-white/80 dark:bg-black/60 h-[26px] px-2.5 rounded-xl corner-squircle border border-black/10 dark:border-white/10 shadow-sm flex items-center justify-center">
+              <span className="text-gray-900 dark:text-white/90 text-[10px] font-bold tracking-wider leading-normal">{resolutionTag}</span>
             </div>
           </div>
         )}
@@ -4951,9 +5159,8 @@ export const GenerationCard = React.memo(function GenerationCard({
           {agentFocusRole === 'inspect' && (() => {
             const minDim = Math.min(w, h);
 
-            if (agentInspectScenario === 'qc') {
-              // 场景一：生图刚完成的自主质检验收 (Post-Generation QC Review)
-              // 结合方案二：视觉显著性热点检测 + 实时动态航点漫游机
+            if (agentInspectScenario === 'qc' || agentInspectScenario === 'compare') {
+              // 场景一/三：自主质检验收与对照查看 - 复用现有单点游动查看动效机制
               return (
                 <InfiniteRealtimeQCGaze 
                   key="infinite-realtime-qc-gaze"
@@ -4964,83 +5171,6 @@ export const GenerationCard = React.memo(function GenerationCard({
                   imageUrl={imageUrl}
                   landmarks={data.landmarks}
                 />
-              );
-            }
-
-            if (agentInspectScenario === 'compare') {
-              // 场景三：多图对照与参考溯源 (Cross-Card Comparison & Feature Extraction)
-              // 节奏特征：短促、敏锐、定向对角切入扫视（1.8s 快速穿梭对比，抓取风格特征）
-              const compareMainSize = Math.max(300, Math.round(minDim * 0.75));
-              const compareProbeSize = Math.max(140, Math.round(minDim * 0.35));
-
-              const r = data.landmarks?.regions;
-              const targetX = r?.head?.x ?? r?.primaryObject?.x ?? 50;
-              const targetY = r?.head?.y ?? r?.primaryObject?.y ?? 35;
-              const fromX = targetX > 50 ? Math.max(15, targetX - 35) : Math.min(85, targetX + 35);
-              const fromY = Math.max(15, targetY - 20);
-
-              const compareCoords = {
-                left: [`${fromX}%`, `${targetX}%`, `${targetX - 8}%`, `${fromX}%`],
-                top: [`${fromY}%`, `${targetY}%`, `${targetY + 18}%`, `${fromY}%`],
-              };
-
-              return (
-                <motion.div
-                  key="foveal-gaze-compare"
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.35, ease: 'easeOut' }}
-                  className="absolute inset-0 z-20 pointer-events-none overflow-hidden squircle"
-                >
-                  {/* 对焦暗角 */}
-                  <div 
-                    className="absolute inset-0 pointer-events-none"
-                    style={{
-                      background: 'radial-gradient(ellipse at center, rgba(0,0,0,0) 40%, rgba(0,0,0,0.22) 100%)',
-                    }}
-                  />
-
-                  {/* 敏锐对角特征探针 (从外围掠过主体核心) */}
-                  <motion.div
-                    className="absolute rounded-full pointer-events-none blur-2xl mix-blend-screen -translate-x-1/2 -translate-y-1/2"
-                    style={{
-                      width: compareMainSize,
-                      height: compareMainSize,
-                      background: 'radial-gradient(circle, rgba(255,255,255,0.62) 0%, rgba(192,132,252,0.44) 35%, rgba(168,85,247,0.18) 65%, transparent 100%)',
-                    }}
-                    animate={{
-                      left: compareCoords.left,
-                      top: compareCoords.top,
-                      scale: [0.95, 1.15, 1, 0.95],
-                      opacity: [0.7, 0.95, 0.85, 0.7],
-                    }}
-                    transition={{
-                      duration: 1.8,
-                      repeat: Infinity,
-                      ease: 'easeInOut',
-                    }}
-                  />
-
-                  {/* 锐利特征捕捉高光 */}
-                  <motion.div
-                    className="absolute rounded-full pointer-events-none blur-md mix-blend-overlay -translate-x-1/2 -translate-y-1/2"
-                    style={{
-                      width: compareProbeSize,
-                      height: compareProbeSize,
-                      background: 'radial-gradient(circle, rgba(255,255,255,0.95) 0%, rgba(220,180,255,0.5) 45%, transparent 100%)',
-                    }}
-                    animate={{
-                      left: compareCoords.left,
-                      top: compareCoords.top,
-                    }}
-                    transition={{
-                      duration: 1.8,
-                      repeat: Infinity,
-                      ease: 'easeInOut',
-                    }}
-                  />
-                </motion.div>
               );
             }
 
@@ -5066,13 +5196,25 @@ export const GenerationCard = React.memo(function GenerationCard({
           cardWidth={w}
           cardHeight={h}
           imageUrl={imageUrl}
+          onDeletePoint={(pointId) => {
+            if (!data.landmarks) return;
+            const updatedElements = data.landmarks.elements?.filter(e => e.id !== pointId);
+            const updatedPoints = data.landmarks.interestPoints?.filter(p => p.id !== pointId);
+            onUpdate(data.id, {
+              landmarks: {
+                ...data.landmarks,
+                elements: updatedElements,
+                interestPoints: updatedPoints,
+              }
+            });
+          }}
         />
       </div>
 
       {/* Bottom Layer: Light Panel (Always rendered for generation cards; skeleton blocks in low LOD) */}
       {shouldRenderBottomPanel && (
       <div 
-        className={`generation-card-bottom-panel pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 ${isLowLodSkeleton ? '!rounded-none !corner-shape-none' : 'squircle'} p-4 gap-2 w-[480px] border border-gray-200/80 dark:border-[#404040] cursor-default self-start ease-out transform-gpu opacity-100 [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
+        className={`generation-card-bottom-panel ${isMountFading ? 'card-tag-fade-in' : ''} pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 ${isLowLodSkeleton ? '!rounded-none !corner-shape-none' : 'squircle'} p-4 gap-2 w-[480px] border border-gray-200/80 dark:border-[#404040] cursor-default self-start ease-out transform-gpu opacity-100 [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
         isZooming
           ? 'shadow-none dark:shadow-none' // Persistent Degradation: strip expensive drop shadows during high-frequency zoom
           : isSelected 

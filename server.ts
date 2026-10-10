@@ -9,16 +9,30 @@ dotenv.config();
 const defaultPromptFilePath = path.join(process.cwd(), "src/agent/systemPrompt.txt");
 const defaultStatePromptFilePath = path.join(process.cwd(), "src/agent/stateNodePrompt.txt");
 const defaultLandmarksPromptFilePath = path.join(process.cwd(), "src/agent/subjectLandmarksPrompt.txt");
+const defaultJsonAdapterPromptFilePath = path.join(process.cwd(), "src/agent/jsonAdapterPrompt.txt");
 const customPromptDir = path.join(process.cwd(), ".data");
 const customPromptFilePath = path.join(customPromptDir, "systemPrompt.txt");
 const customStatePromptFilePath = path.join(customPromptDir, "stateNodePrompt.txt");
 const customLandmarksPromptFilePath = path.join(customPromptDir, "subjectLandmarksPrompt.txt");
+const customJsonAdapterPromptFilePath = path.join(customPromptDir, "jsonAdapterPrompt.txt");
 
-function getPrompt(type: 'main' | 'state' | 'landmarks' = 'main') {
+function getPrompt(type: 'main' | 'state' | 'landmarks' | 'jsonAdapter' = 'main') {
   try {
     const isProd = process.env.NODE_ENV === 'production';
-    const customPath = type === 'state' ? customStatePromptFilePath : (type === 'landmarks' ? customLandmarksPromptFilePath : customPromptFilePath);
-    const defaultPath = type === 'state' ? defaultStatePromptFilePath : (type === 'landmarks' ? defaultLandmarksPromptFilePath : defaultPromptFilePath);
+    const customPath = type === 'state'
+      ? customStatePromptFilePath
+      : type === 'landmarks'
+      ? customLandmarksPromptFilePath
+      : type === 'jsonAdapter'
+      ? customJsonAdapterPromptFilePath
+      : customPromptFilePath;
+    const defaultPath = type === 'state'
+      ? defaultStatePromptFilePath
+      : type === 'landmarks'
+      ? defaultLandmarksPromptFilePath
+      : type === 'jsonAdapter'
+      ? defaultJsonAdapterPromptFilePath
+      : defaultPromptFilePath;
     if (isProd) {
       if (fs.existsSync(customPath)) {
         return fs.readFileSync(customPath, "utf-8");
@@ -54,7 +68,71 @@ const parametersForTool = (toolId: string) => {
     'page.inspect': { properties: observationProperties },
     'guide.lookup': { properties: { query: { type: 'string' } }, required: ['query'] },
     'card.inspect': { properties: { cardId: { type: 'string', description: '需要深入查看的目标卡片 ID' }, includeImage: { type: 'boolean', description: '是否提取高清图像并注入多模态视觉上下文' }, includePrompt: { type: 'boolean', description: '是否提取提示词' }, includeReference: { type: 'boolean', description: '是否提取参考图列表' }, includeParameters: { type: 'boolean', description: '是否提取画幅、模型、渲染状态等参数' } }, required: ['cardId'] },
-    'card.detectLandmarks': { properties: { cardId: { type: 'string', description: '需要进行主体与部位识别的目标卡片 ID（例如 card_xxx 或 canvas.card.xxx）' }, prompt: { type: 'string', description: '针对该图像特定部位识别的补充引导词（可选）' }, force: { type: 'boolean', description: '是否强制重新识别并覆盖已有标注（默认为 true）' } }, required: ['cardId'] },
+    'card.detectLandmarks': {
+      properties: {
+        cardId: { type: 'string', description: '需要进行画面元素空间标注的目标卡片 ID（例如 card_xxx 或 canvas.card.xxx）' },
+        action: {
+          type: 'string',
+          enum: ['detect', 'list', 'update', 'delete', 'clear'],
+          description: '操作动作：detect（默认，调用大模型空间定位与语义标注）、list（查询卡片已有标注列表）、update（修改指定标注）、delete（删除指定 ID 标注）、clear（清空卡片全部标注）'
+        },
+        requirement: { type: 'string', description: '具体标注要求（自然语言意图描述，如"标注主要角色手持的长剑与腰间玉佩"、"识别所有光源与反光表面"等，不限部位、不限数量）' },
+        prompt: { type: 'string', description: '兼容参数，等同于 requirement' },
+        mode: {
+          type: 'string',
+          enum: ['append', 'overwrite'],
+          description: '合并模式：append（在卡片已有标注基础上追加新标注）、overwrite（覆写已有标注，默认）'
+        },
+        updates: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: '要修改的标注元素 ID（如 elem_1）' },
+              label: { type: 'string', description: '新的标签文本' },
+              description: { type: 'string', description: '新的视觉外观细节描述' },
+              category: { type: 'string', description: '元素类别' },
+              point: {
+                type: 'object',
+                properties: { x: { type: 'number' }, y: { type: 'number' } },
+                description: '新的归一化坐标百分比 (0~100)'
+              },
+              box: {
+                type: 'array',
+                items: { type: 'number' },
+                description: '2D 归一化包围盒 [ymin, xmin, ymax, xmax]'
+              }
+            },
+            required: ['id']
+          },
+          description: '更新项列表（action="update" 时生效）'
+        },
+        deleteIds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '要删除的标注元素 ID 数组（action="delete" 时生效，如 ["elem_1"]）'
+        },
+        force: { type: 'boolean', description: '是否强制重新识别（默认为 true）' }
+      },
+      required: ['cardId']
+    },
+    'card.annotateElements': {
+      properties: {
+        cardId: { type: 'string', description: '目标卡片 ID（与 card.detectLandmarks 功能完全相同）' },
+        action: {
+          type: 'string',
+          enum: ['detect', 'list', 'update', 'delete', 'clear'],
+          description: '操作动作：detect（默认检测）、list（列表）、update（更新）、delete（删除）、clear（清空）'
+        },
+        requirement: { type: 'string', description: '具体标注要求描述' },
+        prompt: { type: 'string', description: '兼容参数，等同于 requirement' },
+        mode: { type: 'string', enum: ['append', 'overwrite'], description: '合并模式：append 追加或 overwrite 覆写' },
+        updates: { type: 'array', items: { type: 'object' }, description: '更新项列表' },
+        deleteIds: { type: 'array', items: { type: 'string' }, description: '删除 ID 数组' },
+        force: { type: 'boolean', description: '是否强制重新识别' }
+      },
+      required: ['cardId']
+    },
     'card.generate': { properties: { name: { type: 'string', description: '卡片名称（尽可能简短、辨识度高）' }, targetCardId: { type: 'string', description: '目标卡片 ID（"new" 表示新建衍生生图卡片，或已有卡片 ID）' }, prompt: { type: 'string', description: '正向生图提示词' }, aspectRatio: { type: 'string', description: '画幅比例，如 16:9, 9:16, 1:1 等' }, referenceCardIds: { type: 'array', items: { type: 'string' }, description: '参考图卡片 ID 列表' }, autoStart: { type: 'boolean', description: '是否直接排队启动生成（默认为 true）' }, forceOverwrite: { type: 'boolean', description: '是否强制在原卡片覆盖（慎用，默认已出图卡片会触发 Fork 衍生）' } }, required: ['name'] },
     'sys.updateState': { properties: { taskTitle: { type: 'string' }, goal: { type: 'string' }, subGoal: { type: 'string' }, progress: { type: 'string' }, notes: { type: 'string' }, notesMode: { type: 'string', enum: ['append', 'overwrite'], description: '重点笔记模式：append（追加，默认）或 overwrite（重写替换现有笔记）' }, plan: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, title: { type: 'string' }, status: { type: 'string' } } } } } },
     'sys.endTask': { properties: { success: { type: 'boolean' }, finalResponse: { type: 'string' }, waitForUser: { type: 'string' }, paused: { type: 'boolean', description: '若任务属于等待后台异步生图/排队渲染，设置为 true 挂起任务等待出图事件唤醒' } }, required: ['success', 'finalResponse'] },
@@ -572,7 +650,11 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
-    const type = req.query.type === 'state' ? 'state' : 'main';
+    const reqType = String(req.query.type || 'main');
+    const type: 'main' | 'state' | 'landmarks' | 'jsonAdapter' = 
+      reqType === 'state' ? 'state' :
+      reqType === 'landmarks' || reqType === 'subject_landmarks' ? 'landmarks' :
+      reqType === 'jsonAdapter' || reqType === 'json_adapter' ? 'jsonAdapter' : 'main';
     res.json({ prompt: getPrompt(type), type });
   });
 
@@ -582,9 +664,25 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
       if (typeof prompt !== 'string') {
         return res.status(400).json({ error: 'Invalid prompt content' });
       }
-      const targetType = type === 'state' ? 'state' : 'main';
-      const defaultPath = targetType === 'state' ? defaultStatePromptFilePath : defaultPromptFilePath;
-      const customPath = targetType === 'state' ? customStatePromptFilePath : customPromptFilePath;
+      const reqType = String(type);
+      const targetType: 'main' | 'state' | 'landmarks' | 'jsonAdapter' =
+        reqType === 'state' ? 'state' :
+        reqType === 'landmarks' || reqType === 'subject_landmarks' ? 'landmarks' :
+        reqType === 'jsonAdapter' || reqType === 'json_adapter' ? 'jsonAdapter' : 'main';
+      const defaultPath = targetType === 'state'
+        ? defaultStatePromptFilePath
+        : targetType === 'landmarks'
+        ? defaultLandmarksPromptFilePath
+        : targetType === 'jsonAdapter'
+        ? defaultJsonAdapterPromptFilePath
+        : defaultPromptFilePath;
+      const customPath = targetType === 'state'
+        ? customStatePromptFilePath
+        : targetType === 'landmarks'
+        ? customLandmarksPromptFilePath
+        : targetType === 'jsonAdapter'
+        ? customJsonAdapterPromptFilePath
+        : customPromptFilePath;
 
       if (fs.existsSync(path.dirname(defaultPath))) {
         fs.writeFileSync(defaultPath, prompt, 'utf-8');
@@ -783,13 +881,21 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         if (effectiveCardContext.markdownSummary) {
           cardContextInjection = `\n${effectiveCardContext.markdownSummary}\n\n`;
         } else {
+          const rawAnnotations = Array.isArray(effectiveCardContext.annotations)
+            ? effectiveCardContext.annotations
+            : (Array.isArray(effectiveCardContext.landmarks?.elements) ? effectiveCardContext.landmarks.elements : []);
+          let annotationsText = '';
+          if (rawAnnotations.length > 0) {
+            annotationsText = `\n- 已有元素标注 (${rawAnnotations.length} 项):\n` +
+              rawAnnotations.map((a: any) => `  * [${a.id}] ${a.label} (${a.category || '元素'}${a.point ? ` 坐标[${a.point.x},${a.point.y}]` : ''})${a.description ? ` - ${a.description}` : ''}`).join('\n');
+          }
           cardContextInjection = `
 # 目标卡片上下文信息 (Selected Card Context)
 - 卡片ID：${effectiveCardContext.cardId || effectiveCardContext.id || '未知'}
 - 标题/分集：${effectiveCardContext.title || effectiveCardContext.fileName || '未命名卡片'}
 - 卡片提示词：${effectiveCardContext.prompt || '无提示词'}
 - 比例/分辨率：${effectiveCardContext.aspectRatio || effectiveCardContext.ratio || '默认'} (${effectiveCardContext.resolution || effectiveCardContext.res || '2K'})
-${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态视觉上下文' : ''}
+${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态视觉上下文' : ''}${annotationsText}
 `;
         }
       }
@@ -977,7 +1083,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         if (!actionDesc && message.content.includes('调用')) {
           const hasKnownTool = AGENT_TOOL_REGISTRY.some(tool => 
             message.content.includes(tool.id) || message.content.includes(functionNameForTool(tool.id))
-          );
+          ) || /标注|生图|卡片|检测|观察|actAndObserve|inspect|generate|landmarks|annotate/i.test(message.content);
           if (hasKnownTool) {
             actionDesc = message.content;
           }
@@ -989,7 +1095,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
             const adapterKeyToUse = jsonAdapterKey || keyToUse;
             const { endpoint: adapterEndpoint, actualModel: adapterActualModel, apiKey: adapterApiKey } = getModelConfig(adapterModelType, adapterKeyToUse);
 
-            const systemPromptTemplate = customJsonAdapterPrompt || `你是一个极其精准的工具 JSON 转换与转译节点。你的任务是将 Agent 主循环输出的不标准 JSON、JS 对象结构、伪代码或自然语言动作指令，严格转译为符合对应工具 Schema 的标准 JSON 参数。\n\n【转换与纠错规则】\n1. 提取参数与 ID：\n   - 对于 card.detectLandmarks，精准提取目标卡片 ID cardId（如 "card_xxx" 或 "canvas.card.xxx"）、补充引导词 prompt 及 force 标识。若输入仅提及卡片或自然语言指示识别某图部位，必须提取其 cardId 组装为 { cardId, force: true }。\n   - 对于 card.inspect，精准提取目标卡片 ID cardId 及 includeImage / includePrompt / includeReference / includeParameters 布尔开关。\n   - 对于 card.generate，必须精准提取卡片名称 name（尽可能简短、辨识度高）、参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！\n2. 修复非标格式：遇到未加双引号的 Key（如 cardId: "xxx"）或单引号文本，一律重写纠正为标准合法 JSON。\n3. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 像素数值。\n4. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, notes, notesMode 等）。\n\n可用工具的 JSON Schema：\n{{adapterToolPrompt}}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }`;
+            const systemPromptTemplate = customJsonAdapterPrompt || getPrompt('jsonAdapter') || `你是一个极其精准的工具 JSON 转换与转译节点。你的任务是将 Agent 主循环输出的不标准 JSON、JS 对象结构、伪代码或自然语言动作指令，严格转译为符合对应工具 Schema 的标准 JSON 参数。\n\n【转换与纠错规则】\n1. 提取参数与 ID：\n   - 对于 card.detectLandmarks / card.annotateElements（画面元素标注节点）：\n     * 精准提取目标卡片 ID cardId（如 "card_xxx" 或 "canvas.card.xxx"）。\n     * 精准提取操作动作 action：可选值为 "detect"（默认，调用大模型检测标注）、"list"（查看已有标注列表）、"update"（修改指定标注）、"delete"（删除指定 ID 标注）、"clear"（清空所有标注）。\n     * 提取具体标注要求 requirement（支持任意自然语言要求，如"标注主要角色手持的长剑与腰间玉佩"、"识别所有光源与反光表面"等，不限部位、不限数量；若输入写作 prompt，统一映射为 requirement）。\n     * 提取合并模式 mode：可选值为 "append"（在卡片已有标注基础上追加新标注）或 "overwrite"（覆写已有标注，默认）。\n     * 提取更新数据 updates：对象数组，每一项包含 id，可选包含 label、description、category、point ({x, y})、box ([ymin, xmin, ymax, xmax])。\n     * 提取删除 ID 数组 deleteIds：如 ["elem_1", "elem_2"]。\n     * 提取 force 标识（布尔值，是否强制重新检测）。\n   - 对于 card.inspect，精准提取目标卡片 ID cardId 及 includeImage / includePrompt / includeReference / includeParameters 布尔开关。\n   - 对于 card.generate，必须精准提取卡片名称 name（规范：尽可能简短、辨识度高，如"金发女郎晚礼服"；若原输入缺失则根据 prompt 提炼 4~8 字短名）、参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！\n2. 修复非标格式：遇到未加双引号的 Key（如 cardId: "xxx"）或单引号文本，一律重写纠正为标准合法 JSON。\n3. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 像素数值。\n4. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, goal, subGoal, progress, notes, notesMode, plan 等）。\n\n可用工具的 JSON Schema：\n{{adapterToolPrompt}}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }`;
 
             const finalAdapterPrompt = systemPromptTemplate.includes('{{adapterToolPrompt}}')
               ? systemPromptTemplate.replace('{{adapterToolPrompt}}', adapterToolPrompt)
@@ -1210,7 +1316,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         .map((tool) => JSON.stringify({ name: tool.id, description: tool.description, parameters: parametersForTool(tool.id) }))
         .join('\n');
 
-      const systemPromptTemplate = systemPrompt || `你是一个极其精准的工具 JSON 转换与转译节点。你的任务是将 Agent 主循环输出的不标准 JSON、JS 对象结构、伪代码或自然语言动作指令，严格转译为符合对应工具 Schema 的标准 JSON 参数。\n\n【转换与纠错规则】\n1. 提取参数与 ID：\n   - 对于 card.detectLandmarks，精确提取目标卡片 ID cardId（如 "card_xxx" 或 "canvas.card.xxx"）、补充引导词 prompt 及 force 标识。若输入仅提及卡片或自然语言指示识别某图部位，必须提取其 cardId 组装为 { cardId, force: true }。\n   - 对于 card.inspect，精确提取目标卡片 ID cardId 及 includeImage / includePrompt / includeReference / includeParameters 布尔开关。\n   - 对于 card.generate，必须精准提取卡片名称 name（尽可能简短、辨识度高）、参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！\n2. 修复非标格式：遇到未加双引号的 Key（如 cardId: "xxx"）或单引号文本，一律重写纠正为标准合法 JSON。\n3. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 像素数值。\n4. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, notes, notesMode 等）。\n\n可用工具的 JSON Schema：\n{{adapterToolPrompt}}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }`;
+      const systemPromptTemplate = systemPrompt || getPrompt('jsonAdapter') || `你是一个极其精准的工具 JSON 转换与转译节点。你的任务是将 Agent 主循环输出的不标准 JSON、JS 对象结构、伪代码或自然语言动作指令，严格转译为符合对应工具 Schema 的标准 JSON 参数。\n\n【转换与纠错规则】\n1. 提取参数与 ID：\n   - 对于 card.detectLandmarks / card.annotateElements（画面元素标注节点）：\n     * 精准提取目标卡片 ID cardId（如 "card_xxx" 或 "canvas.card.xxx"）。\n     * 精准提取操作动作 action：可选值为 "detect"（默认，调用大模型检测标注）、"list"（查看已有标注列表）、"update"（修改指定标注）、"delete"（删除指定 ID 标注）、"clear"（清空所有标注）。\n     * 提取具体标注要求 requirement（支持任意自然语言要求，如"标注主要角色手持的长剑与腰间玉佩"、"识别所有光源与反光表面"等，不限部位、不限数量；若输入写作 prompt，统一映射为 requirement）。\n     * 提取合并模式 mode：可选值为 "append"（在卡片已有标注基础上追加新标注）或 "overwrite"（覆写已有标注，默认）。\n     * 提取更新数据 updates：对象数组，每一项包含 id，可选包含 label、description、category、point ({x, y})、box ([ymin, xmin, ymax, xmax])。\n     * 提取删除 ID 数组 deleteIds：如 ["elem_1", "elem_2"]。\n     * 提取 force 标识（布尔值，是否强制重新检测）。\n   - 对于 card.inspect，精准提取目标卡片 ID cardId 及 includeImage / includePrompt / includeReference / includeParameters 布尔开关。\n   - 对于 card.generate，必须精准提取卡片名称 name（规范：尽可能简短、辨识度高，如"金发女郎晚礼服"；若原输入缺失则根据 prompt 提炼 4~8 字短名）、参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！\n2. 修复非标格式：遇到未加双引号的 Key（如 cardId: "xxx"）或单引号文本，一律重写纠正为标准合法 JSON。\n3. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 像素数值。\n4. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, goal, subGoal, progress, notes, notesMode, plan 等）。\n\n可用工具的 JSON Schema：\n{{adapterToolPrompt}}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }`;
 
       const finalPrompt = systemPromptTemplate.includes('{{adapterToolPrompt}}')
         ? systemPromptTemplate.replace('{{adapterToolPrompt}}', adapterToolPrompt)
@@ -1245,12 +1351,20 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
     }
   });
 
-  // Dedicated Ultra-Fast Subject Landmarks Detection Node (DeepSeek / Qwen / GLM)
+  // Dedicated Ultra-Fast Visual Element Annotation Node (DeepSeek / Qwen / GLM / Doubao)
   app.post('/api/agent/detect-landmarks', async (req, res) => {
     try {
-      const { imageUrl, slices, prompt, apiKey, model, ratio } = req.body || {};
+      const { imageUrl, slices, prompt, requirement, apiKey, model, ratio } = req.body || {};
       if (!imageUrl && (!Array.isArray(slices) || slices.length === 0)) {
         return res.status(400).json({ error: 'Missing imageUrl or slices' });
+      }
+
+      const effectiveRequirement = (typeof requirement === 'string' && requirement.trim()) ||
+                                   (typeof prompt === 'string' && prompt.trim()) || '';
+      if (!effectiveRequirement) {
+        return res.status(400).json({
+          error: '画面元素标注节点必须传入具体的标注要求 (requirement 或 prompt)，例如："标注画面中主要人物手持的武器与腰间饰品"'
+        });
       }
 
       const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(model || 'deepseek-v4-flash', apiKey);
@@ -1258,59 +1372,28 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       const hasSlices = Array.isArray(slices) && slices.length > 1;
 
       let landmarksPromptTemplate = getPrompt('landmarks');
-      if (!landmarksPromptTemplate || !landmarksPromptTemplate.trim()) {
-        landmarksPromptTemplate = `你是一个具备卓越艺术人体解剖结构与空间定位能力的图像核心视觉兴趣点专家。
-你的核心任务是：深入观察分析输入的图像，利用原生 Visual Grounding 空间感知能力，精准圈定全图最核心的 3~8 个动态兴趣点（Interest Points）与关键解剖区域。
+      if (!landmarksPromptTemplate || !landmarksPromptTemplate.trim() || landmarksPromptTemplate.includes('人体核心解剖部位必选清单')) {
+        landmarksPromptTemplate = `你是一个具备卓越多模态视觉空间定位与语义解析能力的高级画面元素标注专家。
+你的核心任务是：深入观察输入的图像，并严格根据调用方提出的【具体标注要求 (requirement)】，运用原生 Visual Grounding 空间感知能力，精准识别并定位符合要求的关键画面元素（不论是角色人物、肢体细节、服饰特征、武器道具、环境景观、建筑结构、光影氛围或微观纹理）。
 
-【人体核心解剖部位必选清单（只要画面可见必须全部提取，严禁遗漏）】
-当画面中包含人物时，必须完整覆盖以下核心解剖与形体部位：
-1. 面部与五官神态（id: "eyes" 或 "face"，如眼神光、微闭双眼、唇角、微表情）；
-2. 颈项与锁骨线条（id: "neck" 或 "necklace"，如锁骨反光、颈项弧线）；
-3. ★★★ 胸部与胸腔起伏线条（id: "chest"，如挺拔胸部轮廓、丰满胸前起伏、深V领口曲线与胸前阴影，必须明确标注，严禁遗漏！）；
-4. 手部姿态与指节动作（id: "hands"，如手指姿势、轻抚动作、手腕指戒）；
-5. 姿态身形与腿部曲线（id: "legs" 或 "body"，如腰腹线条、修长腿部坐卧姿态）；
-6. 核心贴身服饰与质感工艺（id: "dress" 或 "outfit"，如礼服密集水钻、珠光褶皱）。
-
-【视觉兴趣度、停留时长与运镜节奏规约（极度关键，决定动态端详体验）】
-1. "importance": (0.1 ~ 1.0 浮点数) —— 视觉吸引力与艺术重心权重：
-   - 绝美眼神、面容微表情、核心高光焦点: 0.92 ~ 0.99
-   - 锁骨颈项、挺拔胸部与深V领口、核心贴身服饰质感: 0.82 ~ 0.91
-   - 手部指节动态、精巧饰品、修长腿部曲线: 0.68 ~ 0.81
-   - 次要构图区或环境光影: 0.40 ~ 0.65
-2. "dwellSeconds": (0.8 ~ 3.5 浮点数) —— 该部位值得深情端详/注视打转的时长（秒）：
-   - 核心灵魂部位（眼神、精致神态）：2.2 ~ 3.5 秒（流连忘返、深入品味）
-   - 中等张力部位（胸口领口、锁骨）：1.4 ~ 2.0 秒（舒缓呼吸赏析）
-   - 次要部位（裙摆下摆、背景）：0.8 ~ 1.2 秒（轻快扫视略过）
-3. "transitPace": "linger_slow" | "steady_flow" | "quick_glance" —— 视线飞向该点时的运镜转移速度与吸附感：
-   - "linger_slow": 强引力吸引，视线缓慢柔和滑入，沿途细细扫掠
-   - "steady_flow": 标准优雅运镜
-   - "quick_glance": 敏锐轻快扫视
-4. "box_2d": [ymin, xmin, ymax, xmax] —— 0~1000 范围内的归一化整数（0为最顶/最左边缘，1000为最底/最右边缘），紧贴目标真实像素边缘。
+【核心准则】
+1. 意图驱动：一切标注严格以调用方传入的【具体标注要求】为准，切勿自作主张强行提取未要求的部位。
+2. 数量自适应：严禁死板限制标注个数。若要求标注 1 个特定物体则精准输出 1 个；若要求密集标注全局道具，则按需输出全部符合的目标；若画面中不存在所要求的元素，则诚实返回空列表并于 summary 中说明，严禁凭空幻觉。
+3. 空间包围盒：利用原生 Visual Grounding 为每个元素输出相对于全图画面的 2D 包围盒 "box_2d": [ymin, xmin, ymax, xmax]（0~1000 范围内的归一化整数，0为最顶/最左边缘，1000为最底/最右边缘），紧贴目标真实像素边缘。
 
 【输出格式规范（严格返回合法 JSON 对象，严禁 Markdown）】
 {
-  "summary": "画面主体特征、角色姿态与艺术氛围简述",
-  "shotType": "close_up | medium_shot | full_shot | landscape | macro | object",
-  "hasPerson": true,
-  "interestPoints": [
+  "summary": "画面元素标注完成情况简述（说明识别到了哪些符合要求的元素，或未发现的原因）",
+  "elements": [
     {
-      "id": "eyes",
-      "label": "精准具体的解剖与特征描述（如'迷离仰视的半睁双眼与微张红唇'）",
+      "id": "elem_1",
+      "label": "精准简短的元素标签（如'唐横刀'、'主光源'、'反光铜镜'、'腰间玉佩'）",
+      "category": "prop | character | environment | lighting | anatomy | clothing | detail | other",
       "box_2d": [ymin, xmin, ymax, xmax],
-      "importance": 0.98,
-      "dwellSeconds": 2.6,
-      "transitPace": "linger_slow",
-      "category": "face"
+      "importance": 0.95,
+      "description": "该元素的视觉外观细节与特征描述"
     }
-  ],
-  "regions": {
-    "head": { "box_2d": [ymin, xmin, ymax, xmax] },
-    "eyes": { "box_2d": [ymin, xmin, ymax, xmax] },
-    "chest": { "box_2d": [ymin, xmin, ymax, xmax] },
-    "legs": { "box_2d": [ymin, xmin, ymax, xmax] },
-    "hands": [{ "box_2d": [ymin, xmin, ymax, xmax] }],
-    "primaryObject": { "label": "核心主体焦点", "box_2d": [ymin, xmin, ymax, xmax] }
-  }
+  ]
 }`;
       }
 
@@ -1319,7 +1402,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       if (hasSlices) {
         userMessagesContent.push({
           type: 'text',
-          text: `这是一张纵向全身长图，已沿纵向精准切分为 ${slices.length} 个局部高清特写切片：`
+          text: `这是一张纵向切分的长图，已沿纵向切分为 ${slices.length} 个局部高清切片：`
         });
 
         for (let i = 0; i < slices.length; i++) {
@@ -1339,19 +1422,25 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
 
         userMessagesContent.push({
           type: 'text',
-          text: `【识别与定位任务要求】:
-1. 观察所有切片中的局部画面，识别出全图最核心的人体关键解剖部位与视觉兴趣点（覆盖：面部五官、锁骨颈项、挺拔胸部与深V领口、手指动态、身形腿部线条及核心贴身服饰）；
-2. 为每个识别出的部位标注所在切片编号 "sliceIndex": 0, 1, 2...；
+          text: `【画面元素标注任务要求】:
+${effectiveRequirement}
+
+【规范说明】:
+1. 观察所有切片中的局部画面，严格依照上述要求精准定位对应的元素（若包含多个则全部提取，若画面中不存在则返回空列表并在 summary 中说明）；
+2. 为每个识别出的元素标注所在切片编号 "sliceIndex": 0, 1, 2...；
 3. 以及在该切片局部画面中的 2D 包围盒 "box_2d": [ymin, xmin, ymax, xmax]（0~1000 范围整数，紧贴目标像素边缘）；
-${prompt ? `参考提示词: ${prompt}` : ''}
+4. 提供简明标签 label、category 及细节特征描述 description。
 严格返回纯 JSON 格式。`
         });
       } else {
-        const userTextPrompt = `请深入观察并定位此图像的核心视觉焦点与关键解剖部位。
-【任务要求】:
-1. 识别并提取图像中最核心的 3~8 个动态视觉兴趣点 (interestPoints) 及 regions，完整覆盖画面中可见的人体关键解剖部位（面部五官、锁骨颈项、挺拔胸部与领口起伏、手指手腕动作、身形腰腹与腿部线条）以及核心服饰质感与主体焦点；
-2. 严格利用原生 Visual Grounding 为每个部位输出相对于全图画面的 2D 包围盒 "box_2d": [ymin, xmin, ymax, xmax]（0~1000 范围内的归一化整数，0为最顶/最左，1000为最底/最右），务必紧贴目标真实像素边缘；
-${prompt ? `参考提示词: ${prompt}` : ''}
+        const userTextPrompt = `请深入观察图像，并严格执行以下【具体标注要求】:
+【具体标注要求】:
+${effectiveRequirement}
+
+【规范说明】:
+1. 根据上述要求，定位图像中对应的关键画面元素，不要提取与要求无关的无关干扰，也绝不限制元素个数（按要求输出全部符合的元素，若无则输出空数组并在 summary 说明）；
+2. 为每个元素输出精确紧贴边缘的 2D 归一化包围盒 "box_2d": [ymin, xmin, ymax, xmax]（0~1000 范围整数）；
+3. 给出简短准确的标签 label、category 和视觉细节描述 description。
 严格返回纯 JSON 格式。`;
 
         userMessagesContent = [
@@ -1395,9 +1484,10 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
       if (!response.ok) {
         const errText = await response.text();
         console.info(`[LandmarksNode] Model API returned status ${response.status}:`, errText);
-        const fallback = generateFallbackLandmarks(prompt);
+        const fallback = generateFallbackLandmarks(effectiveRequirement);
         return res.json({
           ...fallback,
+          requirement: effectiveRequirement,
           detectedAt: Date.now(),
           modelUsed: 'heuristic_fallback',
           fallbackNotice: `视觉接口响应异常 (${response.status})，已启用启发式保底定位`,
@@ -1411,7 +1501,7 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
         parsed = JSON.parse(data.content || '{}');
       } catch {
         console.warn('Failed to parse landmarks json:', data.content);
-        parsed = generateFallbackLandmarks(prompt);
+        parsed = generateFallbackLandmarks(effectiveRequirement);
       }
 
       // Process regions from model (supports both Object and Array structures)
@@ -1524,167 +1614,72 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
         return null;
       }
 
-      // Process interestPoints using Grounding Centroid Calculation
-      let rawPoints = Array.isArray(parsed.interestPoints) ? parsed.interestPoints : [];
-      let interestPoints: any[] = [];
-      const seenPointIds = new Set<string>();
+      // Process elements using Grounding Centroid Calculation
+      let rawElements = Array.isArray(parsed.elements) ? parsed.elements : (Array.isArray(parsed.interestPoints) ? parsed.interestPoints : []);
+      let elements: any[] = [];
+      const seenElemIds = new Set<string>();
 
-      for (let i = 0; i < rawPoints.length; i++) {
-        const pt = rawPoints[i];
-        if (!pt || typeof pt !== 'object') continue;
-        const pos = parseCentroidAndBox(pt, pt.id || pt.name || pt.category || pt.label);
+      for (let i = 0; i < rawElements.length; i++) {
+        const item = rawElements[i];
+        if (!item || typeof item !== 'object') continue;
+        const pos = parseCentroidAndBox(item, item.id || item.name || item.category || item.label);
         if (pos) {
-          const rawId = String(pt.id || pt.name || `pt_${i}`).trim();
+          const rawId = String(item.id || item.name || `elem_${i}`).trim();
           let uniqueId = rawId;
           let counter = 1;
-          while (seenPointIds.has(uniqueId)) {
+          while (seenElemIds.has(uniqueId)) {
             uniqueId = `${rawId}_${counter++}`;
           }
-          seenPointIds.add(uniqueId);
+          seenElemIds.add(uniqueId);
 
-          interestPoints.push({
+          elements.push({
             id: uniqueId,
-            label: pt.label || pt.name || '重点特征',
-            x: pos.x,
-            y: pos.y,
-            importance: typeof pt.importance === 'number' ? pt.importance : 0.85,
-            dwellSeconds: typeof pt.dwellSeconds === 'number' ? pt.dwellSeconds : 1.8,
-            transitPace: pt.transitPace || (pt.importance > 0.9 ? 'linger_slow' : pt.importance < 0.7 ? 'quick_glance' : 'steady_flow'),
-            category: pt.category || 'highlight',
-            box_2d: pos.box_2d,
-            _alreadyGlobal: true,
+            label: item.label || item.name || `元素_${i + 1}`,
+            category: item.category || 'detail',
+            point: { x: pos.x, y: pos.y },
+            box: pos.box_2d,
+            description: item.description || item.label || '',
+            importance: typeof item.importance === 'number' ? item.importance : 0.85,
+            source: 'ai_detected',
+            createdAt: Date.now(),
           });
         }
       }
 
-      // Process regions using Grounding Centroid Calculation
+      // Populate backward-compatible interestPoints from elements
+      let interestPoints = elements.map(el => ({
+        id: el.id,
+        label: el.label,
+        x: el.point.x,
+        y: el.point.y,
+        importance: el.importance,
+        dwellSeconds: 1.8,
+        transitPace: 'steady_flow',
+        category: el.category,
+        box: el.box,
+        box_2d: el.box,
+        _alreadyGlobal: true,
+      }));
+
+      // Synthesize regions for backward compatibility
       const regions: any = {};
-
-      if (rawRegions.head) {
-        const p = parseCentroidAndBox(rawRegions.head, 'head');
-        if (p) regions.head = { x: p.x, y: p.y, box_2d: p.box_2d, _alreadyGlobal: true };
-      }
-      if (rawRegions.eyes) {
-        const p = parseCentroidAndBox(rawRegions.eyes, 'eyes');
-        if (p) regions.eyes = { x: p.x, y: p.y, box_2d: p.box_2d, _alreadyGlobal: true };
-      }
-      if (rawRegions.chest) {
-        const p = parseCentroidAndBox(rawRegions.chest, 'chest');
-        if (p) regions.chest = { x: p.x, y: p.y, box_2d: p.box_2d, _alreadyGlobal: true };
-      }
-      if (rawRegions.legs) {
-        const p = parseCentroidAndBox(rawRegions.legs, 'legs');
-        if (p) regions.legs = { x: p.x, y: p.y, box_2d: p.box_2d, _alreadyGlobal: true };
-      }
-      if (Array.isArray(rawRegions.hands)) {
-        regions.hands = rawRegions.hands
-          .map((h: any) => parseCentroidAndBox(h, 'hands'))
-          .filter(Boolean)
-          .map((p: any) => ({ x: p.x, y: p.y, box_2d: p.box_2d, _alreadyGlobal: true }));
-      } else if (rawRegions.hands) {
-        const p = parseCentroidAndBox(rawRegions.hands, 'hands');
-        if (p) regions.hands = [{ x: p.x, y: p.y, box_2d: p.box_2d, _alreadyGlobal: true }];
-      }
-      if (rawRegions.primaryObject) {
-        const p = parseCentroidAndBox(rawRegions.primaryObject, 'primaryObject');
-        if (p) {
-          regions.primaryObject = {
-            label: rawRegions.primaryObject.label || '核心主体焦点',
-            x: p.x,
-            y: p.y,
-            box_2d: p.box_2d,
-            _alreadyGlobal: true,
-          };
-        }
-      }
-
-      // Fallback synthesis if interestPoints is empty
-      if (interestPoints.length === 0) {
-        if (regions.eyes || regions.head) {
-          interestPoints.push({
-            id: 'eyes',
-            label: '面部五官与眼神光',
-            x: regions.eyes?.x ?? regions.head?.x ?? 50,
-            y: regions.eyes?.y ?? (regions.head ? regions.head.y - 2 : 25),
-            importance: 0.98,
-            dwellSeconds: 2.2,
-            category: 'face',
-            _alreadyGlobal: true,
-          });
-        }
-        if (regions.chest) {
-          interestPoints.push({
-            id: 'chest',
-            label: '服饰质感与领口细节',
-            x: regions.chest.x,
-            y: regions.chest.y,
-            importance: 0.92,
-            dwellSeconds: 1.8,
-            category: 'clothing',
-            _alreadyGlobal: true,
-          });
-        }
-        if (regions.hands?.[0]) {
-          interestPoints.push({
-            id: 'hands',
-            label: '手部结构与饰品',
-            x: regions.hands[0].x,
-            y: regions.hands[0].y,
-            importance: 0.85,
-            dwellSeconds: 1.4,
-            category: 'anatomy',
-            _alreadyGlobal: true,
-          });
-        }
-        if (regions.legs) {
-          interestPoints.push({
-            id: 'legs',
-            label: '腿部与身形线条',
-            x: regions.legs.x,
-            y: regions.legs.y,
-            importance: 0.80,
-            dwellSeconds: 1.3,
-            category: 'anatomy',
-            _alreadyGlobal: true,
-          });
-        }
-        if (regions.primaryObject) {
-          interestPoints.push({
-            id: 'primaryObject',
-            label: regions.primaryObject.label || '核心主体焦点',
-            x: regions.primaryObject.x,
-            y: regions.primaryObject.y,
-            importance: 0.90,
-            dwellSeconds: 2.0,
-            category: 'highlight',
-            _alreadyGlobal: true,
-          });
-        }
-      }
-
-      // If person is in scene and regions.chest exists, ensure chest interest point is present
-      if (parsed.hasPerson !== false && regions.chest) {
-        const hasChest = interestPoints.some((pt: any) => pt.id === 'chest' || /胸|领口|cleavage|bust/i.test(pt.label || ''));
-        if (!hasChest) {
-          const insertIdx = Math.min(interestPoints.length, 2);
-          interestPoints.splice(insertIdx, 0, {
-            id: 'chest',
-            label: '挺拔胸部与深V领口',
-            x: regions.chest.x,
-            y: regions.chest.y,
-            importance: 0.95,
-            dwellSeconds: 2.0,
-            category: 'anatomy',
-            box_2d: regions.chest.box_2d,
-            _alreadyGlobal: true,
-          });
+      for (const el of elements) {
+        const labelLower = (el.label + ' ' + (el.category || '')).toLowerCase();
+        if (/head|face|头|面|眼/.test(labelLower) && !regions.head) {
+          regions.head = { x: el.point.x, y: el.point.y, box_2d: el.box, _alreadyGlobal: true };
+        } else if (/chest|bust|cleavage|胸|领口/.test(labelLower) && !regions.chest) {
+          regions.chest = { x: el.point.x, y: el.point.y, box_2d: el.box, _alreadyGlobal: true };
+        } else if (/leg|feet|foot|腿|足/.test(labelLower) && !regions.legs) {
+          regions.legs = { x: el.point.x, y: el.point.y, box_2d: el.box, _alreadyGlobal: true };
+        } else if (!regions.primaryObject) {
+          regions.primaryObject = { label: el.label, x: el.point.x, y: el.point.y, box_2d: el.box, _alreadyGlobal: true };
         }
       }
 
       res.json({
-        summary: parsed.summary || '画面核心视觉焦点分析完成',
-        hasPerson: parsed.hasPerson ?? true,
-        shotType: parsed.shotType || 'medium_shot',
+        summary: parsed.summary || (elements.length > 0 ? `成功定位并标注 ${elements.length} 个画面元素` : '未在画面中检测到符合要求的元素'),
+        requirement: effectiveRequirement,
+        elements,
         interestPoints,
         regions,
         isGlobalCoordinates: true,
@@ -1693,7 +1688,7 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
       });
     } catch (err: any) {
       console.error('Detect landmarks error:', err);
-      const fallback = generateFallbackLandmarks(req.body?.prompt);
+      const fallback = generateFallbackLandmarks(req.body?.requirement || req.body?.prompt);
       res.json({
         ...fallback,
         detectedAt: Date.now(),
@@ -1703,40 +1698,29 @@ ${prompt ? `参考提示词: ${prompt}` : ''}
     }
   });
 
-  function generateFallbackLandmarks(prompt = '') {
-    const p = (prompt || '').toLowerCase();
-    const isCloseUp = /close.?up|特写|face|portrait|肖像/.test(p);
-    const isLandscape = /landscape|scenery|room|city|street|风景|场景|街道/.test(p);
-    if (isLandscape) {
-      return {
-        summary: '风景与空间构图',
-        hasPerson: false,
-        shotType: 'landscape',
-        interestPoints: [
-          { id: 'horizon', label: '中心景物焦点', x: 50, y: 50, importance: 0.9, dwellSeconds: 2.0, category: 'highlight' },
-          { id: 'sky_light', label: '天际光影漫射', x: 50, y: 25, importance: 0.7, dwellSeconds: 1.4, category: 'lighting' },
-          { id: 'foreground', label: '近景空间质感', x: 50, y: 75, importance: 0.65, dwellSeconds: 1.2, category: 'texture' }
-        ],
-        regions: {
-          primaryObject: { label: '中心景物', x: 50, y: 50, box: [25, 25, 75, 75] }
-        }
-      };
-    }
+  function generateFallbackLandmarks(reqText = '') {
+    const elemLabel = (reqText || '').slice(0, 15).trim() || '画面核心元素';
     return {
-      summary: isCloseUp ? '人物微距特写肖像' : '人物中景肖像',
-      hasPerson: true,
-      shotType: isCloseUp ? 'close_up' : 'medium_shot',
+      summary: reqText ? `根据标注要求【${reqText.slice(0, 30)}】完成保底标注` : '画面核心元素标注',
+      requirement: reqText,
+      elements: [
+        {
+          id: 'elem_fallback_1',
+          label: elemLabel,
+          category: 'highlight',
+          point: { x: 50, y: 50 },
+          box: [25, 25, 75, 75],
+          description: `对应标注要求: ${reqText || '画面核心焦点'}`,
+          importance: 0.9,
+          source: 'ai_detected',
+          createdAt: Date.now(),
+        }
+      ],
       interestPoints: [
-        { id: 'eyes', label: '眼神光与微表情', x: 50, y: isCloseUp ? 33 : 21, importance: 0.95, dwellSeconds: 2.2, category: 'face' },
-        { id: 'chest', label: '服饰质感与领口细节', x: 50, y: isCloseUp ? 68 : 45, importance: 0.8, dwellSeconds: 1.5, category: 'clothing' },
-        { id: 'hands', label: '手部结构细节', x: 38, y: 52, importance: 0.7, dwellSeconds: 1.2, category: 'anatomy' }
+        { id: 'elem_fallback_1', label: elemLabel, x: 50, y: 50, importance: 0.9, dwellSeconds: 1.8, transitPace: 'steady_flow', category: 'highlight', box_2d: [25, 25, 75, 75], _alreadyGlobal: true }
       ],
       regions: {
-        head: { x: 50, y: isCloseUp ? 35 : 24, box: [10, 35, 45, 65] },
-        eyes: { x: 50, y: isCloseUp ? 33 : 21 },
-        chest: { x: 50, y: isCloseUp ? 68 : 45, box: [38, 30, 65, 70] },
-        legs: { x: 50, y: 80, box: [65, 28, 95, 72] },
-        hands: [{ x: 38, y: 52 }, { x: 62, y: 52 }]
+        primaryObject: { label: elemLabel, x: 50, y: 50, box_2d: [25, 25, 75, 75], _alreadyGlobal: true }
       }
     };
   }

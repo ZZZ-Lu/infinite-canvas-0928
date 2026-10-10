@@ -151,21 +151,45 @@
   transition: opacity 0.5s ease-out;
 }
 
-/* Asset Card Header Tags (Filename & Resolution Badge):
-   - Upgrading (restoring to full LOD / idle): Gentle fade-in transition with 0.5s duration.
-   - Degrading (gesturing / zooming / panning / micro-LOD): Instant disappearance with 0s duration (no animation). */
-.asset-heavy-dom {
+/* Asset Card Header Tags & Text Labels (Filename, Resolution Badge & Prompt Panel):
+   - In Standard LOD: Statically opacity 1 (no animation on re-render, pan, or zoom)
+   - When mounting from viewport culling or LOD transition: card-tag-fade-in provides smooth 0.35s fade-in
+   - Hiding (Micro / Nano LOD): Direct hide with NO transition */
+.asset-heavy-dom,
+.card-header-tag,
+.generation-card-bottom-panel {
+  display: flex;
   opacity: 1;
-  transition: opacity 0.5s ease-out;
 }
 
-#canvas-workspace[data-zooming="true"] .asset-heavy-dom,
-#canvas-workspace[data-panning="true"] .asset-heavy-dom,
-#canvas-workspace[data-gesture="true"] .asset-heavy-dom,
-#canvas-workspace[data-scale-micro="true"] .asset-heavy-dom {
+.card-tag-fade-in,
+#canvas-workspace[data-lod-fade="true"] .asset-heavy-dom,
+#canvas-workspace[data-lod-fade="true"] .card-header-tag,
+#canvas-workspace[data-lod-fade="true"] .generation-card-bottom-panel {
+  animation: lod-text-fade-in 0.35s ease-out forwards !important;
+}
+
+@keyframes lod-text-fade-in {
+  0% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+/* Micro & Nano LOD: Instantly hide text labels without any transition */
+#canvas-workspace[data-scale-micro="true"] .asset-heavy-dom,
+#canvas-workspace[data-scale-nano="true"] .asset-heavy-dom,
+#canvas-workspace[data-scale-micro="true"] .card-header-tag,
+#canvas-workspace[data-scale-nano="true"] .card-header-tag,
+#canvas-workspace[data-scale-micro="true"] .generation-card-bottom-panel,
+#canvas-workspace[data-scale-nano="true"] .generation-card-bottom-panel,
+#canvas-workspace[data-scale-micro="true"] .card-tag-fade-in,
+#canvas-workspace[data-scale-nano="true"] .card-tag-fade-in {
   opacity: 0 !important;
-  display: none !important;
   transition: none !important;
+  animation: none !important;
   pointer-events: none !important;
 }
 

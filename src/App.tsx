@@ -1,7 +1,7 @@
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
-import { AgentCursor } from './components/AgentCursor';
+import { AgentCursor, buildDynamicSelectionPrompt } from './components/AgentCursor';
 import { AgentContextMenu } from './components/AgentContextMenu';
-import { GenerationCard, CardData, CARD_DIMENSIONS, getCardSize, safeParseJsonResponse, compressImageBlob, resolveReferenceToPayload } from './components/GenerationCard';
+import { GenerationCard, CardData, CARD_DIMENSIONS, getCardSize, safeParseJsonResponse, compressImageBlob, resolveReferenceToPayload, SubjectLandmarks, VisualElementAnnotation } from './components/GenerationCard';
 import { WORKRALLY_IMAGE_MODELS, WORKRALLY_IMAGE_TOOL } from './config/workrallyImageModels';
 import { WORKRALLY_VIDEO_MODELS, WORKRALLY_VIDEO_TOOL } from './config/workrallyVideoModels';
 import { NanoLodCanvas } from './components/NanoLodCanvas';
@@ -28,7 +28,7 @@ import { getActiveMcpKey, getActiveMcpTokenSync, getMcpConfig } from './utils/mc
 import { CanvasLineageOverlay } from './components/CanvasLineageOverlay';
 import { AGENT_TOOL_REGISTRY, getAgentToolConfig } from './agent/toolRegistry';
 import { getPageComponentDefinition, type MouseActionName } from './agent/pageComponentRegistry';
-import { buildAutoInjectedCardContext } from './agent/cardContextBuilder';
+import { buildAutoInjectedCardContext, buildMultiCardInjectedContext } from './agent/cardContextBuilder';
 import { agentFocusManager, type AgentFocusSnapshot } from './agent/agentFocusManager';
 import { AnimatePresence, motion, useMotionValue, animate, useMotionTemplate, useMotionValueEvent, useTransform } from 'motion/react';
 
@@ -753,6 +753,61 @@ export default function App() {
   const [isAgentRunning, setIsAgentRunning] = useState(false);
   const isAgentRunningRef = useRef(false);
   isAgentRunningRef.current = isAgentRunning;
+
+  const isThinkingOrLoadingPhrase = useCallback((s?: string) => {
+    if (!s) return false;
+    const clean = s.trim();
+    if (!clean) return false;
+    return (
+      clean === '...' ||
+      clean === '…' ||
+      clean === 'thinking' ||
+      clean === 'loading' ||
+      clean === '正在思考...' ||
+      clean === '正在思考' ||
+      clean === '图生好了，我先看下...' ||
+      clean === '图生好了，我先看下' ||
+      clean.endsWith('...') ||
+      clean.endsWith('…') ||
+      clean.includes('正在思考') ||
+      clean.includes('排队渲染') ||
+      clean.includes('正在拉取')
+    );
+  }, []);
+
+  const isDefaultSelectionPrompt = useCallback((s?: string) => {
+    if (!s) return false;
+    const clean = s.trim();
+    return (
+      clean === '选中了这组内容，要调整什么？' ||
+      clean === '我能帮什么忙？' ||
+      clean.startsWith('选了') ||
+      clean.includes('需要我做什么？')
+    );
+  }, []);
+
+  // 🛡️ Bulletproof Safety Net Effect for Agent State & Cursor Mode
+  // Whenever Agent stops running AND inspect queue is empty, automatically purge any lingering thinking/loading speech and reset cursor mode to 'default'
+  useEffect(() => {
+    if (!isAgentRunning && inspectQueueRef.current.length === 0) {
+      agentFocusManager.setCursorMode('default');
+      agentFocusManager.clearAll(0);
+      setAgentState(prev => {
+        if (isThinkingOrLoadingPhrase(prev.speak)) {
+          return {
+            ...prev,
+            speak: undefined,
+            isActive: false,
+            isMoving: false,
+            cursorMode: 'default',
+          };
+        }
+        return prev.cursorMode !== 'default' || prev.isActive || prev.isMoving
+          ? { ...prev, cursorMode: 'default', isActive: false, isMoving: false }
+          : prev;
+      });
+    }
+  }, [isAgentRunning, isThinkingOrLoadingPhrase]);
   const [agentPrompt, setAgentPrompt] = useState("");
   const [agentQuestion, setAgentQuestion] = useState<{ question: string, resolve: (val: string) => void } | null>(null);
   const [isAgentThinking, setIsAgentThinking] = useState(false);
@@ -930,6 +985,14 @@ export default function App() {
   cardsRef.current = cards;
   const clipboardRef = useRef<CardData[]>([]);
 
+  const activeSelectedCards = useMemo(() => {
+    const currentCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+    const targetIds = (agentQuickInput?.targetIds && agentQuickInput.targetIds.length > 0)
+      ? agentQuickInput.targetIds
+      : (agentQuickInput?.targetId ? [agentQuickInput.targetId] : (agentFocus.primaryCardId ? [agentFocus.primaryCardId] : []));
+    return targetIds.map(id => currentCards.find(c => c.id === id)).filter((c): c is CardData => Boolean(c));
+  }, [cards, agentQuickInput, agentFocus.primaryCardId]);
+
   const handleStartAgentBoxSelect = useCallback((startX: number, startY: number) => {
     setAgentSelectionBox({
       startX,
@@ -960,6 +1023,9 @@ export default function App() {
         );
       }).map(c => c.id);
 
+      // Keep selectedCardIds in 100% lockstep
+      setSelectedCardIds(newlySelectedIds);
+
       // Calculate screen position of the prompt bubble
       const screenX = next.startX * tScale.get() + tx.get();
       const screenY = next.startY * tScale.get() + ty.get();
@@ -967,7 +1033,9 @@ export default function App() {
       // Dynamically target these cards under the Agent!
       setAgentQuickInput(prevQuick => {
         const targetId = newlySelectedIds[0] || null;
-        const promptText = newlySelectedIds.length > 0 ? "选中了这组内容，要调整什么？" : "我能帮什么忙？";
+        const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+        const targetCards = newlySelectedIds.map(id => allCards.find(c => c.id === id)).filter((c): c is CardData => Boolean(c));
+        const promptText = buildDynamicSelectionPrompt(targetCards);
         
         setAgentState(prevAgent => ({
           ...prevAgent,
@@ -1019,7 +1087,7 @@ export default function App() {
 
     if (hitCard) {
       setSelectedCardIds([hitCard.id]);
-      const promptText = "选中了这组内容，要调整什么？";
+      const promptText = buildDynamicSelectionPrompt([hitCard]);
       const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
         ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
         : undefined;
@@ -1098,7 +1166,7 @@ export default function App() {
 
       if (hitCard) {
         setSelectedCardIds([hitCard.id]);
-        const promptText = "选中了这组内容，要调整什么？";
+        const promptText = buildDynamicSelectionPrompt([hitCard]);
         const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
           ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
           : undefined;
@@ -1429,35 +1497,160 @@ export default function App() {
       isProcessingInspectQueueRef.current = false;
       if (inspectQueueRef.current.length === 0) {
         agentFocusManager.setCursorMode('default');
+        setAgentState(prev => (isThinkingOrLoadingPhrase(prev.speak) ? { ...prev, speak: undefined } : prev));
       }
     }
   }, [centerCardOnScreen, currentProject]);
   processInspectQueueRef.current = processInspectQueue;
 
-  const detectAndSaveCardLandmarks = useCallback(async (
+  const manageCardAnnotations = useCallback(async (
     targetCard: CardData,
-    mediaUrl?: string,
-    customPrompt?: string,
-    force: boolean = false
+    options: {
+      action?: 'detect' | 'list' | 'update' | 'delete' | 'clear';
+      requirement?: string;
+      customPrompt?: string;
+      mode?: 'append' | 'overwrite';
+      updates?: Array<{ id: string; label?: string; description?: string; category?: string; point?: { x: number; y: number }; box?: [number, number, number, number] }>;
+      deleteIds?: string[];
+      force?: boolean;
+      mediaUrl?: string;
+    } = {}
   ) => {
-    if (!force && targetCard.landmarks) {
-      const detectedParts = Object.keys(targetCard.landmarks.regions || {});
-      const pointsCount = Array.isArray(targetCard.landmarks.interestPoints) ? targetCard.landmarks.interestPoints.length : 0;
+    const action = options.action || 'detect';
+    const currentLandmarks = targetCard.landmarks;
+    const currentElements: VisualElementAnnotation[] = currentLandmarks?.elements || (currentLandmarks?.interestPoints ? currentLandmarks.interestPoints.map(p => ({
+      id: p.id,
+      label: p.label,
+      category: p.category || 'detail',
+      point: { x: p.x, y: p.y },
+      box: (p as any).box_2d || p.box,
+      description: p.label,
+      source: 'ai_detected' as const,
+      createdAt: currentLandmarks.detectedAt || Date.now(),
+    })) : []);
+
+    // 1. Action: list
+    if (action === 'list') {
       return {
         success: true,
-        alreadyHadLandmarks: true,
         cardId: targetCard.id,
-        landmarks: targetCard.landmarks,
-        summary: targetCard.landmarks.summary || '已有主体标注产物',
-        interestPointsCount: pointsCount,
-        detectedParts,
-        regions: targetCard.landmarks.regions,
-        message: `卡片【${targetCard.name || targetCard.id}】已有主体与部位标注（共 ${pointsCount} 个关键点，覆盖: ${detectedParts.join('、') || '全身'}），无需重复计算。如需重新分析，请指定 force: true。`
+        elements: currentElements,
+        count: currentElements.length,
+        summary: currentLandmarks?.summary || '无标注数据',
+        requirement: currentLandmarks?.requirement || '',
+        message: `卡片【${targetCard.name || targetCard.id}】当前共有 ${currentElements.length} 项画面元素标注。`
       };
     }
 
+    // 2. Action: clear
+    if (action === 'clear') {
+      setCards(prev => prev.map(c => {
+        if (c.id !== targetCard.id) return c;
+        const { landmarks, ...rest } = c;
+        return rest;
+      }), false);
+      return {
+        success: true,
+        cardId: targetCard.id,
+        elements: [],
+        count: 0,
+        message: `已清空卡片【${targetCard.name || targetCard.id}】的所有画面元素标注。`
+      };
+    }
+
+    // 3. Action: delete
+    if (action === 'delete') {
+      const deleteIds = options.deleteIds || [];
+      if (!deleteIds.length) {
+        throw new Error('执行 delete 动作时必须提供要删除的标注 ID 数组 (deleteIds)');
+      }
+      const deleteSet = new Set(deleteIds);
+      const remainingElements = currentElements.filter(el => !deleteSet.has(el.id));
+      const updatedLandmarks: SubjectLandmarks = {
+        detectedAt: Date.now(),
+        summary: `已删除 ${currentElements.length - remainingElements.length} 项标注`,
+        elements: remainingElements,
+        interestPoints: remainingElements.map(el => ({
+          id: el.id,
+          label: el.label,
+          x: el.point.x,
+          y: el.point.y,
+          importance: el.importance || 0.85,
+          category: el.category as any,
+          box_2d: el.box,
+        })),
+      };
+      setCards(prev => prev.map(c => {
+        if (c.id !== targetCard.id) return c;
+        return { ...c, landmarks: updatedLandmarks };
+      }), false);
+      return {
+        success: true,
+        cardId: targetCard.id,
+        elements: remainingElements,
+        deletedCount: currentElements.length - remainingElements.length,
+        remainingCount: remainingElements.length,
+        message: `成功从卡片【${targetCard.name || targetCard.id}】中删除指定标注，剩余 ${remainingElements.length} 项。`
+      };
+    }
+
+    // 4. Action: update
+    if (action === 'update') {
+      const updates = options.updates || [];
+      if (!updates.length) {
+        throw new Error('执行 update 动作时必须提供更新项列表 (updates)');
+      }
+      const updateMap = new Map(updates.map(u => [u.id, u]));
+      let updatedCount = 0;
+      const newElements = currentElements.map(el => {
+        const patch = updateMap.get(el.id);
+        if (!patch) return el;
+        updatedCount++;
+        return {
+          ...el,
+          ...(patch.label ? { label: patch.label } : {}),
+          ...(patch.description !== undefined ? { description: patch.description } : {}),
+          ...(patch.category ? { category: patch.category } : {}),
+          ...(patch.point ? { point: patch.point } : {}),
+          ...(patch.box ? { box: patch.box } : {}),
+          source: 'agent_updated' as const,
+        };
+      });
+      const updatedLandmarks: SubjectLandmarks = {
+        detectedAt: Date.now(),
+        summary: `已更新 ${updatedCount} 项标注`,
+        elements: newElements,
+        interestPoints: newElements.map(el => ({
+          id: el.id,
+          label: el.label,
+          x: el.point.x,
+          y: el.point.y,
+          importance: el.importance || 0.85,
+          category: el.category as any,
+          box_2d: el.box,
+        })),
+      };
+      setCards(prev => prev.map(c => {
+        if (c.id !== targetCard.id) return c;
+        return { ...c, landmarks: updatedLandmarks };
+      }), false);
+      return {
+        success: true,
+        cardId: targetCard.id,
+        elements: newElements,
+        updatedCount,
+        message: `成功更新卡片【${targetCard.name || targetCard.id}】的 ${updatedCount} 项标注。`
+      };
+    }
+
+    // 5. Action: detect (Default)
+    const effectiveReq = (options.requirement || options.customPrompt || '').trim();
+    if (!effectiveReq) {
+      throw new Error(`调用画面元素标注节点必须提供具体的标注要求 (requirement 或 prompt)，例如："标注主要角色手持的佩剑与腰间玉佩"`);
+    }
+
     try {
-      let effectiveUrl = mediaUrl || targetCard.imageUrl || (targetCard as any).url || (targetCard as any).originalUrl || '';
+      let effectiveUrl = options.mediaUrl || targetCard.imageUrl || (targetCard as any).url || (targetCard as any).originalUrl || '';
       const b64 = await extractCardImageBase64Ref.current(targetCard);
       if (b64) {
         effectiveUrl = b64;
@@ -1467,7 +1660,6 @@ export default function App() {
         throw new Error(`卡片【${targetCard.name || targetCard.id}】暂无可用图像内容（可能未出图或正在生成中）`);
       }
 
-      // 直接全图传参（不使用切片机制，全画幅原生识别）
       const nodeModels = assetExtractionService.getNodeModels();
       const modelToUse = nodeModels.subjectLandmarksModel || 'deepseek-v4-flash';
       const deepseekKey = localStorage.getItem('deepseek_api_key') || '';
@@ -1482,7 +1674,8 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           imageUrl: effectiveUrl,
-          prompt: customPrompt || targetCard.prompt || targetCard.lastGeneratedPrompt || '',
+          requirement: effectiveReq,
+          prompt: effectiveReq,
           model: modelToUse,
           apiKey: apiKeyToSend || undefined,
         })
@@ -1490,43 +1683,93 @@ export default function App() {
 
       if (res.ok) {
         const data = await res.json();
-        if (data && data.regions) {
-          const restoredLandmarks = unpadLandmarks(data, null);
+        if (data) {
+          const restored = unpadLandmarks(data, null);
+          const detectedElements: VisualElementAnnotation[] = Array.isArray(restored.elements)
+            ? restored.elements
+            : (Array.isArray(restored.interestPoints) ? restored.interestPoints.map((p: any) => ({
+                id: p.id,
+                label: p.label,
+                category: p.category || 'detail',
+                point: { x: p.x, y: p.y },
+                box: p.box_2d || p.box,
+                description: p.label,
+                source: 'ai_detected' as const,
+                createdAt: Date.now(),
+              })) : []);
+
+          const mode = options.mode || 'overwrite';
+          let finalElements = detectedElements;
+          if (mode === 'append' && currentElements.length > 0) {
+            const existingIds = new Set(currentElements.map(e => e.id));
+            const newToAdd = detectedElements.map(e => {
+              if (existingIds.has(e.id)) {
+                return { ...e, id: `${e.id}_${Date.now().toString(36)}` };
+              }
+              return e;
+            });
+            finalElements = [...currentElements, ...newToAdd];
+          }
+
+          const newLandmarks: SubjectLandmarks = {
+            ...restored,
+            requirement: effectiveReq,
+            elements: finalElements,
+            interestPoints: finalElements.map(el => ({
+              id: el.id,
+              label: el.label,
+              x: el.point.x,
+              y: el.point.y,
+              importance: el.importance || 0.85,
+              category: el.category as any,
+              box_2d: el.box,
+            })),
+            detectedAt: Date.now(),
+          };
 
           setCards(prev => prev.map(c => {
             if (c.id !== targetCard.id) return c;
             return {
               ...c,
-              landmarks: restoredLandmarks
+              landmarks: newLandmarks
             };
           }), false);
-
-          const detectedParts = Object.keys(restoredLandmarks.regions || {});
-          const pointsCount = Array.isArray(restoredLandmarks.interestPoints) ? restoredLandmarks.interestPoints.length : 0;
 
           return {
             success: true,
             cardId: targetCard.id,
-            summary: restoredLandmarks.summary || '识别完成',
-            interestPointsCount: pointsCount,
-            detectedParts,
-            regions: restoredLandmarks.regions,
-            message: `成功完成卡片【${targetCard.name || targetCard.id}】的主体识别与部位标注（共提取 ${pointsCount} 个关键解剖兴趣点，覆盖部位: ${detectedParts.join('、') || '全身'}）。`
+            elements: finalElements,
+            count: finalElements.length,
+            detectedCount: detectedElements.length,
+            summary: newLandmarks.summary || '标注完成',
+            message: `成功完成卡片【${targetCard.name || targetCard.id}】的画面元素标注（依据要求【${effectiveReq}】提取 ${detectedElements.length} 项元素，当前总计 ${finalElements.length} 项）。`
           };
         }
       }
-      throw new Error(`主体识别节点未返回有效的部位标注数据`);
+      const errJson = await res.json().catch(() => ({}));
+      throw new Error(errJson.error || `画面元素标注节点未返回有效的标注数据`);
     } catch (err) {
-      console.warn('[LandmarksNode] Auto-detection error:', err);
+      console.warn('[ElementAnnotationNode] Detection error:', err);
       throw err;
     }
   }, []);
 
+  const detectAndSaveCardLandmarks = useCallback((
+    targetCard: CardData,
+    mediaUrl?: string,
+    customPrompt?: string,
+    force: boolean = false
+  ) => {
+    return manageCardAnnotations(targetCard, {
+      action: 'detect',
+      requirement: customPrompt,
+      mediaUrl,
+      force
+    });
+  }, [manageCardAnnotations]);
+
   const enqueueCardInspection = useCallback((targetCard: CardData, mediaUrl: string) => {
     if (!mediaUrl) return;
-
-    // 🌟 自动调用图像主体定位模型节点：识别并持久化记录人物头部、胸部、腿部及核心主体空间坐标
-    void detectAndSaveCardLandmarks(targetCard, mediaUrl);
 
     // Deduplicate: avoid pushing the same card ID if already waiting in queue
     if (inspectQueueRef.current.some(item => item.targetCard.id === targetCard.id)) {
@@ -1737,21 +1980,48 @@ export default function App() {
     }
   }, []);
 
-  const handleDrop = useCallback(async (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragOver(false);
+  const lastMousePosRef = useRef<{ x: number; y: number } | null>(null);
 
-    if (!e.dataTransfer || !e.dataTransfer.files) return;
-    const files = Array.from(e.dataTransfer.files) as File[];
-    if (files.length === 0) return;
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      lastMousePosRef.current = { x: e.clientX, y: e.clientY };
+    };
+    window.addEventListener('mousemove', handleMouseMove, { passive: true });
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+    };
+  }, []);
+
+  const importFilesToCanvas = useCallback(async (
+    files: File[], 
+    targetClientX?: number, 
+    targetClientY?: number, 
+    sourceLabel: string = 'Imported'
+  ) => {
+    if (!files || files.length === 0) return;
 
     const rect = containerRef.current?.getBoundingClientRect();
-    if (!rect) return;
 
-    // Calculate canvas drop coordinates
-    const dropClientX = e.clientX;
-    const dropClientY = e.clientY;
+    let dropClientX = targetClientX;
+    let dropClientY = targetClientY;
+
+    if (dropClientX === undefined || dropClientY === undefined) {
+      if (
+        lastMousePosRef.current && rect &&
+        lastMousePosRef.current.x >= rect.left && lastMousePosRef.current.x <= rect.right &&
+        lastMousePosRef.current.y >= rect.top && lastMousePosRef.current.y <= rect.bottom
+      ) {
+        dropClientX = lastMousePosRef.current.x;
+        dropClientY = lastMousePosRef.current.y;
+      } else if (rect) {
+        dropClientX = rect.left + rect.width / 2;
+        dropClientY = rect.top + rect.height / 2;
+      } else {
+        dropClientX = window.innerWidth / 2;
+        dropClientY = window.innerHeight / 2;
+      }
+    }
+
     const dropCanvasX = (dropClientX - tx.get()) / tScale.get();
     const dropCanvasY = (dropClientY - ty.get()) / tScale.get();
 
@@ -1802,12 +2072,12 @@ export default function App() {
         state: 'generating', // shows the sleek loading spinner overlay on top of the image
         ratio: ratio,
         res: '2K',
-        prompt: `Dropped local ${isVideo ? 'video' : 'image'}: ${file.name}`,
+        prompt: `${sourceLabel} ${isVideo ? 'video' : 'image'}: ${file.name || 'unnamed'}`,
         imageUrl: fileUrl, // Visible on the canvas instantly!
         isVideo: isVideo,
         customWidth: customWidth,
         customHeight: customHeight,
-        fileName: file.name,
+        fileName: file.name || 'unnamed',
         nativeWidth: width,
         nativeHeight: height,
       };
@@ -1888,7 +2158,7 @@ export default function App() {
           fullDetailThumbnailUrl = await generateImageThumbnail(processedFile, 128);
         }
       } catch (thumbErr) {
-        console.warn('Could not pre-generate thumbnail on drop:', thumbErr);
+        console.warn('Could not pre-generate thumbnail on import:', thumbErr);
       }
 
       // Step 3: Seamlessly complete import - spinner fades away, optimized preview & thumbnail saved
@@ -1908,6 +2178,102 @@ export default function App() {
       } : c));
     });
   }, [tx, ty, tScale]);
+
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+
+    if (!e.dataTransfer || !e.dataTransfer.files) return;
+    const files = Array.from(e.dataTransfer.files) as File[];
+    if (files.length === 0) return;
+
+    await importFilesToCanvas(files, e.clientX, e.clientY, 'Dropped local');
+  }, [importFilesToCanvas]);
+
+  // Global Ctrl+V / Cmd+V paste listener for direct canvas media import
+  useEffect(() => {
+    const handlePaste = async (e: ClipboardEvent) => {
+      const filesToImport: File[] = [];
+
+      if (e.clipboardData) {
+        // 1. Files directly in clipboardData.files
+        if (e.clipboardData.files && e.clipboardData.files.length > 0) {
+          const fileList = Array.from(e.clipboardData.files);
+          for (const file of fileList) {
+            if (file.type.startsWith('image/') || file.type.startsWith('video/')) {
+              filesToImport.push(file);
+            }
+          }
+        }
+
+        // 2. Items in clipboardData.items (handles browser image copying / screenshots)
+        if (filesToImport.length === 0 && e.clipboardData.items) {
+          const items = Array.from(e.clipboardData.items);
+          for (const item of items) {
+            if (item.kind === 'file' || item.type.startsWith('image/') || item.type.startsWith('video/')) {
+              const file = item.getAsFile();
+              if (file) {
+                const isVideo = item.type.startsWith('video/') || file.type.startsWith('video/');
+                const ext = file.type.split('/')[1] || (isVideo ? 'mp4' : 'png');
+                const defaultName = `Pasted_${isVideo ? 'Video' : 'Image'}_${Date.now()}.${ext}`;
+                const namedFile = (file.name && file.name !== 'image.png' && file.name !== 'blob')
+                  ? file
+                  : new File([file], defaultName, { type: file.type || (isVideo ? 'video/mp4' : 'image/png') });
+                filesToImport.push(namedFile);
+              }
+            }
+          }
+        }
+
+        // 3. Text in clipboardData if it's a data URI or direct image/video URL
+        if (filesToImport.length === 0) {
+          const text = e.clipboardData.getData('text/plain')?.trim();
+          if (text) {
+            if (text.startsWith('data:image/') || text.startsWith('data:video/')) {
+              try {
+                const res = await fetch(text);
+                const blob = await res.blob();
+                const isVideo = blob.type.startsWith('video/');
+                const ext = blob.type.split('/')[1] || (isVideo ? 'mp4' : 'png');
+                const file = new File([blob], `Pasted_Data_${Date.now()}.${ext}`, { type: blob.type });
+                filesToImport.push(file);
+              } catch (err) {
+                console.warn('Failed to convert pasted data URI:', err);
+              }
+            } else if (/^https?:\/\/.+/i.test(text)) {
+              const isImgUrl = /\.(png|jpe?g|webp|gif|svg)(\?.*)?$/i.test(text);
+              const isVidUrl = /\.(mp4|webm|ogv|mov)(\?.*)?$/i.test(text);
+              if (isImgUrl || isVidUrl) {
+                try {
+                  const res = await fetch(text);
+                  if (res.ok) {
+                    const blob = await res.blob();
+                    const file = new File([blob], `Pasted_URL_${Date.now()}.${isVidUrl ? 'mp4' : 'png'}`, { type: blob.type || (isVidUrl ? 'video/mp4' : 'image/png') });
+                    filesToImport.push(file);
+                  }
+                } catch (err) {
+                  console.warn('Failed to fetch pasted media URL:', err);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (filesToImport.length > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+
+        await importFilesToCanvas(filesToImport, undefined, undefined, 'Pasted local');
+      }
+    };
+
+    window.addEventListener('paste', handlePaste);
+    return () => {
+      window.removeEventListener('paste', handlePaste);
+    };
+  }, [importFilesToCanvas]);
 
 
   // --- Canvas Transform Project Sync ---
@@ -2919,6 +3285,32 @@ export default function App() {
   // Extended DOM card state to act as a frontend backdrop while Canvas prepares to render
   const [isDomCardsActive, setIsDomCardsActive] = useState(() => tScale.get() >= getNanoLodThreshold());
 
+  // Track LOD switch from Low -> Standard to animate text labels fade-in
+  const [isLodFading, setIsLodFading] = useState(false);
+  const wasMicroLodRef = useRef(tScale.get() < getNanoLodThreshold());
+  const lodFadeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const triggerLodFadeIn = useCallback(() => {
+    setIsLodFading(true);
+    const workspace = document.getElementById('canvas-workspace');
+    if (workspace) {
+      workspace.setAttribute('data-lod-fade', 'true');
+    }
+    if (lodFadeTimerRef.current) clearTimeout(lodFadeTimerRef.current);
+    lodFadeTimerRef.current = setTimeout(() => {
+      setIsLodFading(false);
+      const ws = document.getElementById('canvas-workspace');
+      if (ws) ws.removeAttribute('data-lod-fade');
+    }, 600);
+  }, []);
+
+  const cancelLodFade = useCallback(() => {
+    if (lodFadeTimerRef.current) clearTimeout(lodFadeTimerRef.current);
+    setIsLodFading(false);
+    const ws = document.getElementById('canvas-workspace');
+    if (ws) ws.removeAttribute('data-lod-fade');
+  }, []);
+
   const handleNanoCanvasReady = useCallback(() => {
     if (isNanoLod) {
       setIsDomCardsActive(false);
@@ -2943,11 +3335,20 @@ export default function App() {
       const isMicro = s < threshold;
       const isNano = s < threshold;
       
+      if (wasMicroLodRef.current && !isMicro) {
+        // Switched from Micro/Nano to Standard LOD: trigger smooth fade-in
+        triggerLodFadeIn();
+      } else if (!wasMicroLodRef.current && isMicro) {
+        // Switched from Standard to Micro/Nano LOD: immediately cancel fade and hide tags
+        cancelLodFade();
+      }
+      wasMicroLodRef.current = isMicro;
+
       setIsMicroLod(isMicro);
       setIsNanoLod(isNano);
     });
     return unsub;
-  }, [tScale]);
+  }, [tScale, triggerLodFadeIn, cancelLodFade]);
 
   // Set of DOM-mounted card IDs (asynchronous frame-budgeted progressive mounting)
   const [renderedCardIds, setRenderedCardIds] = useState<Set<string>>(() => new Set());
@@ -3226,6 +3627,41 @@ export default function App() {
       }
     }
     
+    const isAgentBusy = Boolean(
+      isAgentRunningRef.current ||
+      isAgentRunning ||
+      isAgentThinking ||
+      isProcessingInspectQueueRef.current ||
+      inspectQueueRef.current.length > 0 ||
+      (activeTaskIdRef.current && runtimeRef.current?.getTask(activeTaskIdRef.current)?.status === 'running') ||
+      agentFocusManager.getSnapshot().cursorMode === 'working' ||
+      agentFocusManager.getSnapshot().cursorMode === 'inspect'
+    );
+
+    // 当 Agent 正在某卡片上执行任务时，严禁被右键召唤到其它卡片或位置
+    if (isAgentBusy) {
+      if (!targetId) {
+        // 在空白画布右键时，仅弹出普通创建卡片上下文菜单，不打扰也不移动正在工作的 Agent
+        const menuWidth = 260;
+        const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(e.clientX, window.innerWidth - menuWidth - 20)) : e.clientX;
+        const clampedY = typeof window !== 'undefined' ? Math.max(50, Math.min(e.clientY, window.innerHeight - 340)) : e.clientY;
+        const clampedCanvasX = (clampedX - tx.get()) / tScale.get();
+        const clampedCanvasY = (clampedY - ty.get()) / tScale.get();
+        const ownerId = e.nativeEvent.isTrusted ? 'user' : 'agent';
+        setContextMenus(prev => ({
+          ...prev,
+          [ownerId]: {
+            x: clampedX,
+            y: clampedY,
+            canvasX: clampedCanvasX,
+            canvasY: clampedCanvasY,
+            targetId: null
+          }
+        }));
+      }
+      return;
+    }
+
     // Determine the target IDs for the Agent.
     // If the right-clicked card is part of the user's active multi-selection, 
     // we inherit the multi-selection, so all of them are targeted!
@@ -3286,7 +3722,10 @@ export default function App() {
     }
 
     if (ownerId === 'user' && !isAgentRunning) {
-      const promptText = targetId ? "选中了这组内容，要调整什么？" : "我能帮什么忙？";
+      const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+      const targetCardObj = targetId ? allCards.find(c => c.id === targetId) : null;
+      const targetCards = targetCardObj ? [targetCardObj] : selectedCardIds.map(id => allCards.find(c => c.id === id)).filter((c): c is CardData => Boolean(c));
+      const promptText = buildDynamicSelectionPrompt(targetCards);
       const yOffset = targetId ? 40 : 82;
       setAgentState(prev => ({
         ...prev,
@@ -3455,7 +3894,7 @@ export default function App() {
 
     // Check if inspection scope is targeting a specific canvas card
     let focusedCardInfo: any = undefined;
-    const targetCardId = scope.startsWith('canvas.card.') ? scope.replace('canvas.card.', '') : (scope === 'overview' ? selectedCardIdsRef.current[0] : undefined);
+    const targetCardId = scope.startsWith('canvas.card.') ? scope.replace('canvas.card.', '') : (scope === 'overview' ? (agentFocus.primaryCardId || undefined) : undefined);
     if (targetCardId) {
       const cardObj = cardsRef.current.find(c => c.id === targetCardId);
       if (cardObj) {
@@ -4022,13 +4461,23 @@ export default function App() {
         }
       }
 
+      if (card.landmarks) {
+        response.annotations = card.landmarks.elements || card.landmarks.interestPoints || [];
+      }
+
       return response;
     }
-    if (call.name === 'card.detectLandmarks') {
+    if (call.name === 'card.detectLandmarks' || (call.name as string) === 'card.annotateElements') {
       const cardId = String(call.arguments.cardId || call.arguments.targetCardId || '');
       const cleanCardId = cardId.startsWith('canvas.card.') ? cardId.replace('canvas.card.', '') : cardId;
-      const customPrompt = typeof call.arguments.prompt === 'string' ? call.arguments.prompt.trim() : undefined;
-      const force = call.arguments.force !== false; // 默认 true: 强制执行重新识别
+      const action = (call.arguments.action as any) || 'detect';
+      const requirement = typeof call.arguments.requirement === 'string'
+        ? call.arguments.requirement.trim()
+        : (typeof call.arguments.prompt === 'string' ? call.arguments.prompt.trim() : undefined);
+      const mode = (call.arguments.mode as any) || 'overwrite';
+      const updates = Array.isArray(call.arguments.updates) ? call.arguments.updates as any : undefined;
+      const deleteIds = Array.isArray(call.arguments.deleteIds) ? call.arguments.deleteIds.map(String) : undefined;
+      const force = call.arguments.force !== false;
 
       const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
       const card = allCards.find(c => c.id === cleanCardId);
@@ -4038,11 +4487,19 @@ export default function App() {
       }
 
       agentFocusManager.setCursorMode('working');
-      agentFocusManager.setPrimaryFocus(cleanCardId, 'working', 'card.detectLandmarks');
+      agentFocusManager.setPrimaryFocus(cleanCardId, 'working', call.name);
       await animateMoveToTarget('canvas.card.' + cleanCardId);
 
       const mediaUrl = card.imageUrl || card.url || card.originalUrl || '';
-      const result = await detectAndSaveCardLandmarks(card, mediaUrl, customPrompt, force);
+      const result = await manageCardAnnotations(card, {
+        action,
+        requirement,
+        mode,
+        updates,
+        deleteIds,
+        force,
+        mediaUrl
+      });
       return result;
     }
     if (call.name === 'card.generate') {
@@ -4546,6 +5003,20 @@ export default function App() {
       lines.push(`- 卡片图像: [已注入卡片图像至多模态上下文供观察]`);
     }
 
+    const landmarks = card.landmarks;
+    const elements = landmarks?.elements || landmarks?.interestPoints || [];
+    if (elements.length > 0 || landmarks?.summary) {
+      lines.push(``);
+      lines.push(`【卡片已有画面元素标注】`);
+      if (landmarks?.requirement) lines.push(`- 历史标注需求: "${landmarks.requirement}"`);
+      if (landmarks?.summary) lines.push(`- 视觉特征总结: ${landmarks.summary}`);
+      lines.push(`- 已标注元素 (${elements.length} 项):`);
+      elements.forEach((el: any) => {
+        const coord = el.point ? ` [${el.point.x}, ${el.point.y}]` : '';
+        lines.push(`  * [${el.id}] ${el.label} (${el.category || '元素'}${coord})${el.description ? ` - ${el.description}` : ''}`);
+      });
+    }
+
     return lines.join('\n');
   }, []);
 
@@ -4565,14 +5036,14 @@ export default function App() {
     setIsAgentThinking(true);
     setIsAgentRunning(true);
 
-    // If cardContext not provided but user has a single selected card, auto-enrich context with lineage
+    // If cardContext not provided but an agent-targeted card is active, enrich context with lineage
     let effectiveCardContext = cardContext;
     let effectiveImages = overrideImages;
 
-    if (!effectiveCardContext && selectedCardIdsRef.current.length === 1) {
-      const selectedId = selectedCardIdsRef.current[0];
+    const agentFocusedTargetId = agentQuickInput?.targetId || agentFocus.primaryCardId;
+    if (!effectiveCardContext && agentFocusedTargetId) {
       const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
-      const targetCard = allCards.find(c => c.id === selectedId);
+      const targetCard = allCards.find(c => c.id === agentFocusedTargetId);
       if (targetCard) {
         try {
           const autoCtx = await buildAutoInjectedCardContext(targetCard, allCards, extractCardImageBase64);
@@ -4700,9 +5171,13 @@ export default function App() {
                 } : turn),
               }));
               
-              if (result.speak) {
-                const parsedShort = parseAgentCommunication(result.speak).shortText || result.speak;
+              const rawSpeech = result.speak || result.fullAnswer || (Array.isArray(result.narration) && result.narration.length > 0 ? result.narration[result.narration.length - 1] : undefined);
+              if (rawSpeech && rawSpeech.trim() && !isThinkingOrLoadingPhrase(rawSpeech)) {
+                const parsed = parseAgentCommunication(rawSpeech);
+                const parsedShort = parsed.shortText || parsed.fullText || rawSpeech;
                 setAgentState(prev => ({ ...prev, speak: parsedShort, visible: true }));
+              } else if (result.complete) {
+                setAgentState(prev => (isThinkingOrLoadingPhrase(prev.speak) ? { ...prev, speak: undefined } : prev));
               }
               
               return result;
@@ -4873,7 +5348,8 @@ export default function App() {
             if (!isProcessingInspectQueueRef.current) {
               const latestAnswer = [...task.events].reverse().find(e => e.type === 'answer' && e.text && e.text.trim());
               if (latestAnswer) {
-                const shortSpeech = parseAgentCommunication(latestAnswer.text).shortText;
+                const parsed = parseAgentCommunication(latestAnswer.text);
+                const shortSpeech = parsed.shortText || parsed.fullText;
                 if (shortSpeech) {
                   if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
                   setAgentState(prev => ({
@@ -4887,6 +5363,28 @@ export default function App() {
 
             if (status === 'completed' || status === 'cancelled' || status === 'failed') {
               if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
+              if (!isProcessingInspectQueueRef.current) {
+                agentFocusManager.setCursorMode('default');
+                agentFocusManager.clearAll();
+                setAgentState(prev => {
+                  if (isThinkingOrLoadingPhrase(prev.speak)) {
+                    const latestAnswer = [...task.events].reverse().find(e => e.type === 'answer' && e.text && e.text.trim() && !isThinkingOrLoadingPhrase(e.text));
+                    const parsed = latestAnswer ? parseAgentCommunication(latestAnswer.text) : null;
+                    const speech = parsed ? (parsed.shortText || parsed.fullText) : undefined;
+                    return {
+                      ...prev,
+                      speak: speech,
+                      isActive: false,
+                      isMoving: false,
+                    };
+                  }
+                  return {
+                    ...prev,
+                    isActive: false,
+                    isMoving: false,
+                  };
+                });
+              }
             }
 
             // If task is bound to a specific card context, sync answer events to that card's chat history
@@ -4980,6 +5478,13 @@ export default function App() {
       setIsAgentThinking(false);
       setIsAgentRunning(false);
       isAgentRunningRef.current = false;
+
+      // Clear lingering loading state if inspect queue is empty
+      if (inspectQueueRef.current.length === 0) {
+        agentFocusManager.setCursorMode('default');
+        setAgentState(prev => (isThinkingOrLoadingPhrase(prev.speak) ? { ...prev, speak: undefined } : prev));
+      }
+
       // 🌟 本轮卡片分发与创建完毕，平滑启动出图检视队列，按序消费出图卡片！
       setTimeout(() => {
         void processInspectQueueRef.current();
@@ -5015,7 +5520,15 @@ export default function App() {
     }));
 
     try {
-      const autoCtx = await buildAutoInjectedCardContext(targetCard, allCards, extractCardImageBase64);
+      const selectedIds = selectedCardIdsRef.current;
+      const isMultiSelected = selectedIds.length > 1 && selectedIds.includes(targetCardId);
+      const selectedCards = isMultiSelected
+        ? selectedIds.map(id => allCards.find(c => c.id === id)).filter((c): c is CardData => c !== undefined)
+        : [];
+
+      const autoCtx = isMultiSelected && selectedCards.length > 1
+        ? await buildMultiCardInjectedContext(selectedCards, allCards, extractCardImageBase64)
+        : await buildAutoInjectedCardContext(targetCard, allCards, extractCardImageBase64);
 
       await handleRunAgent(
         promptText,
@@ -5159,8 +5672,16 @@ export default function App() {
     // Restore accurate LOD states now that the user has stopped zooming or dragging
     const currentScale = tScale.get();
     const threshold = getNanoLodThreshold();
-    setIsMicroLod(currentScale < threshold);
-    setIsNanoLod(currentScale < threshold);
+    const isMicro = currentScale < threshold;
+    if (wasMicroLodRef.current && !isMicro) {
+      triggerLodFadeIn();
+    } else if (!wasMicroLodRef.current && isMicro) {
+      cancelLodFade();
+    }
+    wasMicroLodRef.current = isMicro;
+
+    setIsMicroLod(isMicro);
+    setIsNanoLod(isMicro);
     setMountEpoch(n => (n + 1) % 1000000);
     
     const workspace = document.getElementById('canvas-workspace');
@@ -5172,7 +5693,7 @@ export default function App() {
       setIsZooming(false); // MUST sync React state so it doesn't revert on next render
       window.dispatchEvent(new CustomEvent('canvas-styles-restored'));
     }
-  }, [updateCircularCulling, tScale]);
+  }, [updateCircularCulling, tScale, triggerLodFadeIn, cancelLodFade]);
 
   useEffect(() => {
     (window as any).resetGlobalZoomTimer = () => {
@@ -6289,8 +6810,9 @@ export default function App() {
         id="canvas-workspace"
         className={`absolute top-0 left-0 transform-gpu group/canvas z-0 ${isZooming || isDraggingCanvasRef.current || isTweenZooming ? 'will-change-transform' : ''}`}
         data-zooming={isZooming ? 'true' : undefined}
-        data-scale-micro={isMicroLod}
-        data-scale-nano={isNanoLod}
+        data-scale-micro={isMicroLod ? 'true' : undefined}
+        data-scale-nano={isNanoLod ? 'true' : undefined}
+        data-lod-fade={isLodFading ? 'true' : undefined}
         style={{ transformOrigin: '0 0', x: tx, y: ty, scale: tScale }}
       >
 
@@ -6480,6 +7002,8 @@ export default function App() {
         transform={transformValues}
         isIdle={true}
         isZooming={isZooming}
+        isAgentRunning={isAgentRunning || isProcessingInspectQueueRef.current || isAgentThinking || isThinkingOrLoadingPhrase(agentState.speak)}
+        selectedCards={activeSelectedCards}
         isDarkMode={isDarkMode}
         quickInput={
           agentQuickInput?.isOpen
@@ -6502,13 +7026,21 @@ export default function App() {
                   deleteDraft(currentKey); // Delete draft from IndexedDB on submit
                   setAgentQuickInput(null);
                   if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
+                  isAgentRunningRef.current = true;
+                  setIsAgentThinking(true);
+                  setIsAgentRunning(true);
                   setAgentState(prev => ({
                     ...prev,
                     lastPrompt: prompt,
                     speak: "正在思考...",
                     visible: true
                   }));
-                  if (!prompt) return;
+                  if (!prompt) {
+                    setIsAgentThinking(false);
+                    setIsAgentRunning(false);
+                    isAgentRunningRef.current = false;
+                    return;
+                  }
                   if (currentTarget) {
                     await handleCardAgentChat(currentTarget, prompt);
                   } else {

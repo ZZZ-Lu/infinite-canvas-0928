@@ -17,6 +17,7 @@ import {
   ScrollText,
   TerminalSquare,
   Eye,
+  Zap,
   X,
 } from 'lucide-react';
 import { motion } from 'motion/react';
@@ -106,9 +107,9 @@ const NODE_DEFINITIONS: NodeDefinition[] = [
   },
   {
     key: 'subject_landmarks',
-    name: '图像主体定位节点',
-    shortName: 'Landmarks',
-    description: '极速定位图像中人物关键点（头部、胸部、腿部）与核心主体空间百分比坐标',
+    name: '画面元素标注节点',
+    shortName: 'Annotation',
+    description: '极速定位与标注图像中关键主体及画面元素（人物部位、核心物体与视觉焦点）的空间百分比坐标',
     promptKey: 'subjectLandmarksPrompt',
     modelKey: 'subjectLandmarksModel',
   },
@@ -118,6 +119,44 @@ const NODE_DEFINITIONS: NodeDefinition[] = [
     shortName: 'Data Viewer',
     description: '查看当前项目的结构化提取数据 (切片产物)',
   }
+];
+
+const JSON_ADAPTER_PRESETS = [
+  {
+    label: '元素标注·检测',
+    desc: '意图驱动识别指定元素',
+    value: '{{调用 card.detectLandmarks，对卡片 card_1 标注主要人物手持的长剑与腰间玉佩}}',
+  },
+  {
+    label: '元素标注·追加',
+    desc: 'mode="append" 追加识别',
+    value: '{{调用 card.detectLandmarks, cardId: "card_1", action: "detect", requirement: "追加识别背景中的所有光源与反光表面", mode: "append"}}',
+  },
+  {
+    label: '元素标注·列表',
+    desc: 'action="list" 查看已有',
+    value: '{{调用 card.detectLandmarks, cardId: "card_1", action: "list"}}',
+  },
+  {
+    label: '元素标注·更新',
+    desc: 'action="update" 修改标注',
+    value: '{{调用 card.detectLandmarks, cardId: "card_1", action: "update", updates: [{ id: "elem_1", label: "玄铁重剑", description: "剑身漆黑古朴，隐隐有暗金色龙纹流转" }]}}',
+  },
+  {
+    label: '元素标注·删除',
+    desc: 'action="delete" 删除指定',
+    value: '{{调用 card.detectLandmarks, cardId: "card_1", action: "delete", deleteIds: ["elem_2"]}}',
+  },
+  {
+    label: '元素标注·清空',
+    desc: 'action="clear" 清空全部',
+    value: '{{调用 card.detectLandmarks, cardId: "card_1", action: "clear"}}',
+  },
+  {
+    label: '画布卡片·生图',
+    desc: 'card.generate 参数重构',
+    value: '{{调用 card.generate, { name: "金发女郎晚礼服", referenceCardIds: ["rshuewfmu", "yow33r73x"], targetCardId: "new", prompt: "A stunning blonde woman with a glamorous silver fringe necklace, wearing a sheer deep-V evening gown, lying on a luxurious bed in a sensual pose.", aspectRatio: "9:16" }}}',
+  },
 ];
 
 const MODEL_ROUTE_DEFINITIONS: NodeDefinition[] = [
@@ -219,10 +258,10 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
         speak: "正在为你分析画面中的复古奢侈质感..."
       }
     }, null, 2),
-    json_adapter: '{{调用 card.generate, { name: "金发女郎晚礼服", referenceCardIds: ["rshuewfmu", "yow33r73x"], targetCardId: "new", prompt: "A stunning blonde woman with a glamorous silver fringe necklace, wearing a sheer deep-V evening gown, lying on a luxurious bed in a sensual pose.", aspectRatio: "9:16" }}}',
+    json_adapter: JSON_ADAPTER_PRESETS[0].value,
     subject_landmarks: JSON.stringify({
       imageUrl: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=512&auto=format&fit=crop&q=60",
-      prompt: "一位戴着墨镜的时尚青年在都市街头特写肖像"
+      requirement: "标注画面中人物的墨镜、面部五官表情以及耳环首饰"
     }, null, 2),
     data_viewer: '',
   }));
@@ -238,6 +277,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
   const [nodeResults, setNodeResults] = useState<Partial<Record<NodeKey, any>>>({});
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [payloadCopied, setPayloadCopied] = useState(false);
   const [applied, setApplied] = useState(false);
   const [showLandmarkHUD, setShowLandmarkHUD] = useState(() => {
     if (typeof window === 'undefined') return true;
@@ -518,8 +558,11 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
         } catch {
           parsedInput = {
             imageUrl: input.startsWith('http') || input.startsWith('data:') ? input : undefined,
-            prompt: input,
+            requirement: input,
           };
+        }
+        if (!parsedInput.requirement && parsedInput.prompt) {
+          parsedInput.requirement = parsedInput.prompt;
         }
 
         body = {
@@ -604,6 +647,12 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
     setTimeout(() => setCopied(false), 1200);
   };
 
+  const copyPayload = async () => {
+    await navigator.clipboard.writeText(safeJson(payloadPreview));
+    setPayloadCopied(true);
+    setTimeout(() => setPayloadCopied(false), 1200);
+  };
+
   const outputText = resultTab === 'logs'
     ? (result?.logs || []).join('\n')
     : result
@@ -617,7 +666,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
       exit={{ opacity: 0 }}
       data-prevent-canvas-wheel="true"
       onWheel={(event) => event.stopPropagation()}
-      className="fixed inset-0 z-[100] flex flex-col overflow-hidden bg-[#f7f7f8] text-slate-900 dark:bg-[#0d0d0f] dark:text-slate-100"
+      className="fixed inset-0 z-[100] flex flex-col overflow-hidden bg-[#f7f7f8] text-slate-900 select-text dark:bg-[#0d0d0f] dark:text-slate-100"
     >
       <header className="flex h-14 shrink-0 items-center gap-3 border-b border-slate-200 bg-gray-100 px-4 dark:border-white/10 dark:bg-[#151517]">
         <div className="grid h-8 w-8 place-items-center rounded-lg bg-violet-600 text-white"><ListTree size={16} /></div>
@@ -807,8 +856,8 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
                     <Eye size={14} />
                   </div>
                   <div>
-                    <p className="text-xs font-semibold text-slate-800 dark:text-slate-200">卡片空间部位标签 HUD 浮层</p>
-                    <p className="text-[11px] text-slate-400">控制画布卡片上是否默认显示 AI 识别出的身体部位、五官与关键细节的空间锚点与文字标签</p>
+                    <p className="text-xs font-semibold text-slate-800 dark:text-slate-200">画面元素标注 HUD 浮层</p>
+                    <p className="text-[11px] text-slate-400">控制画布卡片上是否默认显示 AI 标注出的画面元素、身体部位与关键细节的空间锚点与文字标签</p>
                   </div>
                 </div>
                 <button
@@ -824,6 +873,34 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
                     }`}
                   />
                 </button>
+              </div>
+            )}
+            {selectedNode === 'json_adapter' && centerTab === 'source' && (
+              <div className="mb-3 shrink-0 rounded-xl border border-blue-500/20 bg-blue-500/5 p-3 dark:border-blue-500/30 dark:bg-blue-500/10">
+                <div className="mb-2 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Zap size={14} className="text-blue-500" />
+                    <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">画面元素标注与工具转译快速测试预设</span>
+                  </div>
+                  <span className="text-[11px] text-slate-400">点击切换要转译的指令</span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {JSON_ADAPTER_PRESETS.map((preset) => (
+                    <button
+                      key={preset.label}
+                      type="button"
+                      onClick={() => updateInput(preset.value)}
+                      className={`cursor-pointer rounded-lg border px-2.5 py-1 text-xs font-medium transition ${
+                        input === preset.value
+                          ? 'border-blue-500 bg-blue-500 text-white shadow-2xs'
+                          : 'border-slate-200 bg-white/70 text-slate-600 hover:border-blue-300 hover:text-blue-600 dark:border-white/10 dark:bg-white/5 dark:text-slate-300 dark:hover:border-blue-500/50 dark:hover:text-blue-400'
+                      }`}
+                      title={preset.desc}
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
             {centerTab === 'source' && (
@@ -874,8 +951,18 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
             )}
             {centerTab === 'payload' && (
               <div className="flex h-full flex-col">
-                <p className="mb-2 text-[11px] text-slate-400">发送前的请求结构预览，凭证已隐藏</p>
-                <pre className="min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap break-words [overflow-wrap:anywhere] rounded-xl border border-slate-200 bg-[#111318] p-4 font-mono text-xs leading-6 text-slate-300 dark:border-white/10">{safeJson(payloadPreview)}</pre>
+                <div className="mb-2 flex items-center justify-between text-[11px] text-slate-400">
+                  <span>发送前的请求结构预览，凭证已隐藏</span>
+                  <button
+                    type="button"
+                    onClick={copyPayload}
+                    className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-0.5 text-[10px] text-slate-600 hover:text-slate-900 shadow-2xs dark:border-white/10 dark:bg-neutral-800 dark:text-slate-300 dark:hover:bg-neutral-700 transition cursor-pointer"
+                  >
+                    {payloadCopied ? <Check size={11} className="text-emerald-500" /> : <Copy size={11} />}
+                    <span>{payloadCopied ? '已复制 Payload' : '复制 Payload'}</span>
+                  </button>
+                </div>
+                <pre className="min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap break-all [word-break:break-all] [overflow-wrap:anywhere] select-text rounded-xl border border-slate-200 bg-[#111318] p-4 font-mono text-xs leading-6 text-slate-300 dark:border-white/10">{safeJson(payloadPreview)}</pre>
               </div>
             )}
           </div>
@@ -910,7 +997,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
               <div className="grid h-full place-items-center text-center text-slate-400"><div><div className="mx-auto mb-3 grid h-11 w-11 place-items-center rounded-2xl border border-slate-200 bg-gray-100 dark:border-white/10 dark:bg-white/10 dark:text-white dark:[&_option]:bg-neutral-900"><Play size={17} /></div><p className="text-sm font-medium text-slate-500 dark:text-slate-300">等待运行</p><p className="mt-1 text-xs">选择节点，检查 Prompt 和输入，然后运行</p></div></div>
             )}
             {!isRunning && result && (
-              <pre className="h-full overflow-y-auto whitespace-pre-wrap break-words [overflow-wrap:anywhere] rounded-xl border border-slate-200 bg-gray-100 p-4 font-mono text-xs leading-6 text-slate-700 dark:border-white/10 dark:bg-black dark:text-slate-300">{outputText || '该节点没有返回日志。'}</pre>
+              <pre className="h-full overflow-y-auto whitespace-pre-wrap break-all [word-break:break-all] [overflow-wrap:anywhere] select-text rounded-xl border border-slate-200 bg-gray-100 p-4 font-mono text-xs leading-6 text-slate-700 dark:border-white/10 dark:bg-black dark:text-slate-300">{outputText || '该节点没有返回日志。'}</pre>
             )}
           </div>
         </section>

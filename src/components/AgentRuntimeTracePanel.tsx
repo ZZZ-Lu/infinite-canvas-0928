@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Braces, CheckCircle2, CircleAlert, Clock3, Cpu, Eye, MousePointer2, Send, TerminalSquare, Wrench, Zap } from 'lucide-react';
+import { Braces, Check, CheckCircle2, CircleAlert, Clock3, Copy, Cpu, Eye, MousePointer2, Send, TerminalSquare, Wrench, Zap } from 'lucide-react';
 import type { AgentRuntimeTrace, AgentTurnTrace } from '../agent/debugTrace';
 import type { RuntimeEvent } from '../agent/runtime';
 
@@ -59,7 +59,11 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
   }
 
   return (
-    <section className="flex min-h-0 flex-1 bg-[#fbfbfc] dark:bg-[#121214]">
+    <section 
+      className="flex min-h-0 flex-1 select-text bg-[#fbfbfc] dark:bg-[#121214]"
+      onPointerDown={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+    >
       <aside className="flex w-64 shrink-0 flex-col border-r border-slate-200 bg-gray-100 dark:border-white/10 dark:bg-[#151517]">
         <div className="border-b border-slate-200 px-4 py-4 dark:border-white/10">
           <p className="text-[10px] font-semibold uppercase tracking-[.16em] text-violet-500">Runtime Trace</p>
@@ -132,56 +136,57 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
           <div className="ml-auto text-[10px] text-slate-400">{turn ? `${clock(turn.startedAt)} · ${duration(turn)}` : ''}</div>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-4">
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">
           {!turn && <div className="grid h-full place-items-center text-sm text-slate-400">等待第一轮模型请求。</div>}
-          {turn && detailTab === 'prompt' && <div className="space-y-4">
+          {turn && detailTab === 'prompt' && <div className="flex min-h-0 flex-1 flex-col space-y-3">
             <TraceNotice icon={<Eye size={15} />} title="这是服务端实际组装后发送给模型的内容" text="可据此检查 userMessage、task、history、System Prompt、工具定义分别如何进入本轮请求。API Key 已排除。" />
             {turn.transport ? (
               <JsonBlock 
+                className="flex min-h-0 flex-1 flex-col"
                 title={`模型：${turn.transport.request.model}`} 
                 value={turn.transport.request.messages?.[0]?.content || turn.transport.request} 
               />
             ) : <PendingBlock />}
           </div>}
-          {turn && detailTab === 'output' && <div className="space-y-4">
-            <JsonBlock title="模型原始返回" value={turn.transport?.response?.content || null} />
-            <JsonBlock title="服务端解析后的轮次结果" value={turn.parsedResult ? (() => { const { debug: _debug, ...parsed } = turn.parsedResult!; return parsed; })() : null} />
+          {turn && detailTab === 'output' && <div className="flex min-h-0 flex-1 flex-col space-y-3">
+            <JsonBlock className="flex min-h-[220px] flex-1 flex-col" title="模型原始返回" value={turn.transport?.response?.content || null} />
+            <JsonBlock className="flex min-h-[220px] flex-1 flex-col" title="服务端解析后的轮次结果" value={turn.parsedResult ? (() => { const { debug: _debug, ...parsed } = turn.parsedResult!; return parsed; })() : null} />
             {turn.error && <TraceNotice icon={<CircleAlert size={15} />} title="轮次请求失败" text={turn.error} danger />}
           </div>}
           {turn && detailTab === 'tools' && <div className="space-y-3">
             <TraceNotice icon={<MousePointer2 size={15} />} title="组件与鼠标动作的来源" text="工具输入的 targetId 来自本轮之前的 page.inspect；ui.actAndObserve 的输出会包含动作后的 page.inspect。展开记录可查看完整 JSON、可见组件坐标与页面状态。" />
             {turnEvents.length ? turnEvents.map(event => <ToolEventCard key={event.id} event={event} />) : <PendingBlock text="本轮尚未产生 Runtime 工具事件。" />}
           </div>}
-          {turn && detailTab === 'stateNode' && <div className="space-y-4">
+          {turn && detailTab === 'stateNode' && <div className="flex min-h-0 flex-1 flex-col space-y-3">
             <TraceNotice
               icon={<Cpu size={15} />}
               title="认知状态提取节点（/api/agent/update-state-node）"
               text="在每轮主循环结束后自动触发运行，解析主 Agent 输出并提取更新认知状态 JSON（标题、目标、小目标、进度、笔记与计划）。"
             />
             {turn.stateNodeTrace?.prompt ? (
-              <JsonBlock title="状态节点输入 Prompt" value={turn.stateNodeTrace.prompt} />
+              <JsonBlock className="flex min-h-[200px] flex-1 flex-col" title="状态节点输入 Prompt" value={turn.stateNodeTrace.prompt} />
             ) : null}
             {turn.stateNodeTrace?.response ? (
-              <JsonBlock title="状态节点解析更新结果" value={turn.stateNodeTrace.response} />
+              <JsonBlock className="flex min-h-[200px] flex-1 flex-col" title="状态节点解析更新结果" value={turn.stateNodeTrace.response} />
             ) : (
               <PendingBlock text="本轮尚未产生状态节点更新数据。" />
             )}
           </div>}
-          {turn && detailTab === 'jsonAdapter' && <div className="space-y-4">
+          {turn && detailTab === 'jsonAdapter' && <div className="flex min-h-0 flex-1 flex-col space-y-3">
             <TraceNotice
               icon={<Zap size={15} />}
               title="工具 JSON 转译节点（/api/agent/turn）"
               text="当主模型输出非标 JSON、JS 对象语法或自然语言时触发。0毫秒极速模式优先修复语法，若不符合规范则唤醒转译 LLM 节点重构标准参数。"
             />
             {turn.parsedResult?.jsonAdapterTrace ? (
-              <JsonBlock title="转译节点运行模式与数据追踪" value={turn.parsedResult.jsonAdapterTrace} />
+              <JsonBlock className="flex min-h-0 flex-1 flex-col" title="转译节点运行模式与数据追踪" value={turn.parsedResult.jsonAdapterTrace} />
             ) : (
               <PendingBlock text="本轮主模型已直接输出标准 JSON，无需唤醒转译节点。" />
             )}
           </div>}
-          {turn && detailTab === 'task' && <div className="space-y-4">
-            <JsonBlock title="本轮调用前的任务快照（实际注入 task / history 的来源）" value={turn.taskBefore} />
-            <JsonBlock title="任务最新状态" value={trace.task} />
+          {turn && detailTab === 'task' && <div className="flex min-h-0 flex-1 flex-col space-y-3">
+            <JsonBlock className="flex min-h-[200px] flex-1 flex-col" title="本轮调用前的任务快照（实际注入 task / history 的来源）" value={turn.taskBefore} />
+            <JsonBlock className="flex min-h-[200px] flex-1 flex-col" title="任务最新状态" value={trace.task} />
           </div>}
         </div>
       </main>
@@ -190,36 +195,40 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
 }
 
 function TraceNotice({ icon, title, text, danger = false }: { icon: React.ReactNode; title: string; text: string; danger?: boolean }) {
-  return <div className={`flex gap-2 rounded-xl border p-3 text-xs leading-5 ${danger ? 'border-red-200 bg-red-50 text-red-700 dark:border-red-500/30 dark:bg-red-500 dark:text-red-300' : 'border-violet-100 bg-violet-50 text-slate-600 dark:border-violet-500/20 dark:bg-violet-500 dark:text-slate-300'}`}><span className="mt-0.5 shrink-0 text-violet-500">{icon}</span><div><p className="font-semibold">{title}</p><p className="mt-0.5 opacity-80">{text}</p></div></div>;
+  return <div className={`flex gap-2 rounded-xl border p-3 text-xs leading-5 shrink-0 ${danger ? 'border-red-200 bg-red-50 text-red-700 dark:border-red-500/30 dark:bg-red-500 dark:text-red-300' : 'border-violet-100 bg-violet-50 text-slate-600 dark:border-violet-500/20 dark:bg-violet-500 dark:text-slate-300'}`}><span className="mt-0.5 shrink-0 text-violet-500">{icon}</span><div><p className="font-semibold">{title}</p><p className="mt-0.5 opacity-80">{text}</p></div></div>;
 }
 
-function JsonBlock({ title, value }: { title: string; value: unknown }) {
+function JsonBlock({ title, value, className }: { title: string; value: unknown; className?: string }) {
   const [copied, setCopied] = useState(false);
   const isString = typeof value === 'string';
   // If it's an object, JSON.stringify escapes \n to \\n. We unescape it here for UI readability.
   let displayValue = isString ? value : json(value);
   displayValue = displayValue.replace(/\\n/g, '\n').replace(/\\"/g, '"');
   
-  const handleCopy = () => {
+  const handleCopy = (e: React.MouseEvent) => {
+    e.stopPropagation();
     navigator.clipboard.writeText(displayValue);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
   return (
-    <section>
-      <div className="mb-2 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <span className="h-1.5 w-1.5 rounded-full bg-violet-500" />
-          <h3 className="text-xs font-semibold">{title}</h3>
+    <section className={`min-w-0 max-w-full ${className || ''}`}>
+      <div className="mb-2 flex shrink-0 items-center justify-between">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-violet-500" />
+          <h3 className="truncate text-xs font-semibold">{title}</h3>
         </div>
         <button 
           onClick={handleCopy}
-          className="text-[10px] text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+          type="button"
+          className="flex shrink-0 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 shadow-sm transition hover:bg-slate-50 hover:text-slate-900 active:scale-95 dark:border-white/10 dark:bg-neutral-800 dark:text-slate-200 dark:hover:bg-neutral-700 cursor-pointer"
+          title="复制全部文本"
         >
-          {copied ? '已复制' : '复制'}
+          {copied ? <Check size={12} className="text-emerald-500" /> : <Copy size={12} />}
+          <span>{copied ? '已复制' : '复制文本'}</span>
         </button>
       </div>
-      <pre className="max-h-[560px] overflow-y-auto whitespace-pre-wrap select-text break-words [overflow-wrap:anywhere] rounded-xl border border-slate-200 bg-gray-100 p-4 font-mono text-[11px] leading-5 text-slate-700 dark:border-white/10 dark:bg-black dark:text-slate-300">
+      <pre className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto whitespace-pre-wrap break-all [word-break:break-all] [overflow-wrap:anywhere] select-text rounded-xl border border-slate-200 bg-gray-100 p-4 font-mono text-[11px] leading-6 text-slate-700 dark:border-white/10 dark:bg-black dark:text-slate-300">
         {displayValue}
       </pre>
     </section>
@@ -231,11 +240,11 @@ function PendingBlock({ text = '本轮仍在请求模型或尚未返回可展示
 }
 
 function ToolEventCard({ event }: { event: RuntimeEvent; key?: React.Key }) {
-  return <details className="rounded-xl border border-slate-200 bg-gray-100 p-3 dark:border-white/10 dark:bg-white/[.03]">
+  return <details className="rounded-xl border border-slate-200 bg-gray-100 p-3 dark:border-white/10 dark:bg-white/[.03] select-text">
     <summary className="flex cursor-pointer list-none items-center gap-2"><span className="shrink-0">{eventIcon(event)}</span><span className="min-w-0 flex-1 truncate text-xs font-medium">{event.text}</span><span className="text-[10px] text-slate-400">{event.status || event.type}</span></summary>
     <div className="mt-3 grid gap-3 border-t border-slate-100 pt-3 dark:border-white/10">
       <p className="text-[11px] text-slate-500">{new Date(event.createdAt).toLocaleTimeString('zh-CN', { hour12: false })} · {event.toolName || event.type}</p>
-      <div className="whitespace-pre-wrap select-text text-[11px] leading-5 text-slate-700 dark:text-slate-300">
+      <div className="whitespace-pre-wrap select-text break-all text-[11px] leading-5 text-slate-700 dark:text-slate-300">
         {event.text}
       </div>
       {event.input !== undefined && <JsonBlock title="工具输入" value={event.input} />}

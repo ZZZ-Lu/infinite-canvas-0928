@@ -4,6 +4,7 @@ export type AgentToolName =
   | 'card.inspect'
   | 'card.generate'
   | 'card.detectLandmarks'
+  | 'card.annotateElements'
   | 'ui.actAndObserve'
   | 'sys.updateState'
   | 'sys.endTask'

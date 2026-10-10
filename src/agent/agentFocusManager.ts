@@ -75,6 +75,10 @@ class AgentFocusManager {
   }
 
   public setCursorMode(mode: AgentCursorMode) {
+    if (this.fadeTimer && mode === 'default') {
+      clearTimeout(this.fadeTimer);
+      this.fadeTimer = null;
+    }
     if (this.cursorMode !== mode) {
       this.cursorMode = mode;
       this.notify();
@@ -158,6 +162,7 @@ class AgentFocusManager {
     primary?: string | null;
     references?: string[];
     role?: AgentFocusRole;
+    referenceRole?: AgentFocusRole;
     sourceTool?: string;
     cursorMode?: AgentCursorMode;
   }) {
@@ -171,6 +176,7 @@ class AgentFocusManager {
 
     const role = options.role || 'working';
     const sourceTool = options.sourceTool || 'card.generate';
+    const refRole = options.referenceRole || (options.role === 'inspect' ? 'inspect' : 'reference');
 
     if (options.primary && options.primary !== 'new') {
       this.primaryCardId = options.primary;
@@ -190,7 +196,7 @@ class AgentFocusManager {
           this.referenceCardIds.add(refId);
           this.focusedMap.set(refId, {
             cardId: refId,
-            role: 'reference',
+            role: refRole,
             sourceTool,
             timestamp: Date.now(),
           });
@@ -254,12 +260,12 @@ class AgentFocusManager {
         this.setCursorMode('inspect');
         this.setPrimaryFocus(cardId, 'inspect', 'card.inspect');
       }
-    } else if (call.name === 'card.detectLandmarks') {
+    } else if (call.name === 'card.detectLandmarks' || (call.name as string) === 'card.annotateElements') {
       const cardId = call.arguments?.cardId || call.arguments?.targetCardId;
       if (typeof cardId === 'string' && cardId) {
         const cleanCardId = cardId.startsWith('canvas.card.') ? cardId.replace('canvas.card.', '') : cardId;
         this.setCursorMode('working');
-        this.setPrimaryFocus(cleanCardId, 'working', 'card.detectLandmarks');
+        this.setPrimaryFocus(cleanCardId, 'working', call.name);
       }
     } else if (call.name === 'card.generate') {
       const targetCardId = call.arguments?.targetCardId;
