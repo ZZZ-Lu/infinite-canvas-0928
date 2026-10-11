@@ -23,7 +23,7 @@ import {
   Copy
 } from 'lucide-react';
 import { isCardIntersectingRectangle } from '../utils/viewportCulling';
-import { getPromptAreaHeight, calculatePromptLines } from '../utils/cardLayout';
+import { getBottomPanelHeight, getPromptAreaHeight, calculatePromptLines } from '../utils/cardLayout';
 import { CardImageCanvas } from './CardImageCanvas';
 import { fullImageCache, originalImageCache } from '../utils/imageTextureCache';
 import { ScriptProject } from '../types/script';
@@ -2425,12 +2425,14 @@ export const GenerationCard = React.memo(function GenerationCard({
   const [currentScale, setCurrentScale] = useState(() => scale.get());
   useEffect(() => {
     return scale.on('change', (v) => {
-      // Only trigger React state updates when not actively zooming to avoid rendering thrashing
-      if (!isZooming) {
+      // If we cross the 0.4 LOD boundary, trigger state update immediately so transition runs during zoom
+      const wasBelow = currentScale < 0.4;
+      const isNowBelow = v < 0.4;
+      if (wasBelow !== isNowBelow || !isZooming) {
         setCurrentScale(v);
       }
     });
-  }, [scale, isZooming]);
+  }, [scale, isZooming, currentScale]);
 
   // Synchronize the scale immediately once zooming ends (Instant Restoration)
   useEffect(() => {
@@ -2439,14 +2441,47 @@ export const GenerationCard = React.memo(function GenerationCard({
     }
   }, [isZooming, scale]);
 
-  // Initial mount transition state: triggers a one-time smooth fade-in for text tags upon entering viewport (culling) or mounting
-  const [isMountFading, setIsMountFading] = useState(true);
+  // Track whether the card itself has finished loading & painting
+  const [isCardLoaded, setIsCardLoaded] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return Boolean((window as any).__paintedCardIds?.has(id));
+  });
+  // Initial state: tags start strictly with opacity: 0 while card is loading, then smoothly fade in after load
+  const [isTagsReady, setIsTagsReady] = useState(false);
+
+  // Listen for card-painted event to detect when media/DOM finish loading
   useEffect(() => {
-    const timer = setTimeout(() => {
-      setIsMountFading(false);
-    }, 400);
-    return () => clearTimeout(timer);
-  }, []);
+    if (isCardLoaded) return;
+
+    if (typeof window !== 'undefined' && (window as any).__paintedCardIds?.has(id)) {
+      setIsCardLoaded(true);
+      return;
+    }
+
+    const handleCardPainted = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      if (customEvent.detail?.cardId === id) {
+        setIsCardLoaded(true);
+      }
+    };
+
+    window.addEventListener('card-painted', handleCardPainted);
+    return () => {
+      window.removeEventListener('card-painted', handleCardPainted);
+    };
+  }, [id, isCardLoaded]);
+
+  // When the card finishes loading, smoothly fade in the tags (give browser 1-2 frames to paint card first)
+  useEffect(() => {
+    if (isCardLoaded) {
+      const timer = setTimeout(() => {
+        setIsTagsReady(true);
+      }, 40);
+      return () => clearTimeout(timer);
+    } else {
+      setIsTagsReady(false);
+    }
+  }, [isCardLoaded]);
 
   // 🔍 动态探针：准确获取并缓存真实返回图片/视频的物理像素尺寸
   const [actualDimensions, setActualDimensions] = useState<{ width: number; height: number } | null>(() => {
@@ -3154,9 +3189,10 @@ export const GenerationCard = React.memo(function GenerationCard({
   // Bottom panel container is ALWAYS rendered for generation cards (!isAssetCard)
   const shouldRenderBottomPanel = !isAssetCard;
 
-  // Prompt panel Low LOD exists strictly below 40% in 2D NanoLodCanvas.
-  // Once scale >= 40%, DOM cards always render the complete original interactive panel.
-  const isLowLodSkeleton = false;
+  // Low-LOD Skeleton Overlay:
+  // Visible initially on mount / loading (!isTagsReady) or when scale < 0.4.
+  // Positioned as an overlay over high-LOD component, transitions opacity from 1 down to 0 over 700ms.
+  const isLowLodSkeleton = currentScale < 0.4 || !isTagsReady;
   
   useEffect(() => {
     if (videoRef.current && videoRef.current.readyState >= 2) {
@@ -3167,11 +3203,10 @@ export const GenerationCard = React.memo(function GenerationCard({
   const adjustTextareaHeight = useCallback(() => {
     const el = textareaRef.current;
     if (!el) return;
-    el.style.height = 'auto';
-    const scrollHeight = el.scrollHeight;
-    el.style.height = `${scrollHeight}px`;
+    const promptH = getPromptAreaHeight(localPrompt);
+    el.style.height = `${promptH}px`;
     
-    if (scrollHeight >= 300) {
+    if (el.scrollHeight > promptH && promptH >= 300) {
       el.style.overflowY = 'auto';
     } else {
       el.style.overflowY = 'hidden';
@@ -3180,15 +3215,13 @@ export const GenerationCard = React.memo(function GenerationCard({
     if (mirrorRef.current) {
       mirrorRef.current.scrollTop = el.scrollTop;
     }
-  }, []);
+  }, [localPrompt]);
 
   useLayoutEffect(() => {
-    if (shouldRenderBottomPanel && !isLowLodSkeleton) {
+    if (shouldRenderBottomPanel) {
       adjustTextareaHeight();
-      const raf = requestAnimationFrame(adjustTextareaHeight);
-      return () => cancelAnimationFrame(raf);
     }
-  }, [shouldRenderBottomPanel, isLowLodSkeleton, localPrompt, adjustTextareaHeight]);
+  }, [shouldRenderBottomPanel, localPrompt, adjustTextareaHeight]);
 
   // Track dragging locally for 0-latency, then sync on pointer up
   const posRef = useRef({ x, y });
@@ -3396,7 +3429,9 @@ export const GenerationCard = React.memo(function GenerationCard({
             slave.el.style.transform = `translate(${slave.initialX}px, ${slave.initialY}px)`;
           });
           // Select only this card (deselect others) since no drag occurred
-          onSelect?.(upEvent as any, id, true);
+          if ((upEvent as any).isTrusted) {
+            onSelect?.(upEvent as any, id, true);
+          }
         }
       }
     };
@@ -3412,7 +3447,8 @@ export const GenerationCard = React.memo(function GenerationCard({
       e.preventDefault();
       return;
     }
-    if (e.button === 0) {
+    // Only genuine human pointer clicks select the card (Agent actions never overwrite selection)
+    if (e.button === 0 && e.isTrusted) {
       onSelect?.(e, id);
     }
   };
@@ -4457,7 +4493,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       data-agent-target={`canvas.card.${id}`}
       data-agent-actions="mouse.move mouse.click mouse.doubleClick mouse.hover mouse.drag"
       data-selected={isSelected ? 'true' : 'false'}
-      className={`absolute top-0 left-0 pointer-events-none will-change-transform ${isSelected ? 'z-10' : 'z-0'}`}
+      className={`absolute top-0 left-0 pointer-events-none will-change-transform ${isSelected || isAgentTarget ? 'z-10' : 'z-0'}`}
       style={{ transformOrigin: 'top left', transform: `translate(${displayX}px, ${displayY}px)` }}
       onPointerDownCapture={handleContainerPointerDown}
     >
@@ -4578,7 +4614,7 @@ export const GenerationCard = React.memo(function GenerationCard({
             pickerSelectionIndex && pickerSelectionIndex > 0
               ? 'outline outline-[4px] outline-[#2563eb] shadow-[0_0_25px_rgba(37,99,235,0.7)] scale-[1.015]'
               : isAgentTarget && isSelected
-                ? 'outline outline-[#a45cf8] ring-2 ring-[#3b82f6] shadow-[0_0_25px_rgba(168,85,247,0.45)]'
+                ? 'outline-none'
                 : agentFocusRole === 'working'
                   ? 'outline outline-[#a45cf8] shadow-[0_0_28px_rgba(168,85,247,0.55)] animate-pulse'
                   : agentFocusRole === 'reference'
@@ -4593,6 +4629,8 @@ export const GenerationCard = React.memo(function GenerationCard({
           } ${
             pickerSelectionIndex && pickerSelectionIndex > 0
               ? 'translate-y-0'
+              : isAgentTarget && isSelected
+                ? 'border-transparent shadow-[0_0_20px_rgba(59,130,246,0.35),0_0_25px_rgba(168,85,247,0.45)] translate-y-0'
               : isAgentTarget
                 ? 'border-transparent shadow-[0_0_25px_rgba(168,85,247,0.45),0_20px_40px_-8px_rgba(0,0,0,0.18)] dark:shadow-[0_0_30px_rgba(168,85,247,0.55),0_24px_48px_-8px_rgba(0,0,0,0.65)] translate-y-0'
                 : isSelected 
@@ -4608,6 +4646,8 @@ export const GenerationCard = React.memo(function GenerationCard({
             height: h,
             outlineWidth: pickerSelectionIndex && pickerSelectionIndex > 0 
               ? 'calc(4px / var(--current-scale, 1))' 
+              : isAgentTarget && isSelected
+                ? '0px'
               : isAgentTarget
                 ? 'calc(2.5px / var(--current-scale, 1))'
                 : isPickerTarget
@@ -4628,10 +4668,24 @@ export const GenerationCard = React.memo(function GenerationCard({
           }}
           onPointerDown={onPointerDown}
         >
+        {/* Dual Co-Presence Border (Half User Blue #3b82f6 + Half Agent Purple #a45cf8) */}
+        {isAgentTarget && isSelected && (
+          <div 
+            className="dual-selection-border absolute inset-0 pointer-events-none rounded-[20px] corner-squircle z-[65] select-none transition-opacity duration-150"
+            style={{
+              padding: '2.5px',
+              background: 'linear-gradient(135deg, #3b82f6 0%, #3b82f6 44%, #a45cf8 56%, #a45cf8 100%)',
+              WebkitMask: 'linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0)',
+              WebkitMaskComposite: 'xor',
+              mask: 'linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0)',
+              maskComposite: 'exclude',
+            }}
+          />
+        )}
         {/* Card / File Name Tag */}
         {(data.name || data.fileName) && (
           <div 
-            className={`absolute z-[60] pointer-events-none asset-heavy-dom card-header-tag flex justify-start ${isMountFading ? 'card-tag-fade-in' : ''}`}
+            className={`absolute z-[60] pointer-events-none asset-heavy-dom card-header-tag flex justify-start transition-opacity duration-700 ease-out ${isTagsReady ? 'opacity-100 tag-visible' : 'opacity-0'}`}
             style={{
               top: '12px',
               left: '12px',
@@ -4654,7 +4708,7 @@ export const GenerationCard = React.memo(function GenerationCard({
         {isAgentTarget && (
           <div 
             ref={miraTagRef}
-            className={`absolute top-[12px] left-1/2 -translate-x-1/2 z-[70] pointer-events-none asset-heavy-dom card-header-tag select-none ${isMountFading ? 'card-tag-fade-in' : ''}`}
+            className={`absolute top-[12px] left-1/2 -translate-x-1/2 z-[70] pointer-events-none asset-heavy-dom card-header-tag select-none transition-opacity duration-700 ease-out ${isTagsReady ? 'opacity-100 tag-visible' : 'opacity-0'}`}
           >
             <div className="bg-[#a45cf8] h-[26px] px-2.5 rounded-xl corner-squircle shadow-md flex items-center gap-1.5 border border-white/20">
               <span className="w-1.5 h-1.5 rounded-full bg-white animate-ping" />
@@ -4669,7 +4723,7 @@ export const GenerationCard = React.memo(function GenerationCard({
         {resolutionTag && (
           <div 
             ref={rightTagRef}
-            className={`absolute z-[60] pointer-events-none asset-heavy-dom card-header-tag ${isMountFading ? 'card-tag-fade-in' : ''}`}
+            className={`absolute z-[60] pointer-events-none asset-heavy-dom card-header-tag transition-opacity duration-700 ease-out ${isTagsReady ? 'opacity-100 tag-visible' : 'opacity-0'}`}
             style={{
               top: '12px',
               right: '12px',
@@ -4772,6 +4826,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                   autoPlay={isPlaying}
                   className="absolute inset-0 w-full h-full object-cover pointer-events-none transition-opacity duration-500 group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform"
                   onLoadedData={(e) => {
+                    setIsCardLoaded(true);
                     const video = e.currentTarget;
                     if (video.duration) {
                       setDuration(video.duration);
@@ -5106,6 +5161,7 @@ export const GenerationCard = React.memo(function GenerationCard({
               dpr={dpr}
               state={state}
               isZooming={isZooming}
+              onLoaded={() => setIsCardLoaded(true)}
               className="squircle"
             />
           )
@@ -5211,66 +5267,24 @@ export const GenerationCard = React.memo(function GenerationCard({
         />
       </div>
 
-      {/* Bottom Layer: Light Panel (Always rendered for generation cards; skeleton blocks in low LOD) */}
+      {/* Bottom Layer: Light Panel (Always rendered for generation cards) */}
       {shouldRenderBottomPanel && (
       <div 
-        className={`generation-card-bottom-panel ${isMountFading ? 'card-tag-fade-in' : ''} pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 ${isLowLodSkeleton ? '!rounded-none !corner-shape-none' : 'squircle'} p-4 gap-2 w-[480px] border border-gray-200/80 dark:border-[#404040] cursor-default self-start ease-out transform-gpu opacity-100 [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
-        isZooming
-          ? 'shadow-none dark:shadow-none' // Persistent Degradation: strip expensive drop shadows during high-frequency zoom
-          : isSelected 
-            ? 'shadow-[0_16px_36px_-6px_rgba(0,0,0,0.12),0_8px_16px_-4px_rgba(0,0,0,0.06)] dark:shadow-[0_20px_40px_-6px_rgba(0,0,0,0.45)] translate-y-0' 
-            : 'shadow-[0_1px_3px_rgba(0,0,0,0.05),0_1px_2px_rgba(0,0,0,0.03)] dark:shadow-none translate-y-0'
+        className={`generation-card-bottom-panel relative pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 squircle p-4 gap-2 w-[480px] border border-gray-200/80 dark:border-[#404040] cursor-default self-start transform-gpu [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
+        isSelected 
+          ? 'shadow-[0_16px_36px_-6px_rgba(0,0,0,0.12),0_8px_16px_-4px_rgba(0,0,0,0.06)] dark:shadow-[0_20px_40px_-6px_rgba(0,0,0,0.45)]' 
+          : 'shadow-[0_1px_3px_rgba(0,0,0,0.05),0_1px_2px_rgba(0,0,0,0.03)] dark:shadow-none'
       }`}
         style={{
           marginLeft: (w - 480) / 2,
-          transitionProperty: 'box-shadow, opacity',
-          transitionDuration: isZooming ? '0ms' : '180ms'
+          height: getBottomPanelHeight(localPrompt, refList.length),
+          minHeight: getBottomPanelHeight(localPrompt, refList.length),
         }}
       >
-        {isLowLodSkeleton ? (
-          <div className="flex flex-col gap-2 w-full select-none pointer-events-none">
-            {/* Reference images skeleton blocks - ALWAYS rendered to match Full Detail DOM's + Add Button */}
-            <div className="flex items-center gap-2 flex-wrap w-full">
-              {refList.map((_, idx) => (
-                <div key={idx} className="w-12 h-12 rounded-none bg-gray-200/80 dark:bg-neutral-700/60 flex-shrink-0" />
-              ))}
-              <div className="w-12 h-12 rounded-none border-2 border-dashed border-gray-300/80 dark:border-neutral-700/60 flex-shrink-0" />
-            </div>
-
-            {/* Text lines skeleton blocks - matching Full Detail mt-1 min-h-[50px] max-h-[300px] flex flex-col gap-1.5 */}
-            {(() => {
-              const promptH = getPromptAreaHeight(localPrompt);
-              const totalLines = calculatePromptLines(localPrompt);
-              const displayLineCount = Math.max(1, Math.min(13, Math.round(promptH / 22)));
-              return (
-                <div 
-                  className="relative w-full flex flex-col justify-center gap-1.5 mt-1"
-                  style={{ height: promptH }}
-                >
-                  {Array.from({ length: displayLineCount }).map((_, i) => (
-                    <div
-                      key={i}
-                      className={`h-3.5 bg-gray-200/90 dark:bg-neutral-700/80 rounded-none ${
-                        i === displayLineCount - 1 && displayLineCount > 1 ? 'w-[55%]' : 'w-[92%]'
-                      }`}
-                    />
-                  ))}
-                </div>
-              );
-            })()}
-
-            {/* Controls skeleton bar - matching Full Detail mt-2 pt-2 border-t */}
-            <div className="flex items-center justify-between mt-2 pt-2 border-t border-gray-200/60 dark:border-neutral-700/50">
-              <div className="flex items-center gap-2">
-                <div className="h-7 w-16 bg-gray-200/80 dark:bg-neutral-700/60 rounded-none" />
-                <div className="h-7 w-20 bg-gray-200/80 dark:bg-neutral-700/60 rounded-none" />
-                <div className="h-7 w-14 bg-gray-200/80 dark:bg-neutral-700/60 rounded-none" />
-              </div>
-              <div className="w-8 h-8 rounded-none bg-gray-200/90 dark:bg-neutral-700/80" />
-            </div>
-          </div>
-        ) : (
-        <>
+        {/* High-LOD Interactive Prompt Component: Base Layer directly rendered underneath with full layout */}
+        <div
+          className="generation-card-bottom-panel-content relative z-0 flex flex-col gap-3 w-full"
+        >
         {/* Top: Reference & Actions */}
         <div className="flex items-start justify-between relative" ref={refMenuContainerRef}>
           <div className="relative flex items-center gap-2 flex-wrap w-full">
@@ -5397,7 +5411,8 @@ export const GenerationCard = React.memo(function GenerationCard({
               ? expandedPromptHeight
               : isRebounding
                 ? textareaHeight
-                : undefined,
+                : getPromptAreaHeight(localPrompt),
+            minHeight: getPromptAreaHeight(localPrompt),
             transition: isRebounding ? 'height 0.24s cubic-bezier(0.16, 1, 0.3, 1)' : 'none',
           }}
         >
@@ -5459,6 +5474,7 @@ export const GenerationCard = React.memo(function GenerationCard({
               fontFamily: 'inherit',
               letterSpacing: 'normal',
               lineHeight: '22px',
+              height: getPromptAreaHeight(localPrompt),
               boxSizing: 'border-box',
               scrollbarWidth: 'none',
               msOverflowStyle: 'none',
@@ -5828,8 +5844,55 @@ export const GenerationCard = React.memo(function GenerationCard({
             <ArrowUp className="w-4 h-4 stroke-[3]" />
           </button>
         </div>
-        </>
-        )}
+        </div>
+
+        {/* Low-LOD Skeleton Component: Overlay Layer on top, cross-fades opacity from 1 down to 0 over 400ms */}
+        <div 
+          className={`generation-card-bottom-panel-skeleton lod-crossfade absolute inset-0 z-10 p-4 rounded-[inherit] bg-gray-100 dark:bg-neutral-800 flex flex-col gap-3 select-none transition-opacity duration-400 ease-out ${
+            isLowLodSkeleton ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
+          }`}
+          aria-hidden={!isLowLodSkeleton}
+        >
+          {/* Reference images skeleton blocks - ALWAYS rendered to match Full Detail DOM's + Add Button */}
+          <div className="flex items-center gap-2 flex-wrap w-full">
+            {refList.map((_, idx) => (
+              <div key={idx} className="w-12 h-12 rounded-lg bg-gray-200/80 dark:bg-neutral-700/60 flex-shrink-0" />
+            ))}
+            <div className="w-12 h-12 rounded-lg border-2 border-dashed border-gray-300/80 dark:border-neutral-700/60 flex-shrink-0" />
+          </div>
+
+          {/* Text lines skeleton blocks - matching Full Detail mt-1 min-h-[50px] max-h-[300px] flex flex-col gap-1.5 */}
+          {(() => {
+            const promptH = getPromptAreaHeight(localPrompt);
+            const totalLines = calculatePromptLines(localPrompt);
+            const displayLineCount = Math.max(1, Math.min(13, Math.round(promptH / 22)));
+            return (
+              <div 
+                className="relative w-full flex flex-col justify-center gap-1.5 mt-1"
+                style={{ height: promptH }}
+              >
+                {Array.from({ length: displayLineCount }).map((_, i) => (
+                  <div
+                    key={i}
+                    className={`h-3.5 bg-gray-200/90 dark:bg-neutral-700/80 rounded-sm ${
+                      i === displayLineCount - 1 && displayLineCount > 1 ? 'w-[55%]' : 'w-[92%]'
+                    }`}
+                  />
+                ))}
+              </div>
+            );
+          })()}
+
+          {/* Controls skeleton bar - matching Full Detail mt-2 pt-2 border-t */}
+          <div className="flex items-center justify-between mt-2 pt-2 border-t border-gray-200/60 dark:border-neutral-700/50">
+            <div className="flex items-center gap-2">
+              <div className="h-7 w-16 bg-gray-200/80 dark:bg-neutral-700/60 rounded-md" />
+              <div className="h-7 w-20 bg-gray-200/80 dark:bg-neutral-700/60 rounded-md" />
+              <div className="h-7 w-14 bg-gray-200/80 dark:bg-neutral-700/60 rounded-md" />
+            </div>
+            <div className="w-8 h-8 rounded-full bg-gray-200/90 dark:bg-neutral-700/80" />
+          </div>
+        </div>
       </div>
       )}
       </motion.div>

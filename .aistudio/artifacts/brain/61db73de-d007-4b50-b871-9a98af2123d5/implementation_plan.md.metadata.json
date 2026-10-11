@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan to fix multi-card Agent focus rendering in Nano LOD canvas mode.\n\nKey Changes:\n1. Update NanoLodCanvas props to pass `agentTargetCardIds` (Set/Array of card IDs) and `agentFocusMap` / `agentQuickInput` state.\n2. In NanoLodCanvas renderer, draw solid purple focus borders (`#9333ea`) for all focused cards in `agentTargetCardIds` or `agentFocusMap`.\n3. Render canvas-native Agent status badge and cursor/speak indicators on all focused cards in Nano LOD mode.\n4. Ensure full consistency between Full LOD (DOM) and Nano LOD (Canvas) Agent focus states.",
+  "updatedAt":  "2026-10-10T02:42:10.356219851Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

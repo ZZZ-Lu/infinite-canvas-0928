@@ -16,7 +16,9 @@ export interface NanoLodCanvasProps {
   selectedCardIds: string[];
   renderedCardIds?: Set<string>;
   agentTargetCardId?: string | null;
+  agentTargetCardIds?: string[] | Set<string>;
   agentReferenceCardIds?: string[];
+  agentFocusMap?: Record<string, { role: string; sourceTool: string }>;
   pickerSession?: {
     targetCardId: string;
     selectedReferences?: Array<{
@@ -63,53 +65,289 @@ function drawCardBottomPanel(
   normalLineWidth: number
 ) {
   const panelW = 480;
-
-  const refCount = card.referenceImages?.length || 0;
-  const refRows = Math.ceil((refCount + 1) / 8);
-  const refSectionHeight = refRows * 56;
-
-  const promptAreaHeight = getPromptAreaHeight(card.prompt);
-  const displayLineCount = Math.max(1, Math.min(13, Math.round(promptAreaHeight / 22)));
-
-  // Get unified panel height matching Full Detail & MicroLOD exactly
-  const panelH = getBottomPanelHeight(card.prompt, card.referenceImages?.length);
+  const refList = card.referenceImages || [];
+  const refCount = refList.length;
+  const promptText = card.prompt || '';
+  const panelH = getBottomPanelHeight(promptText, refCount);
   const panelX = cardX + (cardW - panelW) / 2;
   const panelY = cardY + cardH + 12; // 12px gap matching flex flex-col gap-3 in DOM
 
-  // Background fill (sharp straight edges / no border radius in Low LOD)
+  ctx.save();
+
+  // Create squircle clipping mask for panel container
+  ctx.beginPath();
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(panelX, panelY, panelW, panelH, 16);
+  } else {
+    ctx.rect(panelX, panelY, panelW, panelH);
+  }
+  ctx.clip();
+
+  // Enable direct real-time GPU Canvas filter blur
+  if ('filter' in ctx) {
+    (ctx as any).filter = 'blur(2.5px)';
+  }
+
+  // 1) Panel Container Background
   ctx.fillStyle = dark ? '#262626' : '#f3f4f6';
-  ctx.fillRect(panelX, panelY, panelW, panelH);
+  ctx.beginPath();
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(panelX, panelY, panelW, panelH, 16);
+  } else {
+    ctx.rect(panelX, panelY, panelW, panelH);
+  }
+  ctx.fill();
 
-  // Border
-  ctx.strokeStyle = isSelected ? borderSelected : borderNormal;
-  ctx.lineWidth = isSelected ? selectedLineWidth : normalLineWidth;
-  ctx.strokeRect(panelX, panelY, panelW, panelH);
+  let curY = panelY + 16; // p-4 (16px padding)
 
-  // Internal skeleton color blocks (sharp straight edges / no border radius in Low LOD)
-  ctx.fillStyle = dark ? '#383838' : '#e2e8f0';
-  let curY = panelY + 17; // 1px border + 16px padding
-
-  // 1) Reference images skeleton (ALWAYS rendered, including plus button)
+  // 2) Reference Images Area (exact 1:1 real component layout matching DOM)
+  const refRows = Math.ceil((refCount + 1) / 8);
   for (let r = 0; r < refRows; r++) {
-    const itemsInRow = Math.min(refCount + 1 - r * 8, 8);
-    for (let i = 0; i < itemsInRow; i++) {
-      ctx.fillRect(panelX + 16 + i * 56, curY + r * 56, 48, 48);
+    const items = Math.min(refCount + 1 - r * 8, 8);
+    for (let i = 0; i < items; i++) {
+      const itemIdx = r * 8 + i;
+      const rx = panelX + 16 + i * 56;
+      const ry = curY + r * 56;
+
+      if (itemIdx < refCount) {
+        const item = refList[itemIdx];
+        const itemUrl = item?.url || item?.thumbnailUrl || '';
+        let refImg: HTMLImageElement | null = null;
+        if (itemUrl) {
+          refImg = getOrLoadThumbImage(itemUrl, () => {});
+        }
+
+        // Draw Thumbnail Box
+        ctx.save();
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(rx, ry, 48, 48, 8);
+        } else {
+          ctx.rect(rx, ry, 48, 48);
+        }
+        ctx.clip();
+
+        ctx.fillStyle = dark ? '#171717' : '#f9fafb';
+        ctx.fillRect(rx, ry, 48, 48);
+
+        if (refImg && refImg.complete && refImg.naturalWidth > 0) {
+          ctx.drawImage(refImg, rx, ry, 48, 48);
+        }
+
+        // Draw Blue Tag at top left: `@item.name`
+        const tagName = item.name || `@${itemIdx + 1}`;
+        ctx.fillStyle = '#0284c7'; // Blue badge background
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(rx + 2, ry + 2, 42, 12, 3);
+        } else {
+          ctx.rect(rx + 2, ry + 2, 42, 12);
+        }
+        ctx.fill();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 9px sans-serif';
+        ctx.textBaseline = 'top';
+        ctx.fillText(tagName.slice(0, 7), rx + 4, ry + 3);
+
+        ctx.restore();
+
+        // Border around thumbnail
+        ctx.strokeStyle = dark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.1)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(rx, ry, 48, 48, 8);
+        } else {
+          ctx.rect(rx, ry, 48, 48);
+        }
+        ctx.stroke();
+      } else {
+        // The "+ Add" Button Box (Dashed border)
+        ctx.strokeStyle = dark ? '#525252' : '#d1d5db';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(rx, ry, 48, 48, 8);
+        } else {
+          ctx.rect(rx, ry, 48, 48);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Plus icon '+'
+        ctx.strokeStyle = dark ? '#737373' : '#9ca3af';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(rx + 24, ry + 18);
+        ctx.lineTo(rx + 24, ry + 30);
+        ctx.moveTo(rx + 18, ry + 24);
+        ctx.lineTo(rx + 30, ry + 24);
+        ctx.stroke();
+      }
     }
   }
-  curY += refSectionHeight; // includes row height + outer gap-2 (8px)
+  curY += (refRows * 56 - 8) + 16; // ref section + gap-3 (12px) + mt-1 (4px)
 
-  // 2) Prompt text skeleton lines (mt-1 = 4px offset)
-  curY += 4;
-  const textTopOffset = curY + (promptAreaHeight - displayLineCount * 18) / 2;
-  for (let i = 0; i < displayLineCount; i++) {
-    const lw = (i === displayLineCount - 1 && displayLineCount > 1) ? panelW * 0.55 : panelW * 0.85;
-    ctx.fillRect(panelX + 16, textTopOffset + i * 22, lw, 14);
+  // 3) Actual Prompt Text with Blue `@Mention` Badges
+  ctx.textBaseline = 'top';
+  ctx.font = '500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+
+  const rawLines = promptText ? promptText.split('\n') : ['输入文字指令，例如：清冷克制的女主...'];
+  let lineY = curY;
+  const availableW = 448; // 480 - 32 padding
+
+  for (let l = 0; l < rawLines.length; l++) {
+    const lineStr = rawLines[l];
+    if (!lineStr) {
+      lineY += 22;
+      continue;
+    }
+
+    // Tokenize line into mentions (@...) and normal text
+    const tokens = lineStr.split(/(@\S+)/g);
+    let currentX = panelX + 16;
+
+    for (let k = 0; k < tokens.length; k++) {
+      const token = tokens[k];
+      if (!token) continue;
+
+      if (token.startsWith('@')) {
+        // Blue `@Mention` Pill Badge
+        const tw = ctx.measureText(token).width + 8;
+        if (currentX + tw > panelX + 16 + availableW && currentX > panelX + 16) {
+          currentX = panelX + 16;
+          lineY += 22;
+        }
+
+        ctx.fillStyle = '#0284c7'; // Blue badge background
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(currentX, lineY + 1, tw, 20, 4);
+        } else {
+          ctx.rect(currentX, lineY + 1, tw, 20);
+        }
+        ctx.fill();
+
+        ctx.fillStyle = '#ffffff'; // White text
+        ctx.fillText(token, currentX + 4, lineY + 2);
+        currentX += tw + 4;
+      } else {
+        // Regular text
+        ctx.fillStyle = dark ? '#f5f5f5' : '#1f2937';
+        for (let ch = 0; ch < token.length; ch++) {
+          const char = token[ch];
+          const cw = ctx.measureText(char).width;
+          if (currentX + cw > panelX + 16 + availableW) {
+            currentX = panelX + 16;
+            lineY += 22;
+          }
+          ctx.fillText(char, currentX, lineY + 2);
+          currentX += cw;
+        }
+      }
+    }
+    lineY += 22;
   }
 
-  // 3) Controls bottom bar (mt-2 pt-2 border-t)
-  const actionBarY = panelY + panelH - 17 - 32;
-  ctx.fillRect(panelX + 16, actionBarY + 2, 140, 28);
-  ctx.fillRect(panelX + panelW - 48, actionBarY, 32, 32);
+  // 4) Actual Action Bar / Controls
+  const actionBarY = panelY + panelH - 16 - 32; // p-4 (16px) + 32px height
+
+  // Top border line
+  ctx.strokeStyle = dark ? '#404040' : '#e5e7eb';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(panelX + 16, actionBarY - 8);
+  ctx.lineTo(panelX + panelW - 16, actionBarY - 8);
+  ctx.stroke();
+
+  // Blue `@ 引用` Button
+  ctx.fillStyle = '#0284c7';
+  ctx.beginPath();
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(panelX + 16, actionBarY + 2, 60, 28, 8);
+  } else {
+    ctx.rect(panelX + 16, actionBarY + 2, 60, 28);
+  }
+  ctx.fill();
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 12px sans-serif';
+  ctx.fillText('@ 引用', panelX + 22, actionBarY + 8);
+
+  // Model Selector Pill `✨ Hy Image3.5 pre... ˅`
+  ctx.fillStyle = dark ? '#262626' : '#f9fafb';
+  ctx.strokeStyle = dark ? '#404040' : '#e5e7eb';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(panelX + 84, actionBarY + 2, 130, 28, 8);
+  } else {
+    ctx.rect(panelX + 84, actionBarY + 2, 130, 28);
+  }
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = dark ? '#d4d4d4' : '#4b5563';
+  ctx.font = '12px sans-serif';
+  ctx.fillText('✨ Hy Image3.5 pre...', panelX + 90, actionBarY + 8);
+
+  // Ratio Pill `16:9 ˅`
+  ctx.beginPath();
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(panelX + 222, actionBarY + 2, 60, 28, 8);
+  } else {
+    ctx.rect(panelX + 222, actionBarY + 2, 60, 28);
+  }
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = dark ? '#d4d4d4' : '#4b5563';
+  ctx.font = '12px sans-serif';
+  ctx.fillText(card.ratio || '16:9', panelX + 230, actionBarY + 8);
+
+  // Resolution Pill `2K ˅`
+  ctx.beginPath();
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(panelX + 290, actionBarY + 2, 48, 28, 8);
+  } else {
+    ctx.rect(panelX + 290, actionBarY + 2, 48, 28);
+  }
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = dark ? '#d4d4d4' : '#4b5563';
+  ctx.font = '12px sans-serif';
+  ctx.fillText(card.res || '2K', panelX + 298, actionBarY + 8);
+
+  // Circular Generate Button with Arrow `↑`
+  ctx.fillStyle = dark ? '#ffffff' : '#111827';
+  ctx.beginPath();
+  ctx.arc(panelX + panelW - 16 - 16, actionBarY + 16, 16, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = dark ? '#111827' : '#ffffff';
+  ctx.font = 'bold 16px sans-serif';
+  ctx.fillText('↑', panelX + panelW - 32 - 5, actionBarY + 7);
+
+  // Reset real-time filter blur
+  if ('filter' in ctx) {
+    (ctx as any).filter = 'none';
+  }
+
+  ctx.restore();
+
+  // Stroke border
+  ctx.strokeStyle = isSelected ? borderSelected : borderNormal;
+  ctx.lineWidth = isSelected ? selectedLineWidth : normalLineWidth;
+  ctx.beginPath();
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(panelX, panelY, panelW, panelH, 16);
+  } else {
+    ctx.rect(panelX, panelY, panelW, panelH);
+  }
+  ctx.stroke();
 }
 
 export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function NanoLodCanvas({
@@ -117,7 +355,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   selectedCardIds,
   renderedCardIds,
   agentTargetCardId,
+  agentTargetCardIds,
   agentReferenceCardIds,
+  agentFocusMap,
   pickerSession,
   scale,
   tx,
@@ -153,8 +393,14 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   const agentTargetCardIdRef = useRef(agentTargetCardId);
   agentTargetCardIdRef.current = agentTargetCardId;
 
+  const agentTargetCardIdsRef = useRef(agentTargetCardIds);
+  agentTargetCardIdsRef.current = agentTargetCardIds;
+
   const agentReferenceCardIdsRef = useRef(agentReferenceCardIds);
   agentReferenceCardIdsRef.current = agentReferenceCardIds;
+
+  const agentFocusMapRef = useRef(agentFocusMap);
+  agentFocusMapRef.current = agentFocusMap;
 
   const pickerSessionRef = useRef(pickerSession);
   pickerSessionRef.current = pickerSession;
@@ -256,6 +502,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     const colorDraft = dark ? '#262626' : '#f3f4f6';
     const borderNormal = dark ? 'rgba(64, 64, 64, 0.85)' : 'rgba(212, 212, 216, 0.85)';
     const borderSelected = '#3b82f6';
+    const borderAgentTarget = '#9333ea';
     const normalLineWidth = 1.5 / scaleRatio;
     const selectedLineWidth = 3.5 / scaleRatio;
 
@@ -263,6 +510,15 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       const card = currentCards[i];
       const dim = getCardSize(card);
       const isSelected = selectedSet.has(card.id);
+      const targetIds = agentTargetCardIdsRef.current;
+      const isAgentTargetInSet = Boolean(
+        targetIds && (targetIds instanceof Set ? targetIds.has(card.id) : targetIds.includes(card.id))
+      );
+      const isAgentFocused = Boolean(
+        (agentTargetCardIdRef.current && agentTargetCardIdRef.current === card.id) ||
+        isAgentTargetInSet ||
+        agentFocusMapRef.current?.[card.id]
+      );
       const hasMedia = Boolean(
         card.thumbnailUrl || card.imageUrl || card.originalImageUrl || card.trueOriginalImageUrl || card.fileData || card.originalFileData || card.trueOriginalFileData
       );
@@ -300,9 +556,15 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       }
 
       // Proportional rectangle stroke border
-      offCtx.strokeStyle = isSelected ? borderSelected : borderNormal;
-      offCtx.lineWidth = isSelected ? selectedLineWidth : normalLineWidth;
-      offCtx.strokeRect(card.x, card.y, dim.width, dim.height);
+      if (isAgentFocused) {
+        offCtx.strokeStyle = borderAgentTarget;
+        offCtx.lineWidth = selectedLineWidth * 1.25;
+        offCtx.strokeRect(card.x, card.y, dim.width, dim.height);
+      } else {
+        offCtx.strokeStyle = isSelected ? borderSelected : borderNormal;
+        offCtx.lineWidth = isSelected ? selectedLineWidth : normalLineWidth;
+        offCtx.strokeRect(card.x, card.y, dim.width, dim.height);
+      }
 
       // 4. Bottom Panel Skeleton Color Block for Generation Cards in Overview Mode
       const isGenerationCard = !card.fileName && !card.isAsset;
@@ -542,6 +804,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       const isPickerSelected = pickerSelectionIndex > 0;
 
       const dim = getCardSize(card);
+      const screenW = dim.width * currentScale;
 
       // --- CALCULATE REALTIME NANO DRAGGING OFFSET ---
       let cardX = card.x;
@@ -624,8 +887,15 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         }
       }
 
+      const focusItem = agentFocusMapRef.current?.[card.id];
+      const targetIds = agentTargetCardIdsRef.current;
+      const isAgentTargetInSet = Boolean(
+        targetIds && (targetIds instanceof Set ? targetIds.has(card.id) : targetIds.includes(card.id))
+      );
       const isAgentPrimary = Boolean(
-        agentTargetCardIdRef.current && agentTargetCardIdRef.current === card.id
+        (agentTargetCardIdRef.current && agentTargetCardIdRef.current === card.id) ||
+        isAgentTargetInSet ||
+        focusItem
       );
       const isAgentRef = Boolean(
         agentReferenceCardIdsRef.current && agentReferenceCardIdsRef.current.includes(card.id)
@@ -638,13 +908,15 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         ctx.strokeRect(cardX, cardY, dim.width, dim.height);
       } else if (isAgentPrimary) {
         if (isSelected) {
-          // Dual co-presence: user blue inner border + agent purple outer border
-          ctx.strokeStyle = borderSelected;
-          ctx.lineWidth = selectedLineWidth;
-          ctx.strokeRect(cardX, cardY, dim.width, dim.height);
-          ctx.strokeStyle = borderAgentTarget;
-          ctx.lineWidth = selectedLineWidth * 1.3;
-          ctx.strokeRect(cardX - 1.5, cardY - 1.5, dim.width + 3, dim.height + 3);
+          // Dual co-presence: half user blue (#3b82f6) + half agent purple (#a45cf8) diagonal gradient stroke
+          const grad = ctx.createLinearGradient(cardX, cardY, cardX + dim.width, cardY + dim.height);
+          grad.addColorStop(0, '#3b82f6');
+          grad.addColorStop(0.44, '#3b82f6');
+          grad.addColorStop(0.56, '#a45cf8');
+          grad.addColorStop(1, '#a45cf8');
+          ctx.strokeStyle = grad;
+          ctx.lineWidth = selectedLineWidth * 1.35;
+          ctx.strokeRect(cardX - 1, cardY - 1, dim.width + 2, dim.height + 2);
         } else {
           ctx.strokeStyle = borderAgentTarget;
           ctx.lineWidth = selectedLineWidth * 1.25;
@@ -690,8 +962,6 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       }
 
       // 4. Center indicator / video play badge
-      const screenW = dim.width * currentScale;
-
       if (card.isVideo && screenW >= 12) {
         // Video Thumbnail Overlay: semi-transparent circular badge with play triangle
         const cx = cardX + dim.width / 2;
@@ -826,7 +1096,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     if (isActive) {
       scheduleDraw();
     }
-  }, [cards, selectedCardIds, renderedCardIds, pickerSession, isDarkMode, isOverviewMode, dotModeThreshold, isActive]);
+  }, [cards, selectedCardIds, renderedCardIds, agentTargetCardId, agentTargetCardIds, agentReferenceCardIds, agentFocusMap, pickerSession, isDarkMode, isOverviewMode, dotModeThreshold, isActive]);
 
   // Listen to custom nano dragging and card painted events for local, non-react repaint
   useEffect(() => {

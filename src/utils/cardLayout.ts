@@ -27,11 +27,11 @@
  *    - gap-2 before action bar = 8px
  *    - mt-2 (8px) + pt-2 (8px) + border-t (1px) + controls (32px) = 49px
  * 
- * Total Panel Height = 2 (border) + 32 (padding) + 49 (action bar) + 8 (gap) + (rows * 56) + 4 (mt-1) + promptHeight
- *                    = 95 + (rows * 56) + promptHeight
+ * Total Panel Height = 2 (border) + 32 (padding) + (rows * 56 - 8) + 12 (gap-3) + 4 (mt-1) + promptHeight + 12 (gap-3) + 8 (mt-2) + 1 (border-t) + 8 (pt-2) + 32 (btn)
+ *                    = 103 + (rows * 56) + promptHeight
  * 
- * Minimum Panel Height (empty prompt, 0 refs) = 95 + 56 + 50 = 201px
- * Maximum Panel Height (max prompt 300px, 1 row refs) = 95 + 56 + 300 = 451px
+ * Minimum Panel Height (empty prompt, 0 refs) = 103 + 56 + 50 = 209px
+ * Maximum Panel Height (max prompt 300px, 1 row refs) = 103 + 56 + 300 = 459px
  */
 
 export function calculatePromptLines(promptText: string | undefined | null): number {
@@ -59,5 +59,5 @@ export function getBottomPanelHeight(promptText: string | undefined | null, refe
   const refSectionHeight = refRows * 56;
   const promptHeight = getPromptAreaHeight(promptText);
 
-  return 95 + refSectionHeight + promptHeight;
+  return 103 + refSectionHeight + promptHeight;
 }

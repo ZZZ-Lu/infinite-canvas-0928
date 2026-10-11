@@ -1,4 +1,5 @@
 import { AspectRatio, CARD_DIMENSIONS, getCardSize } from '../components/GenerationCard';
+import { getBottomPanelHeight } from './cardLayout';
 
 export interface CardBounds {
   id: string;
@@ -7,6 +8,10 @@ export interface CardBounds {
   ratio: AspectRatio;
   customWidth?: number;
   customHeight?: number;
+  prompt?: string;
+  referenceImages?: any[];
+  fileName?: string;
+  isAsset?: boolean;
 }
 
 export interface CanvasViewport {
@@ -19,12 +24,17 @@ export interface CanvasViewport {
 
 /**
  * Calculates visual dimensions of a card in canvas world coordinates.
- * Includes the image area, gap, and bottom prompt/action panel.
+ * Includes the image area, gap, and dynamic bottom prompt/action panel height for generation cards.
  */
 export function getCardDimensions(card: CardBounds): { width: number; height: number } {
   const dim = getCardSize(card);
+  const isGenerationCard = !card.fileName && !card.isAsset;
   const visualWidth = Math.max(dim.width, 480);
-  const visualHeight = dim.height + 220; // 12px gap + ~200px bottom panel
+  if (!isGenerationCard) {
+    return { width: visualWidth, height: dim.height };
+  }
+  const panelHeight = getBottomPanelHeight(card.prompt, card.referenceImages?.length);
+  const visualHeight = dim.height + 12 + panelHeight;
   return { width: visualWidth, height: visualHeight };
 }
 
@@ -52,14 +62,16 @@ export function isCardIntersectingRectangle(
   const cardBottom = cardTop + cardHeight * scale;
 
   // Add a scale-adaptive buffer zone outside screen edges for smooth pre-loading
-  // At smaller scales (e.g., 0.40), reduces buffer to prevent mounting dozens of offscreen DOM nodes
   const buffer = Math.max(40, Math.min(150, Math.round(150 * Math.sqrt(scale))));
+  
+  // Explicit user preference: Expand top safety buffer zone specifically for top-edge culling
+  const topBuffer = buffer + 350;
 
   return (
     cardLeft <= viewportWidth + buffer &&
     cardRight >= -buffer &&
     cardTop <= viewportHeight + buffer &&
-    cardBottom >= -buffer
+    cardBottom >= -topBuffer
   );
 }
 

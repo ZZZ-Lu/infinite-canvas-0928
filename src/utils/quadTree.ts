@@ -1,4 +1,5 @@
 import { CardData, getCardSize } from '../components/GenerationCard';
+import { getBottomPanelHeight } from './cardLayout';
 
 export interface BoundingBox {
   minX: number;
@@ -173,8 +174,10 @@ export function buildCardQuadTree(cards: CardData[]): QuadTree<CardData> {
   for (let i = 0; i < cards.length; i++) {
     const card = cards[i];
     const dim = getCardSize(card);
+    const isGenerationCard = !card.fileName && !card.isAsset;
     const cWidth = Math.max(dim.width, 480);
-    const cHeight = dim.height + 220; // 12px gap + bottom panel
+    const panelHeight = isGenerationCard ? getBottomPanelHeight(card.prompt, card.referenceImages?.length) : 0;
+    const cHeight = isGenerationCard ? (dim.height + 12 + panelHeight) : dim.height;
 
     const cardMinX = card.x;
     const cardMinY = card.y;

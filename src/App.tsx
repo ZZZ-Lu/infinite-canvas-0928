@@ -989,9 +989,13 @@ export default function App() {
     const currentCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
     const targetIds = (agentQuickInput?.targetIds && agentQuickInput.targetIds.length > 0)
       ? agentQuickInput.targetIds
-      : (agentQuickInput?.targetId ? [agentQuickInput.targetId] : (agentFocus.primaryCardId ? [agentFocus.primaryCardId] : []));
+      : (agentQuickInput?.targetId 
+          ? [agentQuickInput.targetId] 
+          : (agentFocus.primaryCardId 
+              ? [agentFocus.primaryCardId] 
+              : (selectedCardIds.length > 0 ? selectedCardIds : [])));
     return targetIds.map(id => currentCards.find(c => c.id === id)).filter((c): c is CardData => Boolean(c));
-  }, [cards, agentQuickInput, agentFocus.primaryCardId]);
+  }, [cards, agentQuickInput, agentFocus.primaryCardId, selectedCardIds]);
 
   const handleStartAgentBoxSelect = useCallback((startX: number, startY: number) => {
     setAgentSelectionBox({
@@ -1023,8 +1027,7 @@ export default function App() {
         );
       }).map(c => c.id);
 
-      // Keep selectedCardIds in 100% lockstep
-      setSelectedCardIds(newlySelectedIds);
+      // Agent box-select dynamically targets cards for Mira without modifying user selection (selectedCardIds)
 
       // Calculate screen position of the prompt bubble
       const screenX = next.startX * tScale.get() + tx.get();
@@ -1086,7 +1089,6 @@ export default function App() {
     setContextMenus(prev => { const next = {...prev}; delete next['user']; return next; });
 
     if (hitCard) {
-      setSelectedCardIds([hitCard.id]);
       const promptText = buildDynamicSelectionPrompt([hitCard]);
       const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
         ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
@@ -1112,7 +1114,6 @@ export default function App() {
         focusTrigger: Date.now()
       });
     } else {
-      setSelectedCardIds([]);
       const promptText = "我能帮什么忙？";
       setAgentState(prev => ({
         ...prev,
@@ -1165,7 +1166,6 @@ export default function App() {
       const screenY = agentState.y * tScale.get() + ty.get();
 
       if (hitCard) {
-        setSelectedCardIds([hitCard.id]);
         const promptText = buildDynamicSelectionPrompt([hitCard]);
         const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
           ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
@@ -3301,7 +3301,7 @@ export default function App() {
       setIsLodFading(false);
       const ws = document.getElementById('canvas-workspace');
       if (ws) ws.removeAttribute('data-lod-fade');
-    }, 600);
+    }, 1200);
   }, []);
 
   const cancelLodFade = useCallback(() => {
@@ -3323,8 +3323,8 @@ export default function App() {
       // isDomCardsActive will be disabled by the onReady callback from NanoLodCanvas once its first frame renders
     } else {
       setIsDomCardsActive(true);
-      // Give DOM cards a brief window to mount and paint before destroying the backdrop Canvas
-      const t = setTimeout(() => setIsNanoCanvasActive(false), 150);
+      // Give DOM cards window to mount, paint and finish 700ms crossfade before destroying backdrop Canvas
+      const t = setTimeout(() => setIsNanoCanvasActive(false), 800);
       return () => clearTimeout(t);
     }
   }, [isNanoLod]);
@@ -3671,10 +3671,7 @@ export default function App() {
         targetIds = [...selectedCardIds];
       } else {
         targetIds = [targetId];
-        setSelectedCardIds([targetId]);
       }
-    } else {
-      setSelectedCardIds([]);
     }
 
     const ownerId = e.nativeEvent.isTrusted ? 'user' : 'agent';
@@ -4157,6 +4154,12 @@ export default function App() {
   // returns project facts; a later page.inspect remains the only evidence path.
   const applyPageCommand = useCallback(async (action: MouseActionName, targetId: string, arguments_: Record<string, unknown>) => {
     if (action === 'mouse.click') {
+      if (targetId.startsWith('canvas.card.')) {
+        const cardId = targetId.replace('canvas.card.', '');
+        agentFocusManager.setCursorMode('inspect');
+        agentFocusManager.setPrimaryFocus(cardId, 'inspect', 'mouse.click');
+        return;
+      }
       const target = document.querySelector(`[data-agent-target="${targetId}"]`);
       if (target instanceof HTMLElement) {
         // Dispatch both native click and React-compatible MouseEvent to ensure maximum compatibility
@@ -4167,11 +4170,7 @@ export default function App() {
         target.click();
       } else {
         // Manual fallback for critical global state views just in case the element wasn't found in DOM
-        if (targetId.startsWith('canvas.card.')) {
-          const cardId = targetId.replace('canvas.card.', '');
-          setSelectedCardIds([cardId]);
-        }
-        else if (targetId === 'script-bible-toggle') setDrawerOpen(!scriptViewRef.current.drawerOpen);
+        if (targetId === 'script-bible-toggle') setDrawerOpen(!scriptViewRef.current.drawerOpen);
         else if (targetId === 'script.close') setDrawerOpen(false);
         else if (targetId === 'script.view.script') setScriptView('script');
         else if (targetId === 'script.view.assets') setScriptView('assets');
@@ -6774,36 +6773,57 @@ export default function App() {
       />
 
       {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.40 or during staggered DOM loading) */}
-      <NanoLodCanvas
-        cards={cards}
-        selectedCardIds={selectedCardIds}
-        renderedCardIds={renderedCardIds}
-        agentTargetCardId={
-          agentFocus.primaryCardId || 
-          (agentQuickInput?.isOpen && agentQuickInput.targetId ? agentQuickInput.targetId : null)
+      {(() => {
+        const targetCardIds = new Set<string>();
+        if (agentFocus.primaryCardId) targetCardIds.add(agentFocus.primaryCardId);
+        if (agentFocus.referenceCardIds) {
+          agentFocus.referenceCardIds.forEach(id => targetCardIds.add(id));
         }
-        agentReferenceCardIds={agentFocus.referenceCardIds}
-        pickerSession={pickerSession}
-        scale={tScale}
-        tx={tx}
-        ty={ty}
-        isDarkMode={isDarkMode}
-        isOverviewMode={isOverviewMode}
-        isActive={
-          isNanoCanvasActive || 
-          (renderedCardIds.size < visibleCards.length && visibleCards.length > 0) ||
-          (() => {
-            if (typeof window === 'undefined') return false;
-            const paintedSet = (window as any).__paintedCardIds;
-            if (!paintedSet) return visibleCards.length > 0;
-            return visibleCards.some(c => !paintedSet.has(c.id));
-          })()
+        if (agentFocus.focusedMap) {
+          Object.keys(agentFocus.focusedMap).forEach(id => targetCardIds.add(id));
         }
-        onReady={handleNanoCanvasReady}
-        onThumbnailGenerated={(id, thumbnailUrl) => {
-          handleUpdateCard(id, { thumbnailUrl }, false);
-        }}
-      />
+        if (agentQuickInput?.isOpen) {
+          if (agentQuickInput.targetId) targetCardIds.add(agentQuickInput.targetId);
+          if (agentQuickInput.targetIds && Array.isArray(agentQuickInput.targetIds)) {
+            agentQuickInput.targetIds.forEach(id => targetCardIds.add(id));
+          }
+        }
+
+        return (
+          <NanoLodCanvas
+            cards={cards}
+            selectedCardIds={selectedCardIds}
+            renderedCardIds={renderedCardIds}
+            agentTargetCardId={
+              agentFocus.primaryCardId || 
+              (agentQuickInput?.isOpen && agentQuickInput.targetId ? agentQuickInput.targetId : null)
+            }
+            agentTargetCardIds={targetCardIds}
+            agentReferenceCardIds={agentFocus.referenceCardIds}
+            agentFocusMap={agentFocus.focusedMap}
+            pickerSession={pickerSession}
+            scale={tScale}
+            tx={tx}
+            ty={ty}
+            isDarkMode={isDarkMode}
+            isOverviewMode={isOverviewMode}
+            isActive={
+              isNanoCanvasActive || 
+              (renderedCardIds.size < visibleCards.length && visibleCards.length > 0) ||
+              (() => {
+                if (typeof window === 'undefined') return false;
+                const paintedSet = (window as any).__paintedCardIds;
+                if (!paintedSet) return visibleCards.length > 0;
+                return visibleCards.some(c => !paintedSet.has(c.id));
+              })()
+            }
+            onReady={handleNanoCanvasReady}
+            onThumbnailGenerated={(id, thumbnailUrl) => {
+              handleUpdateCard(id, { thumbnailUrl }, false);
+            }}
+          />
+        );
+      })()}
 
       {/* Canvas Workspace for Nodes/Cards */}
       <motion.div 

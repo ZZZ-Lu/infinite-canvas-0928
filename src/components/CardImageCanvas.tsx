@@ -17,6 +17,7 @@ export interface CardImageCanvasProps {
   state?: string;
   isZooming?: boolean;
   className?: string;
+  onLoaded?: () => void;
 }
 
 /**
@@ -41,6 +42,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
   state,
   isZooming = false,
   className = '',
+  onLoaded,
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafIdRef = useRef<number | null>(null);
@@ -63,6 +65,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     dpr,
     state,
     isZooming,
+    onLoaded,
   });
   propsRef.current = {
     cardId,
@@ -75,6 +78,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     dpr,
     state,
     isZooming,
+    onLoaded,
   };
 
   const scheduleDraw = () => {
@@ -229,6 +233,10 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       if (microImgComplete || fullImgComplete || origImgComplete) {
         isPainted = true;
       }
+    }
+
+    if (isPainted) {
+      propsRef.current.onLoaded?.();
     }
 
     if (isPainted && cardId && typeof window !== 'undefined') {
