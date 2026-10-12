@@ -65,289 +65,65 @@ function drawCardBottomPanel(
   normalLineWidth: number
 ) {
   const panelW = 480;
-  const refList = card.referenceImages || [];
-  const refCount = refList.length;
-  const promptText = card.prompt || '';
-  const panelH = getBottomPanelHeight(promptText, refCount);
+
+  const refCount = card.referenceImages?.length || 0;
+  const refRows = Math.ceil((refCount + 1) / 8);
+  const refSectionHeight = refRows * 56;
+
+  const promptAreaHeight = getPromptAreaHeight(card.prompt);
+  const displayLineCount = Math.max(1, Math.min(13, Math.round(promptAreaHeight / 22)));
+
+  // Get unified panel height matching Full Detail & MicroLOD exactly
+  const panelH = getBottomPanelHeight(card.prompt, card.referenceImages?.length);
   const panelX = cardX + (cardW - panelW) / 2;
   const panelY = cardY + cardH + 12; // 12px gap matching flex flex-col gap-3 in DOM
 
-  ctx.save();
-
-  // Create squircle clipping mask for panel container
-  ctx.beginPath();
-  if (typeof ctx.roundRect === 'function') {
-    ctx.roundRect(panelX, panelY, panelW, panelH, 16);
-  } else {
-    ctx.rect(panelX, panelY, panelW, panelH);
-  }
-  ctx.clip();
-
-  // Enable direct real-time GPU Canvas filter blur
-  if ('filter' in ctx) {
-    (ctx as any).filter = 'blur(2.5px)';
-  }
-
-  // 1) Panel Container Background
+  // Background fill (sharp right-angle corners for low LOD style)
   ctx.fillStyle = dark ? '#262626' : '#f3f4f6';
   ctx.beginPath();
-  if (typeof ctx.roundRect === 'function') {
-    ctx.roundRect(panelX, panelY, panelW, panelH, 16);
-  } else {
-    ctx.rect(panelX, panelY, panelW, panelH);
-  }
+  ctx.rect(panelX, panelY, panelW, panelH);
   ctx.fill();
 
-  let curY = panelY + 16; // p-4 (16px padding)
-
-  // 2) Reference Images Area (exact 1:1 real component layout matching DOM)
-  const refRows = Math.ceil((refCount + 1) / 8);
-  for (let r = 0; r < refRows; r++) {
-    const items = Math.min(refCount + 1 - r * 8, 8);
-    for (let i = 0; i < items; i++) {
-      const itemIdx = r * 8 + i;
-      const rx = panelX + 16 + i * 56;
-      const ry = curY + r * 56;
-
-      if (itemIdx < refCount) {
-        const item = refList[itemIdx];
-        const itemUrl = item?.url || item?.thumbnailUrl || '';
-        let refImg: HTMLImageElement | null = null;
-        if (itemUrl) {
-          refImg = getOrLoadThumbImage(itemUrl, () => {});
-        }
-
-        // Draw Thumbnail Box
-        ctx.save();
-        ctx.beginPath();
-        if (typeof ctx.roundRect === 'function') {
-          ctx.roundRect(rx, ry, 48, 48, 8);
-        } else {
-          ctx.rect(rx, ry, 48, 48);
-        }
-        ctx.clip();
-
-        ctx.fillStyle = dark ? '#171717' : '#f9fafb';
-        ctx.fillRect(rx, ry, 48, 48);
-
-        if (refImg && refImg.complete && refImg.naturalWidth > 0) {
-          ctx.drawImage(refImg, rx, ry, 48, 48);
-        }
-
-        // Draw Blue Tag at top left: `@item.name`
-        const tagName = item.name || `@${itemIdx + 1}`;
-        ctx.fillStyle = '#0284c7'; // Blue badge background
-        ctx.beginPath();
-        if (typeof ctx.roundRect === 'function') {
-          ctx.roundRect(rx + 2, ry + 2, 42, 12, 3);
-        } else {
-          ctx.rect(rx + 2, ry + 2, 42, 12);
-        }
-        ctx.fill();
-
-        ctx.fillStyle = '#ffffff';
-        ctx.font = 'bold 9px sans-serif';
-        ctx.textBaseline = 'top';
-        ctx.fillText(tagName.slice(0, 7), rx + 4, ry + 3);
-
-        ctx.restore();
-
-        // Border around thumbnail
-        ctx.strokeStyle = dark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.1)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        if (typeof ctx.roundRect === 'function') {
-          ctx.roundRect(rx, ry, 48, 48, 8);
-        } else {
-          ctx.rect(rx, ry, 48, 48);
-        }
-        ctx.stroke();
-      } else {
-        // The "+ Add" Button Box (Dashed border)
-        ctx.strokeStyle = dark ? '#525252' : '#d1d5db';
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([3, 3]);
-        ctx.beginPath();
-        if (typeof ctx.roundRect === 'function') {
-          ctx.roundRect(rx, ry, 48, 48, 8);
-        } else {
-          ctx.rect(rx, ry, 48, 48);
-        }
-        ctx.stroke();
-        ctx.setLineDash([]);
-
-        // Plus icon '+'
-        ctx.strokeStyle = dark ? '#737373' : '#9ca3af';
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(rx + 24, ry + 18);
-        ctx.lineTo(rx + 24, ry + 30);
-        ctx.moveTo(rx + 18, ry + 24);
-        ctx.lineTo(rx + 30, ry + 24);
-        ctx.stroke();
-      }
-    }
-  }
-  curY += (refRows * 56 - 8) + 16; // ref section + gap-3 (12px) + mt-1 (4px)
-
-  // 3) Actual Prompt Text with Blue `@Mention` Badges
-  ctx.textBaseline = 'top';
-  ctx.font = '500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-
-  const rawLines = promptText ? promptText.split('\n') : ['输入文字指令，例如：清冷克制的女主...'];
-  let lineY = curY;
-  const availableW = 448; // 480 - 32 padding
-
-  for (let l = 0; l < rawLines.length; l++) {
-    const lineStr = rawLines[l];
-    if (!lineStr) {
-      lineY += 22;
-      continue;
-    }
-
-    // Tokenize line into mentions (@...) and normal text
-    const tokens = lineStr.split(/(@\S+)/g);
-    let currentX = panelX + 16;
-
-    for (let k = 0; k < tokens.length; k++) {
-      const token = tokens[k];
-      if (!token) continue;
-
-      if (token.startsWith('@')) {
-        // Blue `@Mention` Pill Badge
-        const tw = ctx.measureText(token).width + 8;
-        if (currentX + tw > panelX + 16 + availableW && currentX > panelX + 16) {
-          currentX = panelX + 16;
-          lineY += 22;
-        }
-
-        ctx.fillStyle = '#0284c7'; // Blue badge background
-        ctx.beginPath();
-        if (typeof ctx.roundRect === 'function') {
-          ctx.roundRect(currentX, lineY + 1, tw, 20, 4);
-        } else {
-          ctx.rect(currentX, lineY + 1, tw, 20);
-        }
-        ctx.fill();
-
-        ctx.fillStyle = '#ffffff'; // White text
-        ctx.fillText(token, currentX + 4, lineY + 2);
-        currentX += tw + 4;
-      } else {
-        // Regular text
-        ctx.fillStyle = dark ? '#f5f5f5' : '#1f2937';
-        for (let ch = 0; ch < token.length; ch++) {
-          const char = token[ch];
-          const cw = ctx.measureText(char).width;
-          if (currentX + cw > panelX + 16 + availableW) {
-            currentX = panelX + 16;
-            lineY += 22;
-          }
-          ctx.fillText(char, currentX, lineY + 2);
-          currentX += cw;
-        }
-      }
-    }
-    lineY += 22;
-  }
-
-  // 4) Actual Action Bar / Controls
-  const actionBarY = panelY + panelH - 16 - 32; // p-4 (16px) + 32px height
-
-  // Top border line
-  ctx.strokeStyle = dark ? '#404040' : '#e5e7eb';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(panelX + 16, actionBarY - 8);
-  ctx.lineTo(panelX + panelW - 16, actionBarY - 8);
-  ctx.stroke();
-
-  // Blue `@ 引用` Button
-  ctx.fillStyle = '#0284c7';
-  ctx.beginPath();
-  if (typeof ctx.roundRect === 'function') {
-    ctx.roundRect(panelX + 16, actionBarY + 2, 60, 28, 8);
-  } else {
-    ctx.rect(panelX + 16, actionBarY + 2, 60, 28);
-  }
-  ctx.fill();
-
-  ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 12px sans-serif';
-  ctx.fillText('@ 引用', panelX + 22, actionBarY + 8);
-
-  // Model Selector Pill `✨ Hy Image3.5 pre... ˅`
-  ctx.fillStyle = dark ? '#262626' : '#f9fafb';
-  ctx.strokeStyle = dark ? '#404040' : '#e5e7eb';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  if (typeof ctx.roundRect === 'function') {
-    ctx.roundRect(panelX + 84, actionBarY + 2, 130, 28, 8);
-  } else {
-    ctx.rect(panelX + 84, actionBarY + 2, 130, 28);
-  }
-  ctx.fill();
-  ctx.stroke();
-
-  ctx.fillStyle = dark ? '#d4d4d4' : '#4b5563';
-  ctx.font = '12px sans-serif';
-  ctx.fillText('✨ Hy Image3.5 pre...', panelX + 90, actionBarY + 8);
-
-  // Ratio Pill `16:9 ˅`
-  ctx.beginPath();
-  if (typeof ctx.roundRect === 'function') {
-    ctx.roundRect(panelX + 222, actionBarY + 2, 60, 28, 8);
-  } else {
-    ctx.rect(panelX + 222, actionBarY + 2, 60, 28);
-  }
-  ctx.fill();
-  ctx.stroke();
-
-  ctx.fillStyle = dark ? '#d4d4d4' : '#4b5563';
-  ctx.font = '12px sans-serif';
-  ctx.fillText(card.ratio || '16:9', panelX + 230, actionBarY + 8);
-
-  // Resolution Pill `2K ˅`
-  ctx.beginPath();
-  if (typeof ctx.roundRect === 'function') {
-    ctx.roundRect(panelX + 290, actionBarY + 2, 48, 28, 8);
-  } else {
-    ctx.rect(panelX + 290, actionBarY + 2, 48, 28);
-  }
-  ctx.fill();
-  ctx.stroke();
-
-  ctx.fillStyle = dark ? '#d4d4d4' : '#4b5563';
-  ctx.font = '12px sans-serif';
-  ctx.fillText(card.res || '2K', panelX + 298, actionBarY + 8);
-
-  // Circular Generate Button with Arrow `↑`
-  ctx.fillStyle = dark ? '#ffffff' : '#111827';
-  ctx.beginPath();
-  ctx.arc(panelX + panelW - 16 - 16, actionBarY + 16, 16, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.fillStyle = dark ? '#111827' : '#ffffff';
-  ctx.font = 'bold 16px sans-serif';
-  ctx.fillText('↑', panelX + panelW - 32 - 5, actionBarY + 7);
-
-  // Reset real-time filter blur
-  if ('filter' in ctx) {
-    (ctx as any).filter = 'none';
-  }
-
-  ctx.restore();
-
-  // Stroke border
+  // Border
   ctx.strokeStyle = isSelected ? borderSelected : borderNormal;
   ctx.lineWidth = isSelected ? selectedLineWidth : normalLineWidth;
-  ctx.beginPath();
-  if (typeof ctx.roundRect === 'function') {
-    ctx.roundRect(panelX, panelY, panelW, panelH, 16);
-  } else {
-    ctx.rect(panelX, panelY, panelW, panelH);
+  ctx.strokeRect(panelX, panelY, panelW, panelH);
+
+  // Internal skeleton color blocks
+  ctx.fillStyle = dark ? '#383838' : '#e2e8f0';
+  let curY = panelY + 17; // 1px border + 16px padding
+
+  // 1) Reference images skeleton (sharp right-angle blocks)
+  for (let r = 0; r < refRows; r++) {
+    const itemsInRow = Math.min(refCount + 1 - r * 8, 8);
+    for (let i = 0; i < itemsInRow; i++) {
+      const rx = panelX + 16 + i * 56;
+      const ry = curY + r * 56;
+      ctx.beginPath();
+      ctx.rect(rx, ry, 48, 48);
+      ctx.fill();
+    }
   }
-  ctx.stroke();
+  curY += (refRows * 56 - 8) + 16; // ref items height + gap-3 (12px) + mt-1 (4px)
+
+  // 2) Prompt text skeleton lines (sharp right-angle lines)
+  const textTopOffset = curY + (promptAreaHeight - displayLineCount * 18) / 2;
+  for (let i = 0; i < displayLineCount; i++) {
+    const lw = (i === displayLineCount - 1 && displayLineCount > 1) ? panelW * 0.55 : panelW * 0.85;
+    ctx.beginPath();
+    ctx.rect(panelX + 16, textTopOffset + i * 22, lw, 14);
+    ctx.fill();
+  }
+
+  // 3) Controls bottom bar & generate button (sharp right-angle)
+  const actionBarY = panelY + panelH - 17 - 32;
+  ctx.beginPath();
+  ctx.rect(panelX + 16, actionBarY + 2, 140, 28);
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.rect(panelX + panelW - 48, actionBarY, 32, 32);
+  ctx.fill();
 }
 
 export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function NanoLodCanvas({
@@ -915,8 +691,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
           grad.addColorStop(0.56, '#a45cf8');
           grad.addColorStop(1, '#a45cf8');
           ctx.strokeStyle = grad;
-          ctx.lineWidth = selectedLineWidth * 1.35;
-          ctx.strokeRect(cardX - 1, cardY - 1, dim.width + 2, dim.height + 2);
+          ctx.lineWidth = selectedLineWidth;
+          ctx.strokeRect(cardX - 0.5, cardY - 0.5, dim.width + 1, dim.height + 1);
         } else {
           ctx.strokeStyle = borderAgentTarget;
           ctx.lineWidth = selectedLineWidth * 1.25;

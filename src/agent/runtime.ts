@@ -143,7 +143,7 @@ export class AgentRuntime {
 
     try {
       let recoveryCount = 0;
-      while (!terminal.has(task.status) && (task.status as RuntimeTaskStatus) !== 'paused' && !signal.aborted) {
+      while (!terminal.has(task.status) && (task.status as RuntimeTaskStatus) !== 'paused' && (task.status as RuntimeTaskStatus) !== 'waiting_user' && !signal.aborted) {
         task.turn += 1;
         task.status = 'planning';
         const turnId = `${task.id}:turn:${task.turn}`;
@@ -341,21 +341,32 @@ export class AgentRuntime {
 
       if (typeof call.arguments.waitForUser === 'string' && call.arguments.waitForUser) {
         task.status = 'waiting_user';
-        const hasAnswer = task.events.some(e => e.turnId === turnId && e.type === 'answer');
-        if (!hasAnswer) {
-          this.addEvent(task, { turnId, type: 'answer', text: call.arguments.waitForUser });
+        const waitForUserText = call.arguments.waitForUser;
+        const textToPublish = responseText || waitForUserText;
+        const existingAnswer = task.events.find(e => e.turnId === turnId && e.type === 'answer');
+        if (existingAnswer) {
+          if (responseText && responseText !== existingAnswer.text) {
+            existingAnswer.text = responseText;
+          }
+        } else {
+          this.addEvent(task, { turnId, type: 'answer', text: textToPublish });
         }
+        task.summary = textToPublish || task.summary;
       } else if (isPaused) {
         task.status = 'paused';
-        const response = typeof call.arguments.finalResponse === 'string' ? call.arguments.finalResponse : '任务已挂起暂停，等待后台事件唤醒。';
-        const hasAnswer = task.events.some(e => e.turnId === turnId && e.type === 'answer');
-        if (!hasAnswer) {
+        const response = responseText || '任务已挂起暂停，等待后台事件唤醒。';
+        const existingAnswer = task.events.find(e => e.turnId === turnId && e.type === 'answer');
+        if (existingAnswer) {
+          if (responseText && responseText !== existingAnswer.text) {
+            existingAnswer.text = responseText;
+          }
+        } else {
           this.addEvent(task, { turnId, type: 'answer', text: response });
         }
         task.summary = response || task.summary;
       } else {
         task.status = 'completed';
-        const response = typeof call.arguments.finalResponse === 'string' ? call.arguments.finalResponse : '任务完成。';
+        const response = responseText || '任务完成。';
         const existingAnswer = task.events.find(e => e.turnId === turnId && e.type === 'answer');
         if (!existingAnswer) {
           this.addEvent(task, { turnId, type: 'answer', text: response });

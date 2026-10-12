@@ -1079,11 +1079,13 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         const matches = [...message.content.matchAll(/\{\{([\s\S]*?)\}\}/g)];
         let actionDesc = matches.length > 0 ? matches.map(m => m[0]).join('\n') : null;
         
-        // Fallback: if no {{ }} but text contains "调用" and a tool name, pass the whole text to the adapter
-        if (!actionDesc && message.content.includes('调用')) {
-          const hasKnownTool = AGENT_TOOL_REGISTRY.some(tool => 
-            message.content.includes(tool.id) || message.content.includes(functionNameForTool(tool.id))
-          ) || /标注|生图|卡片|检测|观察|actAndObserve|inspect|generate|landmarks|annotate/i.test(message.content);
+        // Fallback: if no {{ }} but text contains tool call keywords, pseudo-code or endTask intent, pass to adapter
+        if (!actionDesc) {
+          const contentLower = message.content.toLowerCase();
+          const hasKnownTool = message.content.includes('调用') ||
+            AGENT_TOOL_REGISTRY.some(tool => 
+              message.content.includes(tool.id) || message.content.includes(functionNameForTool(tool.id))
+            ) || /endtask|end_task|sys\.endtask|sys_endtask|结束任务|完成任务|挂起任务|标注|生图|卡片|检测|观察|actAndObserve|inspect|generate|landmarks|annotate/i.test(message.content);
           if (hasKnownTool) {
             actionDesc = message.content;
           }
@@ -1095,7 +1097,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
             const adapterKeyToUse = jsonAdapterKey || keyToUse;
             const { endpoint: adapterEndpoint, actualModel: adapterActualModel, apiKey: adapterApiKey } = getModelConfig(adapterModelType, adapterKeyToUse);
 
-            const systemPromptTemplate = customJsonAdapterPrompt || getPrompt('jsonAdapter') || `你是一个极其精准的工具 JSON 转换与转译节点。你的任务是将 Agent 主循环输出的不标准 JSON、JS 对象结构、伪代码或自然语言动作指令，严格转译为符合对应工具 Schema 的标准 JSON 参数。\n\n【转换与纠错规则】\n1. 提取参数与 ID：\n   - 对于 card.detectLandmarks / card.annotateElements（画面元素标注节点）：\n     * 精准提取目标卡片 ID cardId（如 "card_xxx" 或 "canvas.card.xxx"）。\n     * 精准提取操作动作 action：可选值为 "detect"（默认，调用大模型检测标注）、"list"（查看已有标注列表）、"update"（修改指定标注）、"delete"（删除指定 ID 标注）、"clear"（清空所有标注）。\n     * 提取具体标注要求 requirement（支持任意自然语言要求，如"标注主要角色手持的长剑与腰间玉佩"、"识别所有光源与反光表面"等，不限部位、不限数量；若输入写作 prompt，统一映射为 requirement）。\n     * 提取合并模式 mode：可选值为 "append"（在卡片已有标注基础上追加新标注）或 "overwrite"（覆写已有标注，默认）。\n     * 提取更新数据 updates：对象数组，每一项包含 id，可选包含 label、description、category、point ({x, y})、box ([ymin, xmin, ymax, xmax])。\n     * 提取删除 ID 数组 deleteIds：如 ["elem_1", "elem_2"]。\n     * 提取 force 标识（布尔值，是否强制重新检测）。\n   - 对于 card.inspect，精准提取目标卡片 ID cardId 及 includeImage / includePrompt / includeReference / includeParameters 布尔开关。\n   - 对于 card.generate，必须精准提取卡片名称 name（规范：尽可能简短、辨识度高，如"金发女郎晚礼服"；若原输入缺失则根据 prompt 提炼 4~8 字短名）、参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！\n2. 修复非标格式：遇到未加双引号的 Key（如 cardId: "xxx"）或单引号文本，一律重写纠正为标准合法 JSON。\n3. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 像素数值。\n4. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, goal, subGoal, progress, notes, notesMode, plan 等）。\n\n可用工具的 JSON Schema：\n{{adapterToolPrompt}}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }`;
+            const systemPromptTemplate = customJsonAdapterPrompt || getPrompt('jsonAdapter') || `你是一个极其精准的工具 JSON 转换与转译节点。你的任务是将 Agent 主循环输出的不标准 JSON、JS 对象结构、伪代码、自然语言动作指令或任务完成/挂起宣告，严格转译为符合对应工具 Schema 的标准 JSON 参数。\n\n【转换与纠错规则】\n1. 提取参数与 ID：\n   - 对于 sys.endTask（任务结束/挂起指令）：\n     * 无论是 endTask、end_task、sys_end_task、sys.endTask、结束任务或完成任务，统一提取为 name: "sys.endTask"。\n     * 精准提取 finalResponse（给用户的完整总结或对话），若有简版对话与完整版，必须保留原样全量填入 finalResponse！\n     * 精准提取 waitForUser（若需要等待用户回复或继续操作）。\n     * 提取 paused（布尔值，后台渲染或异步等待时为 true）与 success（布尔值，默认 true）。\n   - 对于 card.detectLandmarks / card.annotateElements（画面元素标注节点）：\n     * 精准提取目标卡片 ID cardId（如 "card_xxx" 或 "canvas.card.xxx"）。\n     * 精准提取操作动作 action：可选值为 "detect"（默认，调用大模型检测标注）、"list"（查看已有标注列表）、"update"（修改指定标注）、"delete"（删除指定 ID 标注）、"clear"（清空所有标注）。\n     * 提取具体标注要求 requirement（支持任意自然语言要求，如"标注主要角色手持的长剑与腰间玉佩"、"识别所有光源与反光表面"等，不限部位、不限数量；若输入写作 prompt，统一映射为 requirement）。\n     * 提取合并模式 mode：可选值为 "append"（在卡片已有标注基础上追加新标注）或 "overwrite"（覆写已有标注，默认）。\n     * 提取更新数据 updates：对象数组，每一项包含 id，可选包含 label、description、category、point ({x, y})、box ([ymin, xmin, ymax, xmax])。\n     * 提取删除 ID 数组 deleteIds：如 ["elem_1", "elem_2"]。\n     * 提取 force 标识（布尔值，是否强制重新检测）。\n   - 对于 card.inspect，精准提取目标卡片 ID cardId 及 includeImage / includePrompt / includeReference / includeParameters 布尔开关。\n   - 对于 card.generate，必须精准提取卡片名称 name（规范：尽可能简短、辨识度高，如"金发女郎晚礼服"；若原输入缺失则根据 prompt 提炼 4~8 字短名）、参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！\n2. 修复非标格式：遇到未加双引号的 Key（如 cardId: "xxx"）或单引号文本，一律重写纠正为标准合法 JSON。\n3. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 像素数值。\n4. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, goal, subGoal, progress, notes, notesMode, plan 等）。\n\n可用工具的 JSON Schema：\n{{adapterToolPrompt}}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }`;
 
             const finalAdapterPrompt = systemPromptTemplate.includes('{{adapterToolPrompt}}')
               ? systemPromptTemplate.replace('{{adapterToolPrompt}}', adapterToolPrompt)
@@ -1141,10 +1143,28 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         }
       }
 
+      const resolveNormalizedToolName = (rawName: string): string => {
+        if (!rawName || typeof rawName !== 'string') return rawName;
+        const trimmed = rawName.trim();
+        if (allowedTools.has(trimmed)) return trimmed;
+        if (toolNameByFunction.has(trimmed)) return toolNameByFunction.get(trimmed)!;
+        
+        const norm = trimmed.toLowerCase().replaceAll('_', '').replaceAll('.', '');
+        if (norm === 'endtask' || norm === 'sysendtask' || norm === 'endtaskinstructions' || norm === 'finish' || norm === 'completetask') {
+          if (allowedTools.has('sys.endTask')) return 'sys.endTask';
+        }
+        if (norm === 'updatestate' || norm === 'sysupdatestate') {
+          if (allowedTools.has('sys.updateState')) return 'sys.updateState';
+        }
+        for (const toolId of allowedTools) {
+          const toolNorm = toolId.toLowerCase().replaceAll('_', '').replaceAll('.', '');
+          if (norm === toolNorm) return toolId;
+        }
+        return trimmed;
+      };
+
       const toolCalls = parsedToolCalls.flatMap((call: any, index: number) => {
-        let name = call?.name;
-        // fallback matching underscore names to dot names
-        if (toolNameByFunction.has(name)) name = toolNameByFunction.get(name);
+        let name = resolveNormalizedToolName(call?.name);
         
         if (!name || !allowedTools.has(name)) return [];
         try {
@@ -1316,7 +1336,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         .map((tool) => JSON.stringify({ name: tool.id, description: tool.description, parameters: parametersForTool(tool.id) }))
         .join('\n');
 
-      const systemPromptTemplate = systemPrompt || getPrompt('jsonAdapter') || `你是一个极其精准的工具 JSON 转换与转译节点。你的任务是将 Agent 主循环输出的不标准 JSON、JS 对象结构、伪代码或自然语言动作指令，严格转译为符合对应工具 Schema 的标准 JSON 参数。\n\n【转换与纠错规则】\n1. 提取参数与 ID：\n   - 对于 card.detectLandmarks / card.annotateElements（画面元素标注节点）：\n     * 精准提取目标卡片 ID cardId（如 "card_xxx" 或 "canvas.card.xxx"）。\n     * 精准提取操作动作 action：可选值为 "detect"（默认，调用大模型检测标注）、"list"（查看已有标注列表）、"update"（修改指定标注）、"delete"（删除指定 ID 标注）、"clear"（清空所有标注）。\n     * 提取具体标注要求 requirement（支持任意自然语言要求，如"标注主要角色手持的长剑与腰间玉佩"、"识别所有光源与反光表面"等，不限部位、不限数量；若输入写作 prompt，统一映射为 requirement）。\n     * 提取合并模式 mode：可选值为 "append"（在卡片已有标注基础上追加新标注）或 "overwrite"（覆写已有标注，默认）。\n     * 提取更新数据 updates：对象数组，每一项包含 id，可选包含 label、description、category、point ({x, y})、box ([ymin, xmin, ymax, xmax])。\n     * 提取删除 ID 数组 deleteIds：如 ["elem_1", "elem_2"]。\n     * 提取 force 标识（布尔值，是否强制重新检测）。\n   - 对于 card.inspect，精准提取目标卡片 ID cardId 及 includeImage / includePrompt / includeReference / includeParameters 布尔开关。\n   - 对于 card.generate，必须精准提取卡片名称 name（规范：尽可能简短、辨识度高，如"金发女郎晚礼服"；若原输入缺失则根据 prompt 提炼 4~8 字短名）、参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！\n2. 修复非标格式：遇到未加双引号的 Key（如 cardId: "xxx"）或单引号文本，一律重写纠正为标准合法 JSON。\n3. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 像素数值。\n4. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, goal, subGoal, progress, notes, notesMode, plan 等）。\n\n可用工具的 JSON Schema：\n{{adapterToolPrompt}}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }`;
+      const systemPromptTemplate = systemPrompt || getPrompt('jsonAdapter') || `你是一个极其精准的工具 JSON 转译节点。你的任务是将输入的伪代码、自然语言或非标指令，严格转译为符合 Schema 的标准 JSON 参数。\n\n【转译与提取准则】\n1. 完整保留对话与结束指令（核心）：\n   - 当输入包含 sys.endTask、endTask、end_task、结束任务或完成任务意图时，统一转换为 name: "sys.endTask"。\n   - 若输入中包含“用户沟通”或“对用户说的话”（含【完整版】与【简版】），转译 sys.endTask 时必须将完整版与简版文本原样保留填入 finalResponse，严禁遗漏简版！\n2. Schema 自动对齐：依据【可用工具 Schema】自动映射参数（如 endTask/end_task 映射为 sys.endTask，cardId, requirement, action），修复缺失引号、单引号或语法错误。\n3. 纯 JSON 输出：直接输出格式 {"tool_calls": [{"name": "工具名", "arguments": {...}}]}，严禁 Markdown 或多余文字。\n\n可用工具的 JSON Schema：\n{{adapterToolPrompt}}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }`;
 
       const finalPrompt = systemPromptTemplate.includes('{{adapterToolPrompt}}')
         ? systemPromptTemplate.replace('{{adapterToolPrompt}}', adapterToolPrompt)

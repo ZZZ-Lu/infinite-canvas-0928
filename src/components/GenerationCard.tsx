@@ -2252,18 +2252,18 @@ export function LandmarkSpatialAnnotations({
   return (
     <div className="absolute inset-0 pointer-events-none z-25 overflow-hidden squircle">
       <AnimatePresence>
-        {/* 1. 位置点方框 (Bounding Boxes) */}
+        {/* 1. 位置点方框 (Bounding Boxes - 仅在 Hover 时显现) */}
         {renderedPoints.map(({ pt, idx, boxRect }) => {
           const isHovered = hoveredPointId === pt.id;
           return (
             <motion.div
               key={`box-${pt.id ? `${pt.id}-${idx}` : idx}`}
               initial={{ opacity: 0, scale: 0.96 }}
-              animate={{ opacity: 1, scale: 1 }}
+              animate={{ opacity: isHovered ? 1 : 0, scale: isHovered ? 1 : 0.98 }}
               exit={{ opacity: 0, scale: 0.96, transition: { duration: 0.2 } }}
               transition={{
-                delay: idx * 0.04,
-                duration: 0.35,
+                delay: isHovered ? 0 : idx * 0.04,
+                duration: 0.2,
                 ease: [0.16, 1, 0.3, 1],
               }}
               style={{
@@ -2274,8 +2274,8 @@ export function LandmarkSpatialAnnotations({
               }}
               className={`absolute pointer-events-auto cursor-pointer rounded transition-all duration-200 border ${
                 isHovered
-                  ? 'border-purple-400 bg-purple-500/20 shadow-[0_0_12px_rgba(168,85,247,0.55)] ring-1 ring-purple-400/60 z-28'
-                  : 'border-purple-500/70 bg-purple-500/10 shadow-[0_0_6px_rgba(168,85,247,0.25)] hover:border-purple-400 hover:bg-purple-500/18 z-26'
+                  ? 'border-purple-400 bg-purple-500/20 shadow-[0_0_12px_rgba(168,85,247,0.55)] ring-1 ring-purple-400/60 z-28 opacity-100'
+                  : 'border-transparent bg-transparent shadow-none z-26 opacity-0'
               }`}
               onMouseEnter={() => setHoveredPointId(pt.id)}
               onMouseLeave={() => setHoveredPointId(null)}
@@ -2378,6 +2378,7 @@ export interface GenerationCardProps {
   isPickerTarget?: boolean;
   isPickerSelectable?: boolean;
   pickerSelectionIndex?: number;
+  isAgentThinking?: boolean;
   onStartCanvasPicker?: (cardId: string) => void;
   onSelect?: (e: React.PointerEvent, id: string, selectOnlyOnPointerUp?: boolean) => void;
   onDrag?: (id: string, dx: number, dy: number) => void;
@@ -2397,6 +2398,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   isAgentTarget,
   agentFocusRole,
   agentInspectScenario = 'inspect',
+  isAgentThinking,
   isZooming,
   allCards,
   currentProject,
@@ -3307,6 +3309,12 @@ export const GenerationCard = React.memo(function GenerationCard({
           const match = transform.match(/translate\(([-\d.]+)px,\s*([-\d.]+)px\)/);
           if (match) {
             slaves.push({ el, initialX: parseFloat(match[1]), initialY: parseFloat(match[2]) });
+          } else {
+            const slaveId = el.getAttribute('data-card-id');
+            const cardObj = allCards?.find(c => c.id === slaveId);
+            if (cardObj) {
+              slaves.push({ el, initialX: cardObj.x, initialY: cardObj.y });
+            }
           }
         }
       });
@@ -4649,7 +4657,7 @@ export const GenerationCard = React.memo(function GenerationCard({
               : isAgentTarget && isSelected
                 ? '0px'
               : isAgentTarget
-                ? 'calc(2.5px / var(--current-scale, 1))'
+                ? 'calc(2px / var(--current-scale, 1))'
                 : isPickerTarget
                   ? 'calc(2px / var(--current-scale, 1))'
                   : isSelected 
@@ -4668,20 +4676,6 @@ export const GenerationCard = React.memo(function GenerationCard({
           }}
           onPointerDown={onPointerDown}
         >
-        {/* Dual Co-Presence Border (Half User Blue #3b82f6 + Half Agent Purple #a45cf8) */}
-        {isAgentTarget && isSelected && (
-          <div 
-            className="dual-selection-border absolute inset-0 pointer-events-none rounded-[20px] corner-squircle z-[65] select-none transition-opacity duration-150"
-            style={{
-              padding: '2.5px',
-              background: 'linear-gradient(135deg, #3b82f6 0%, #3b82f6 44%, #a45cf8 56%, #a45cf8 100%)',
-              WebkitMask: 'linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0)',
-              WebkitMaskComposite: 'xor',
-              mask: 'linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0)',
-              maskComposite: 'exclude',
-            }}
-          />
-        )}
         {/* Card / File Name Tag */}
         {(data.name || data.fileName) && (
           <div 
@@ -4713,7 +4707,15 @@ export const GenerationCard = React.memo(function GenerationCard({
             <div className="bg-[#a45cf8] h-[26px] px-2.5 rounded-xl corner-squircle shadow-md flex items-center gap-1.5 border border-white/20">
               <span className="w-1.5 h-1.5 rounded-full bg-white animate-ping" />
               <span className="text-white text-[10px] font-bold tracking-wide whitespace-nowrap">
-                {agentFocusRole === 'working' ? 'Mira 正在生成' : agentFocusRole === 'reference' ? 'Mira 参考素材' : agentFocusRole === 'inspect' ? (agentInspectScenario === 'qc' ? 'Mira 正在质检' : agentInspectScenario === 'compare' ? 'Mira 正在对照' : 'Mira 正在查看') : 'Mira'}
+                {agentFocusRole === 'interact'
+                  ? 'Mira 正在操作'
+                  : agentFocusRole === 'working' 
+                    ? ((data.state === 'generating' || isAgentThinking) ? 'Mira 正在思考' : 'Mira 正在操作') 
+                    : agentFocusRole === 'reference' 
+                      ? 'Mira 参考素材' 
+                      : agentFocusRole === 'inspect' 
+                        ? (agentInspectScenario === 'qc' ? 'Mira 正在质检' : agentInspectScenario === 'compare' ? 'Mira 正在对照' : 'Mira 正在查看') 
+                        : 'Mira 正在操作'}
               </span>
             </div>
           </div>
@@ -5182,7 +5184,7 @@ export const GenerationCard = React.memo(function GenerationCard({
             >
               <RefreshCw className={`w-8 h-8 ${imageUrl ? 'text-white' : 'text-purple-600'} animate-spin mb-2 drop-shadow-md`} />
               <span className={`text-xs ${imageUrl ? 'text-white/95 font-medium' : 'text-purple-700 font-bold'} tracking-wider drop-shadow-md`}>
-                {imageUrl ? '导入中...' : 'Rendering'}
+                {imageUrl ? (data.prompt ? 'Mira 正在生成...' : '导入中...') : 'Mira 正在思考...'}
               </span>
             </motion.div>
           )}
@@ -5265,12 +5267,27 @@ export const GenerationCard = React.memo(function GenerationCard({
             });
           }}
         />
+
+        {/* Dual Co-Presence Border Overlay (Half User Blue #3b82f6 + Half Agent Purple #a45cf8) */}
+        {isAgentTarget && isSelected && (
+          <div 
+            className="dual-selection-border absolute inset-0 pointer-events-none rounded-[20px] corner-squircle z-[90] select-none transition-opacity duration-150"
+            style={{
+              padding: 'calc(2px / var(--current-scale, 1))',
+              background: 'linear-gradient(135deg, #3b82f6 0%, #3b82f6 44%, #a45cf8 56%, #a45cf8 100%)',
+              WebkitMask: 'linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0)',
+              WebkitMaskComposite: 'xor',
+              mask: 'linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0)',
+              maskComposite: 'exclude',
+            }}
+          />
+        )}
       </div>
 
       {/* Bottom Layer: Light Panel (Always rendered for generation cards) */}
       {shouldRenderBottomPanel && (
       <div 
-        className={`generation-card-bottom-panel relative pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 squircle p-4 gap-2 w-[480px] border border-gray-200/80 dark:border-[#404040] cursor-default self-start transform-gpu [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
+        className={`generation-card-bottom-panel relative pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 ${isLowLodSkeleton ? 'rounded-none' : 'squircle'} p-4 gap-2 w-[480px] border border-gray-200/80 dark:border-[#404040] cursor-default self-start transform-gpu [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
         isSelected 
           ? 'shadow-[0_16px_36px_-6px_rgba(0,0,0,0.12),0_8px_16px_-4px_rgba(0,0,0,0.06)] dark:shadow-[0_20px_40px_-6px_rgba(0,0,0,0.45)]' 
           : 'shadow-[0_1px_3px_rgba(0,0,0,0.05),0_1px_2px_rgba(0,0,0,0.03)] dark:shadow-none'
@@ -5848,20 +5865,20 @@ export const GenerationCard = React.memo(function GenerationCard({
 
         {/* Low-LOD Skeleton Component: Overlay Layer on top, cross-fades opacity from 1 down to 0 over 400ms */}
         <div 
-          className={`generation-card-bottom-panel-skeleton lod-crossfade absolute inset-0 z-10 p-4 rounded-[inherit] bg-gray-100 dark:bg-neutral-800 flex flex-col gap-3 select-none transition-opacity duration-400 ease-out ${
+          className={`generation-card-bottom-panel-skeleton lod-crossfade absolute inset-0 z-10 p-4 rounded-none bg-gray-100 dark:bg-neutral-800 flex flex-col gap-3 select-none transition-opacity duration-400 ease-out ${
             isLowLodSkeleton ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
           }`}
           aria-hidden={!isLowLodSkeleton}
         >
-          {/* Reference images skeleton blocks - ALWAYS rendered to match Full Detail DOM's + Add Button */}
+          {/* Reference images skeleton blocks - sharp right-angle */}
           <div className="flex items-center gap-2 flex-wrap w-full">
             {refList.map((_, idx) => (
-              <div key={idx} className="w-12 h-12 rounded-lg bg-gray-200/80 dark:bg-neutral-700/60 flex-shrink-0" />
+              <div key={idx} className="w-12 h-12 rounded-none bg-gray-200/80 dark:bg-neutral-700/60 flex-shrink-0" />
             ))}
-            <div className="w-12 h-12 rounded-lg border-2 border-dashed border-gray-300/80 dark:border-neutral-700/60 flex-shrink-0" />
+            <div className="w-12 h-12 rounded-none border-2 border-dashed border-gray-300/80 dark:border-neutral-700/60 flex-shrink-0" />
           </div>
 
-          {/* Text lines skeleton blocks - matching Full Detail mt-1 min-h-[50px] max-h-[300px] flex flex-col gap-1.5 */}
+          {/* Text lines skeleton blocks - sharp right-angle */}
           {(() => {
             const promptH = getPromptAreaHeight(localPrompt);
             const totalLines = calculatePromptLines(localPrompt);
@@ -5874,7 +5891,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                 {Array.from({ length: displayLineCount }).map((_, i) => (
                   <div
                     key={i}
-                    className={`h-3.5 bg-gray-200/90 dark:bg-neutral-700/80 rounded-sm ${
+                    className={`h-3.5 bg-gray-200/90 dark:bg-neutral-700/80 rounded-none ${
                       i === displayLineCount - 1 && displayLineCount > 1 ? 'w-[55%]' : 'w-[92%]'
                     }`}
                   />
@@ -5883,14 +5900,14 @@ export const GenerationCard = React.memo(function GenerationCard({
             );
           })()}
 
-          {/* Controls skeleton bar - matching Full Detail mt-2 pt-2 border-t */}
+          {/* Controls skeleton bar - sharp right-angle */}
           <div className="flex items-center justify-between mt-2 pt-2 border-t border-gray-200/60 dark:border-neutral-700/50">
             <div className="flex items-center gap-2">
-              <div className="h-7 w-16 bg-gray-200/80 dark:bg-neutral-700/60 rounded-md" />
-              <div className="h-7 w-20 bg-gray-200/80 dark:bg-neutral-700/60 rounded-md" />
-              <div className="h-7 w-14 bg-gray-200/80 dark:bg-neutral-700/60 rounded-md" />
+              <div className="h-7 w-16 bg-gray-200/80 dark:bg-neutral-700/60 rounded-none" />
+              <div className="h-7 w-20 bg-gray-200/80 dark:bg-neutral-700/60 rounded-none" />
+              <div className="h-7 w-14 bg-gray-200/80 dark:bg-neutral-700/60 rounded-none" />
             </div>
-            <div className="w-8 h-8 rounded-full bg-gray-200/90 dark:bg-neutral-700/80" />
+            <div className="w-8 h-8 rounded-none bg-gray-200/90 dark:bg-neutral-700/80" />
           </div>
         </div>
       </div>

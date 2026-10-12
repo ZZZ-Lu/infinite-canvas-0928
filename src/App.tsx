@@ -786,31 +786,34 @@ export default function App() {
     );
   }, []);
 
-  // 🛡️ Bulletproof Safety Net Effect for Agent State & Cursor Mode
+  const [isAgentThinking, setIsAgentThinking] = useState(false);
+
+  // 🛡️ Bulletproof Reset Function & Safety Net Effect for Agent State & Cursor Mode
+  const resetAgentStateToDefault = useCallback(() => {
+    agentFocusManager.setCursorMode('default');
+    agentFocusManager.clearAll(0);
+    setAgentState(prev => {
+      const needsSpeakReset = isThinkingOrLoadingPhrase(prev.speak);
+      if (needsSpeakReset || prev.cursorMode !== 'default' || prev.isActive || prev.isMoving) {
+        return {
+          ...prev,
+          cursorMode: 'default',
+          isActive: false,
+          isMoving: false,
+          speak: needsSpeakReset ? undefined : prev.speak,
+        };
+      }
+      return prev;
+    });
+  }, [isThinkingOrLoadingPhrase]);
+
   // Whenever Agent stops running AND inspect queue is empty, automatically purge any lingering thinking/loading speech and reset cursor mode to 'default'
   useEffect(() => {
-    if (!isAgentRunning && inspectQueueRef.current.length === 0) {
-      agentFocusManager.setCursorMode('default');
-      agentFocusManager.clearAll(0);
-      setAgentState(prev => {
-        if (isThinkingOrLoadingPhrase(prev.speak)) {
-          return {
-            ...prev,
-            speak: undefined,
-            isActive: false,
-            isMoving: false,
-            cursorMode: 'default',
-          };
-        }
-        return prev.cursorMode !== 'default' || prev.isActive || prev.isMoving
-          ? { ...prev, cursorMode: 'default', isActive: false, isMoving: false }
-          : prev;
-      });
+    if (!isAgentRunning && !isAgentThinking && inspectQueueRef.current.length === 0) {
+      resetAgentStateToDefault();
     }
-  }, [isAgentRunning, isThinkingOrLoadingPhrase]);
+  }, [isAgentRunning, isAgentThinking, resetAgentStateToDefault]);
   const [agentPrompt, setAgentPrompt] = useState("");
-  const [agentQuestion, setAgentQuestion] = useState<{ question: string, resolve: (val: string) => void } | null>(null);
-  const [isAgentThinking, setIsAgentThinking] = useState(false);
   const [agentQuickInput, setAgentQuickInput] = useState<{
     isOpen: boolean;
     x?: number;
@@ -820,7 +823,9 @@ export default function App() {
     targetId: string | null;
     targetIds?: string[];
     lastReply?: string;
+    placeholder?: string;
     focusTrigger?: number;
+    onAskResolve?: (answer: string) => void;
   } | null>(null);
   const [cardDrafts, setCardDrafts] = useState<Record<string, string>>({});
 
@@ -927,17 +932,13 @@ export default function App() {
       }
     }
 
-    // 2. Heuristic fallback
-    if (!shortText) {
-      const cleanPara = rawText.trim();
-      const firstSentence = cleanPara.split(/[。！？\n]/)[0] || cleanPara;
-      shortText = firstSentence.replace(/^[“"'「‘(（\-*\s]+/, '').replace(/[”"'」｝}）)；;\s]+$/, '').trim();
-      if (shortText.length > 40) {
-        shortText = shortText.slice(0, 38) + '...';
-      }
-    }
     if (!fullText) {
       fullText = rawText;
+    }
+
+    // 2. Fallback: If转译节点没有输出简版回答，兜底直接显示完整版回答
+    if (!shortText) {
+      shortText = fullText || rawText;
     }
 
     return { shortText, fullText };
@@ -987,15 +988,42 @@ export default function App() {
 
   const activeSelectedCards = useMemo(() => {
     const currentCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
-    const targetIds = (agentQuickInput?.targetIds && agentQuickInput.targetIds.length > 0)
-      ? agentQuickInput.targetIds
-      : (agentQuickInput?.targetId 
-          ? [agentQuickInput.targetId] 
-          : (agentFocus.primaryCardId 
-              ? [agentFocus.primaryCardId] 
-              : (selectedCardIds.length > 0 ? selectedCardIds : [])));
-    return targetIds.map(id => currentCards.find(c => c.id === id)).filter((c): c is CardData => Boolean(c));
-  }, [cards, agentQuickInput, agentFocus.primaryCardId, selectedCardIds]);
+
+    // 1. Highest precedence: Explicit QuickInput targets
+    if (agentQuickInput?.isOpen) {
+      if (agentQuickInput.targetIds && agentQuickInput.targetIds.length > 0) {
+        return agentQuickInput.targetIds
+          .map(id => currentCards.find(c => c.id === id))
+          .filter((c): c is CardData => Boolean(c));
+      }
+      if (agentQuickInput.targetId) {
+        const found = currentCards.find(c => c.id === agentQuickInput.targetId);
+        return found ? [found] : [];
+      }
+    }
+
+    // 2. Pure Agent Focus SSOT: Only cards explicitly focused by Mira Agent
+    const targetSet = new Set<string>();
+    if (agentFocus.primaryCardId) {
+      targetSet.add(agentFocus.primaryCardId);
+    }
+    if (agentFocus.referenceCardIds && Array.isArray(agentFocus.referenceCardIds)) {
+      agentFocus.referenceCardIds.forEach(id => targetSet.add(id));
+    }
+    if (agentFocus.focusedMap) {
+      Object.keys(agentFocus.focusedMap).forEach(id => targetSet.add(id));
+    }
+
+    if (targetSet.size > 0) {
+      return Array.from(targetSet)
+        .map(id => currentCards.find(c => c.id === id))
+        .filter((c): c is CardData => Boolean(c));
+    }
+
+    // 🛡️ Decoupling Principle: User's manual canvas selection (selectedCardIds)
+    // NEVER leaks into Agent's focus or prompt bubble unless explicitly targeted!
+    return [];
+  }, [cards, agentQuickInput, agentFocus]);
 
   const handleStartAgentBoxSelect = useCallback((startX: number, startY: number) => {
     setAgentSelectionBox({
@@ -1034,6 +1062,19 @@ export default function App() {
       const screenY = next.startY * tScale.get() + ty.get();
 
       // Dynamically target these cards under the Agent!
+      if (newlySelectedIds.length > 1) {
+        agentFocusManager.batchSetFocus({
+          primary: newlySelectedIds[0],
+          references: newlySelectedIds.slice(1),
+          role: 'inspect',
+          referenceRole: 'inspect',
+          sourceTool: 'box_select',
+          cursorMode: 'inspect',
+        });
+      } else if (newlySelectedIds.length === 1) {
+        agentFocusManager.setPrimaryFocus(newlySelectedIds[0], 'inspect', 'box_select');
+      }
+
       setAgentQuickInput(prevQuick => {
         const targetId = newlySelectedIds[0] || null;
         const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
@@ -1089,7 +1130,27 @@ export default function App() {
     setContextMenus(prev => { const next = {...prev}; delete next['user']; return next; });
 
     if (hitCard) {
-      const promptText = buildDynamicSelectionPrompt([hitCard]);
+      const currentSelection = selectedCardIdsRef.current;
+      const targetIds = (currentSelection.length > 1 && currentSelection.includes(hitCard.id))
+        ? [...currentSelection]
+        : [hitCard.id];
+
+      const targetCards = targetIds.map(id => allCards.find(c => c.id === id)).filter((c): c is CardData => Boolean(c));
+
+      if (targetIds.length > 1) {
+        agentFocusManager.batchSetFocus({
+          primary: hitCard.id,
+          references: targetIds.filter(id => id !== hitCard.id),
+          role: 'inspect',
+          referenceRole: 'inspect',
+          sourceTool: 'drag_agent',
+          cursorMode: 'inspect',
+        });
+      } else {
+        agentFocusManager.setPrimaryFocus(hitCard.id, 'inspect', 'drag_agent');
+      }
+
+      const promptText = buildDynamicSelectionPrompt(targetCards);
       const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
         ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
         : undefined;
@@ -1110,10 +1171,12 @@ export default function App() {
         canvasX: finalCanvasX,
         canvasY: finalCanvasY,
         targetId: hitCard.id,
+        targetIds,
         lastReply,
         focusTrigger: Date.now()
       });
     } else {
+      agentFocusManager.clearAll();
       const promptText = "我能帮什么忙？";
       setAgentState(prev => ({
         ...prev,
@@ -1130,6 +1193,7 @@ export default function App() {
         canvasX: finalCanvasX,
         canvasY: finalCanvasY,
         targetId: null,
+        targetIds: [],
         lastReply: undefined,
         focusTrigger: Date.now()
       });
@@ -1166,7 +1230,27 @@ export default function App() {
       const screenY = agentState.y * tScale.get() + ty.get();
 
       if (hitCard) {
-        const promptText = buildDynamicSelectionPrompt([hitCard]);
+        const currentSelection = selectedCardIdsRef.current;
+        const targetIds = (currentSelection.length > 1 && currentSelection.includes(hitCard.id))
+          ? [...currentSelection]
+          : [hitCard.id];
+
+        const targetCards = targetIds.map(id => allCards.find(c => c.id === id)).filter((c): c is CardData => Boolean(c));
+
+        if (targetIds.length > 1) {
+          agentFocusManager.batchSetFocus({
+            primary: hitCard.id,
+            references: targetIds.filter(id => id !== hitCard.id),
+            role: 'inspect',
+            referenceRole: 'inspect',
+            sourceTool: 'pointer_click',
+            cursorMode: 'inspect',
+          });
+        } else {
+          agentFocusManager.setPrimaryFocus(hitCard.id, 'inspect', 'pointer_click');
+        }
+
+        const promptText = buildDynamicSelectionPrompt(targetCards);
         const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
           ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
           : undefined;
@@ -1185,10 +1269,12 @@ export default function App() {
           canvasX: agentState.x,
           canvasY: agentState.y,
           targetId: hitCard.id,
+          targetIds,
           lastReply,
           focusTrigger: Date.now()
         });
       } else {
+        agentFocusManager.clearAll();
         const promptText = "我能帮什么忙？";
         setAgentState(prev => ({
           ...prev,
@@ -1203,6 +1289,7 @@ export default function App() {
           canvasX: agentState.x,
           canvasY: agentState.y,
           targetId: null,
+          targetIds: [],
           lastReply: undefined,
           focusTrigger: Date.now()
         });
@@ -1496,8 +1583,7 @@ export default function App() {
     } finally {
       isProcessingInspectQueueRef.current = false;
       if (inspectQueueRef.current.length === 0) {
-        agentFocusManager.setCursorMode('default');
-        setAgentState(prev => (isThinkingOrLoadingPhrase(prev.speak) ? { ...prev, speak: undefined } : prev));
+        resetAgentStateToDefault();
       }
     }
   }, [centerCardOnScreen, currentProject]);
@@ -3062,9 +3148,7 @@ export default function App() {
   }, []);
 
   const selectedCardIdsRef = useRef(selectedCardIds);
-  useEffect(() => {
-    selectedCardIdsRef.current = selectedCardIds;
-  }, [selectedCardIds]);
+  selectedCardIdsRef.current = selectedCardIds;
 
   const lastVisibleSetUpdateTimeRef = useRef<number>(0);
   const cullingThrottleTimerRef = useRef<any>(null);
@@ -3381,18 +3465,22 @@ export default function App() {
     });
     if (e.shiftKey || e.ctrlKey || e.metaKey) {
       if (!selectOnlyOnPointerUp) {
-        setSelectedCardIds(prev => prev.includes(id) ? prev.filter(cid => cid !== id) : [...prev, id]);
+        setSelectedCardIds(prev => {
+          return prev.includes(id) ? prev.filter(cid => cid !== id) : [...prev, id];
+        });
       }
     } else {
       if (selectOnlyOnPointerUp) {
+        // Pure click intent without dragging (pointerup): collapse selection to only this single card
         setSelectedCardIds([id]);
       } else {
-        setSelectedCardIds(prev => {
-          if (prev.includes(id)) {
-            return prev;
-          }
-          return [id];
-        });
+        const currentSelection = selectedCardIdsRef.current;
+        // Pointerdown intent: If clicking a card that is already part of multi-selection,
+        // DO NOT collapse selection to single card immediately! This preserves multi-selection so all cards can be dragged together.
+        if (currentSelection.includes(id) && currentSelection.length > 1) {
+          return;
+        }
+        setSelectedCardIds([id]);
       }
     }
   }, []);
@@ -3410,6 +3498,7 @@ export default function App() {
   }, [handleCardSelect, handleTogglePickerCard]);
 
   const handleCardDelete = useCallback((id: string) => {
+    agentFocusManager.removeFocus(id);
     setCards(prev => prev.filter(c => c.id !== id));
     setSelectedCardIds(prev => prev.filter(cid => cid !== id));
   }, []);
@@ -3536,6 +3625,7 @@ export default function App() {
         if (isInputActive) return;
         const currentSelection = selectedCardIdsRef.current;
         if (currentSelection.length > 0) {
+          agentFocusManager.batchRemoveFocus(currentSelection);
           setCards(prev => prev.filter(c => !currentSelection.includes(c.id)));
           setSelectedCardIds([]);
         }
@@ -3633,9 +3723,7 @@ export default function App() {
       isAgentThinking ||
       isProcessingInspectQueueRef.current ||
       inspectQueueRef.current.length > 0 ||
-      (activeTaskIdRef.current && runtimeRef.current?.getTask(activeTaskIdRef.current)?.status === 'running') ||
-      agentFocusManager.getSnapshot().cursorMode === 'working' ||
-      agentFocusManager.getSnapshot().cursorMode === 'inspect'
+      (activeTaskIdRef.current && runtimeRef.current?.getTask(activeTaskIdRef.current)?.status === 'running')
     );
 
     // 当 Agent 正在某卡片上执行任务时，严禁被右键召唤到其它卡片或位置
@@ -3667,8 +3755,9 @@ export default function App() {
     // we inherit the multi-selection, so all of them are targeted!
     let targetIds: string[] = [];
     if (targetId) {
-      if (selectedCardIds.includes(targetId)) {
-        targetIds = [...selectedCardIds];
+      const currentSelection = selectedCardIdsRef.current;
+      if (currentSelection.length > 1 && currentSelection.includes(targetId)) {
+        targetIds = [...currentSelection];
       } else {
         targetIds = [targetId];
       }
@@ -3682,10 +3771,26 @@ export default function App() {
         : undefined;
       const lastReply = lastReplyObj ? (lastReplyObj.shortText || lastReplyObj.text) : undefined;
 
+      if (targetIds.length > 1) {
+        agentFocusManager.batchSetFocus({
+          primary: targetId,
+          references: targetIds.filter(id => id !== targetId),
+          role: 'inspect',
+          referenceRole: 'inspect',
+          sourceTool: 'context_menu',
+          cursorMode: 'inspect',
+        });
+      } else if (targetId) {
+        agentFocusManager.setPrimaryFocus(targetId, 'inspect', 'context_menu');
+      } else {
+        // Blank canvas focus mode: clear Agent card focus without wiping user's selection
+        agentFocusManager.clearAll();
+      }
+
       setAgentQuickInput({
         isOpen: true,
-        targetId,
-        targetIds,
+        targetId: targetId || null,
+        targetIds: targetId ? targetIds : [],
         lastReply,
         focusTrigger: Date.now()
       });
@@ -3707,7 +3812,7 @@ export default function App() {
           y: clampedY,
           canvasX: clampedCanvasX,
           canvasY: clampedCanvasY,
-          targetId
+          targetId: null
         }
       }));
     } else {
@@ -3721,7 +3826,11 @@ export default function App() {
     if (ownerId === 'user' && !isAgentRunning) {
       const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
       const targetCardObj = targetId ? allCards.find(c => c.id === targetId) : null;
-      const targetCards = targetCardObj ? [targetCardObj] : selectedCardIds.map(id => allCards.find(c => c.id === id)).filter((c): c is CardData => Boolean(c));
+      const targetCards = targetId 
+        ? (targetIds.length > 1 
+            ? targetIds.map(id => allCards.find(c => c.id === id)).filter((c): c is CardData => Boolean(c))
+            : (targetCardObj ? [targetCardObj] : []))
+        : [];
       const promptText = buildDynamicSelectionPrompt(targetCards);
       const yOffset = targetId ? 40 : 82;
       setAgentState(prev => ({
@@ -4801,16 +4910,31 @@ export default function App() {
     if (call.name === 'user.ask') {
       const question = String(call.arguments.question || '需要您的确认或输入：');
       task.negotiationLog.push({ role: 'agent', content: question, timestamp: Date.now() });
+      
+      const parsed = parseAgentCommunication(question);
+      const displayQuestion = parsed.shortText || parsed.fullText || question;
+
+      setAgentState(prev => ({
+        ...prev,
+        speak: displayQuestion,
+        visible: true,
+      }));
+
+      const targetCardId = task.cardContext?.cardId || task.cardContext?.targetId || agentFocus.primaryCardId || null;
+
       return new Promise<string>((resolve) => {
-        setAgentQuestion({
-          question,
-          resolve: (answer: string) => {
+        setAgentQuickInput({
+          isOpen: true,
+          targetId: targetCardId,
+          placeholder: '输入你的回答...',
+          lastReply: displayQuestion,
+          focusTrigger: Date.now(),
+          onAskResolve: (answer: string) => {
             const finalAnswer = answer || '（用户未回答）';
             task.negotiationLog.push({ role: 'user', content: finalAnswer, timestamp: Date.now() });
             task.lastUserInputAt = Date.now();
-            setAgentQuestion(null);
             resolve(finalAnswer);
-          }
+          },
         });
       });
     }
@@ -5157,7 +5281,7 @@ export default function App() {
                   agentFocusManager.handleJsonNodeToolCall(call);
                 });
               } else if (result.complete && !isProcessingInspectQueueRef.current) {
-                agentFocusManager.clearAll(2500);
+                agentFocusManager.setCursorMode('default');
               }
 
               updateAgentRuntimeTrace(task, trace => ({
@@ -5170,12 +5294,18 @@ export default function App() {
                 } : turn),
               }));
               
-              const rawSpeech = result.speak || result.fullAnswer || (Array.isArray(result.narration) && result.narration.length > 0 ? result.narration[result.narration.length - 1] : undefined);
+              const endTaskCall = Array.isArray(result.toolCalls) ? result.toolCalls.find(call => call.name === 'sys.endTask') : undefined;
+              const endTaskSpeech = endTaskCall?.arguments?.finalResponse || endTaskCall?.arguments?.waitForUser;
+              const rawSpeech = result.speak || result.fullAnswer || (typeof endTaskSpeech === 'string' ? endTaskSpeech : undefined) || (Array.isArray(result.narration) && result.narration.length > 0 ? result.narration[result.narration.length - 1] : undefined);
+
               if (rawSpeech && rawSpeech.trim() && !isThinkingOrLoadingPhrase(rawSpeech)) {
                 const parsed = parseAgentCommunication(rawSpeech);
                 const parsedShort = parsed.shortText || parsed.fullText || rawSpeech;
                 setAgentState(prev => ({ ...prev, speak: parsedShort, visible: true }));
-              } else if (result.complete) {
+              } else if (isAgentRunningRef.current) {
+                // Keep the thinking state active during multi-turn cycles and tool execution
+                setAgentState(prev => ({ ...prev, speak: "正在思考...", visible: true }));
+              } else {
                 setAgentState(prev => (isThinkingOrLoadingPhrase(prev.speak) ? { ...prev, speak: undefined } : prev));
               }
               
@@ -5360,28 +5490,18 @@ export default function App() {
               }
             }
 
-            if (status === 'completed' || status === 'cancelled' || status === 'failed') {
+            if (status === 'completed' || status === 'paused' || status === 'cancelled' || status === 'failed') {
               if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
-              if (!isProcessingInspectQueueRef.current) {
-                agentFocusManager.setCursorMode('default');
-                agentFocusManager.clearAll();
+              if (!isProcessingInspectQueueRef.current && inspectQueueRef.current.length === 0) {
+                resetAgentStateToDefault();
                 setAgentState(prev => {
-                  if (isThinkingOrLoadingPhrase(prev.speak)) {
+                  if (!prev.speak || isThinkingOrLoadingPhrase(prev.speak)) {
                     const latestAnswer = [...task.events].reverse().find(e => e.type === 'answer' && e.text && e.text.trim() && !isThinkingOrLoadingPhrase(e.text));
                     const parsed = latestAnswer ? parseAgentCommunication(latestAnswer.text) : null;
                     const speech = parsed ? (parsed.shortText || parsed.fullText) : undefined;
-                    return {
-                      ...prev,
-                      speak: speech,
-                      isActive: false,
-                      isMoving: false,
-                    };
+                    return { ...prev, speak: speech };
                   }
-                  return {
-                    ...prev,
-                    isActive: false,
-                    isMoving: false,
-                  };
+                  return prev;
                 });
               }
             }
@@ -5479,9 +5599,8 @@ export default function App() {
       isAgentRunningRef.current = false;
 
       // Clear lingering loading state if inspect queue is empty
-      if (inspectQueueRef.current.length === 0) {
-        agentFocusManager.setCursorMode('default');
-        setAgentState(prev => (isThinkingOrLoadingPhrase(prev.speak) ? { ...prev, speak: undefined } : prev));
+      if (inspectQueueRef.current.length === 0 && !isProcessingInspectQueueRef.current) {
+        resetAgentStateToDefault();
       }
 
       // 🌟 本轮卡片分发与创建完毕，平滑启动出图检视队列，按序消费出图卡片！
@@ -5521,11 +5640,18 @@ export default function App() {
     try {
       const selectedIds = selectedCardIdsRef.current;
       const isMultiSelected = selectedIds.length > 1 && selectedIds.includes(targetCardId);
-      const selectedCards = isMultiSelected
-        ? selectedIds.map(id => allCards.find(c => c.id === id)).filter((c): c is CardData => c !== undefined)
-        : [];
+      const targetGroup = isMultiSelected
+        ? selectedIds
+        : (agentQuickInput?.targetIds && agentQuickInput.targetIds.length > 1 && agentQuickInput.targetIds.includes(targetCardId) && selectedIds.length > 1
+            ? agentQuickInput.targetIds
+            : [targetCardId]);
 
-      const autoCtx = isMultiSelected && selectedCards.length > 1
+      const selectedCards = targetGroup.length > 1
+        ? targetGroup.map(id => allCards.find(c => c.id === id)).filter((c): c is CardData => Boolean(c))
+        : [];
+      const isActuallyMulti = selectedCards.length > 1;
+
+      const autoCtx = isActuallyMulti
         ? await buildMultiCardInjectedContext(selectedCards, allCards, extractCardImageBase64)
         : await buildAutoInjectedCardContext(targetCard, allCards, extractCardImageBase64);
 
@@ -6275,11 +6401,15 @@ export default function App() {
           }
         }
 
-        const isBackgroundTarget = 
+        const isCardElement = Boolean((e.target as HTMLElement).closest('[data-card-id]'));
+        const isInteractiveUI = Boolean((e.target as HTMLElement).closest('button, input, textarea, form, [role="dialog"], [role="menu"]'));
+        const isBackgroundTarget = !isCardElement && !isInteractiveUI && (
           e.target === containerRef.current || 
           (e.target as Element).id === 'grid-bg-overlay' || 
           (e.target as Element).id === 'nano-lod-canvas' ||
-          (e.target as Element).id === 'canvas-workspace';
+          (e.target as Element).id === 'canvas-workspace' ||
+          Boolean((e.target as HTMLElement).closest('#canvas-workspace'))
+        );
 
         if (isBackgroundTarget) {
           if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
@@ -6874,6 +7004,7 @@ export default function App() {
               isAgentTarget={isAgentTarget}
               agentFocusRole={agentFocusRole}
               agentInspectScenario={agentInspectScenario}
+              isAgentThinking={isAgentThinking || isAgentRunning}
               isZooming={isZooming}
               allCards={cards}
               currentProject={currentProject}
@@ -7022,7 +7153,7 @@ export default function App() {
         transform={transformValues}
         isIdle={true}
         isZooming={isZooming}
-        isAgentRunning={isAgentRunning || isProcessingInspectQueueRef.current || isAgentThinking || isThinkingOrLoadingPhrase(agentState.speak)}
+        isAgentRunning={isAgentRunning || isProcessingInspectQueueRef.current || isAgentThinking}
         selectedCards={activeSelectedCards}
         isDarkMode={isDarkMode}
         quickInput={
@@ -7030,7 +7161,7 @@ export default function App() {
             ? {
                 isOpen: true,
                 targetId: agentQuickInput.targetId,
-                placeholder: "输入你的想法...",
+                placeholder: agentQuickInput.placeholder || "输入你的想法...",
                 lastReply: agentQuickInput.lastReply,
                 focusTrigger: agentQuickInput.focusTrigger,
                 value: cardDrafts[agentQuickInput.targetId || 'global'] || '',
@@ -7040,6 +7171,15 @@ export default function App() {
                   saveDraft(target, text); // Persist draft to IndexedDB
                 },
                 onSubmit: async (prompt: string) => {
+                  if (agentQuickInput.onAskResolve) {
+                    const askResolver = agentQuickInput.onAskResolve;
+                    const currentKey = agentQuickInput.targetId || 'global';
+                    setCardDrafts(prev => ({ ...prev, [currentKey]: '' }));
+                    deleteDraft(currentKey);
+                    setAgentQuickInput(null);
+                    askResolver(prompt);
+                    return;
+                  }
                   const currentTarget = agentQuickInput.targetId;
                   const currentKey = currentTarget || 'global';
                   setCardDrafts(prev => ({ ...prev, [currentKey]: '' }));
@@ -7062,18 +7202,48 @@ export default function App() {
                     return;
                   }
                   if (currentTarget) {
+                    const isMultiSelection = selectedCardIds.length > 1 && selectedCardIds.includes(currentTarget);
+                    const isMultiInput = agentQuickInput?.targetIds && agentQuickInput.targetIds.length > 1 && agentQuickInput.targetIds.includes(currentTarget) && isMultiSelection;
+
+                    const targetGroup = isMultiSelection
+                      ? selectedCardIds
+                      : (isMultiInput ? agentQuickInput!.targetIds! : [currentTarget]);
+
+                    const references = targetGroup.filter(id => id !== currentTarget);
+
+                    if (references.length > 0) {
+                      agentFocusManager.batchSetFocus({
+                        primary: currentTarget,
+                        references,
+                        role: 'working',
+                        referenceRole: 'reference',
+                        sourceTool: 'quick_input',
+                        cursorMode: 'working',
+                      });
+                    } else {
+                      agentFocusManager.setPrimaryFocus(currentTarget, 'working', 'quick_input');
+                    }
                     await handleCardAgentChat(currentTarget, prompt);
                   } else {
                     await handleRunAgent(prompt);
                   }
                 },
                 onClose: () => {
+                  if (agentQuickInput.onAskResolve) {
+                    const askResolver = agentQuickInput.onAskResolve;
+                    const currentKey = agentQuickInput.targetId || 'global';
+                    setCardDrafts(prev => ({ ...prev, [currentKey]: '' }));
+                    deleteDraft(currentKey);
+                    setAgentQuickInput(null);
+                    askResolver('');
+                    return;
+                  }
                   const currentTarget = agentQuickInput.targetId || 'global';
                   setCardDrafts(prev => ({ ...prev, [currentTarget]: '' }));
                   deleteDraft(currentTarget); // Delete draft from IndexedDB on close
                   setAgentQuickInput(null);
                   setAgentState(prev => {
-                    if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
+                    if (!prev.speak || prev.speak.startsWith('选了') || prev.speak === '我能帮什么忙？' || prev.speak === '选中了这组内容，要调整什么？') {
                       return { ...prev, speak: undefined };
                     }
                     return prev;
@@ -7263,14 +7433,38 @@ export default function App() {
                 const prompt = agentPrompt.trim();
                 setAgentPrompt('');
                 setContextMenus(prev => { const next = {...prev}; delete next['user']; return next; });
-                setAgentState(prev => {
-                  if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
-                    return { ...prev, speak: undefined };
-                  }
-                  return prev;
-                });
                 if (!prompt) return;
+                setIsAgentThinking(true);
+                setIsAgentRunning(true);
+                isAgentRunningRef.current = true;
+                setAgentState(prev => ({
+                  ...prev,
+                  lastPrompt: prompt,
+                  speak: "正在思考...",
+                  visible: true,
+                }));
                 if (currentTarget) {
+                  const isMultiSelection = selectedCardIds.length > 1 && selectedCardIds.includes(currentTarget);
+                  const isMultiInput = agentQuickInput?.targetIds && agentQuickInput.targetIds.length > 1 && agentQuickInput.targetIds.includes(currentTarget) && isMultiSelection;
+
+                  const targetGroup = isMultiSelection
+                    ? selectedCardIds
+                    : (isMultiInput ? agentQuickInput!.targetIds! : [currentTarget]);
+
+                  const references = targetGroup.filter(id => id !== currentTarget);
+
+                  if (references.length > 0) {
+                    agentFocusManager.batchSetFocus({
+                      primary: currentTarget,
+                      references,
+                      role: 'working',
+                      referenceRole: 'reference',
+                      sourceTool: 'context_menu',
+                      cursorMode: 'working',
+                    });
+                  } else {
+                    agentFocusManager.setPrimaryFocus(currentTarget, 'working', 'context_menu');
+                  }
                   await handleCardAgentChat(currentTarget, prompt);
                 } else {
                   await handleRunAgent(prompt);
@@ -7315,62 +7509,7 @@ export default function App() {
           ))}
       </AnimatePresence>
 
-      {/* Agent Question Modal */}
-      <AnimatePresence>
-        {agentQuestion && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/20"
-          >
-            <motion.div
-              initial={{ opacity: 0, scale: 0.95, y: 10 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 10 }}
-              className="bg-gray-100 dark:bg-neutral-800 border border-gray-200 dark:border-[#404040] shadow-2xl p-6 rounded-[24px] corner-squircle w-[420px] max-w-[90vw]"
-            >
-              <h3 className="text-lg font-bold text-gray-900 dark:text-white mb-2 flex items-center gap-2">
-                <Sparkles className="w-5 h-5 text-purple-500" />
-                Mira 的提问
-              </h3>
-              <p className="text-sm font-medium text-gray-700 dark:text-neutral-300 mb-5 leading-relaxed">
-                {agentQuestion.question}
-              </p>
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  const fd = new FormData(e.currentTarget);
-                  agentQuestion.resolve(fd.get('answer') as string);
-                }}
-              >
-                <input
-                  autoFocus
-                  name="answer"
-                  className="w-full bg-white dark:bg-neutral-800 border border-gray-200 dark:border-[#404040] rounded-xl corner-squircle px-3 py-2.5 text-[14px] text-gray-900 dark:text-white outline-none focus:border-purple-500 focus:ring-1 focus:ring-purple-500 mb-5 transition-all placeholder-gray-400 dark:placeholder-neutral-500 font-medium"
-                  placeholder="输入你的回答..."
-                  autoComplete="off"
-                />
-                <div className="flex justify-end gap-2.5">
-                  <button
-                    type="button"
-                    onClick={() => agentQuestion.resolve('')}
-                    className="px-4 py-2 text-[13px] font-semibold text-gray-500 hover:bg-gray-200 dark:hover:bg-neutral-800 rounded-xl corner-squircle transition-colors"
-                  >
-                    跳过
-                  </button>
-                  <button
-                    type="submit"
-                    className="px-4 py-2 text-[13px] font-semibold bg-purple-600 hover:bg-purple-700 text-white shadow-md rounded-xl corner-squircle transition-colors"
-                  >
-                    回复
-                  </button>
-                </div>
-              </form>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+
 
       {/* Bottom Left Scale Indicator HUD */}
       <ZoomControlGroup

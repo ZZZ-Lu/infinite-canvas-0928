@@ -124,17 +124,18 @@ const CURSOR_FLOAT_VARIANTS = {
 };
 
 function isThinkingPhrase(text?: string): boolean {
-  if (!text) return true;
+  if (!text) return false;
   const clean = text.trim();
-  if (!clean) return true;
+  if (!clean) return false;
   return (
     clean === '...' ||
+    clean === '…' ||
     clean === 'thinking' ||
     clean === 'loading' ||
     clean === '正在思考...' ||
+    clean === '正在思考' ||
     clean === '图生好了，我先看下...' ||
-    clean.endsWith('...') ||
-    clean.endsWith('…') ||
+    clean === '图生好了，我先看下' ||
     clean.includes('正在思考') ||
     clean.includes('排队渲染') ||
     clean.includes('正在拉取')
@@ -202,22 +203,25 @@ function SingleLineMarquee({
       }}
     >
       {isThinking ? (
-        <span className="flex items-center gap-1 px-1 py-1 shrink-0">
-          <motion.span 
-            className={`inline-block w-1.5 h-1.5 rounded-full ${dotColorClass}`}
-            animate={{ y: [0, -3.5, 0] }}
-            transition={{ duration: 0.8, repeat: Infinity, ease: 'easeInOut', delay: 0 }}
-          />
-          <motion.span 
-            className={`inline-block w-1.5 h-1.5 rounded-full ${dotColorClass}`}
-            animate={{ y: [0, -3.5, 0] }}
-            transition={{ duration: 0.8, repeat: Infinity, ease: 'easeInOut', delay: 0.15 }}
-          />
-          <motion.span 
-            className={`inline-block w-1.5 h-1.5 rounded-full ${dotColorClass}`}
-            animate={{ y: [0, -3.5, 0] }}
-            transition={{ duration: 0.8, repeat: Infinity, ease: 'easeInOut', delay: 0.3 }}
-          />
+        <span className="flex items-center gap-1.5 px-1 py-0.5 shrink-0 select-none">
+          <span className={textStyleClass}>正在思考</span>
+          <span className="inline-flex items-center gap-1 shrink-0">
+            <motion.span 
+              className={`inline-block w-1.5 h-1.5 rounded-full ${dotColorClass}`}
+              animate={{ y: [0, -3.5, 0] }}
+              transition={{ duration: 0.8, repeat: Infinity, ease: 'easeInOut', delay: 0 }}
+            />
+            <motion.span 
+              className={`inline-block w-1.5 h-1.5 rounded-full ${dotColorClass}`}
+              animate={{ y: [0, -3.5, 0] }}
+              transition={{ duration: 0.8, repeat: Infinity, ease: 'easeInOut', delay: 0.15 }}
+            />
+            <motion.span 
+              className={`inline-block w-1.5 h-1.5 rounded-full ${dotColorClass}`}
+              animate={{ y: [0, -3.5, 0] }}
+              transition={{ duration: 0.8, repeat: Infinity, ease: 'easeInOut', delay: 0.3 }}
+            />
+          </span>
         </span>
       ) : overflow > 0 ? (
         <motion.span
@@ -327,17 +331,22 @@ export function AgentCursor({
     agentState.speak.startsWith('选了') ||
     agentState.speak === '我能帮什么忙？';
 
-  // When quickInput is open and waiting for user input, the agent shouldn't be "thinking"
-  // It should show a ready dynamic prompt unless actively executing
-  const effectiveAgentSpeak = (quickInput?.isOpen && submitStep === 'idle' && isDefaultOrSelectionSpeak)
-    ? dynamicPromptText
-    : (rawIsThinking && isAgentRunning === false)
-      ? undefined
-      : (agentState.speak || (quickInput?.isOpen ? dynamicPromptText : undefined));
+  // When Agent is actively running/executing, it is strictly in execution/thinking mode:
+  // Display active agent speak if available, otherwise strictly show "正在思考..."
+  // Never fall back to dynamic selection prompt ("选了X张图片...") during execution!
+  const effectiveAgentSpeak = isAgentRunning
+    ? (agentState.speak && !agentState.speak.startsWith('选了') && agentState.speak !== '我能帮什么忙？' ? agentState.speak : "正在思考...")
+    : (quickInput?.isOpen && submitStep === 'idle' && isDefaultOrSelectionSpeak)
+      ? dynamicPromptText
+      : (rawIsThinking && isAgentRunning === false)
+        ? undefined
+        : (agentState.speak || (quickInput?.isOpen ? dynamicPromptText : undefined));
 
-  const effectiveIsThinking = (quickInput?.isOpen && submitStep === 'idle' && rawIsThinking)
-    ? false
-    : isActuallyThinking;
+  const effectiveIsThinking = isAgentRunning
+    ? isThinkingPhrase(effectiveAgentSpeak)
+    : (quickInput?.isOpen && submitStep === 'idle' && rawIsThinking)
+      ? false
+      : isActuallyThinking;
 
   // Deduplication guard: Never display identical text simultaneously in Row 1 and Row 2
   const historyText = rawHistoryText && rawHistoryText.trim() !== (effectiveAgentSpeak || '').trim()

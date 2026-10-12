@@ -13,6 +13,8 @@
 
 **协同铁律**：聚焦不能脱离鼠标独立存在，鼠标也不能做无焦点的盲目表演。鼠标动作的时序（启程、飞行、到达、交互、离开）必须与卡片聚焦的视觉反馈（引力光晕、实线锁定、能量脉冲、平滑淡出）形成毫秒级严格对齐。
 
+**架构修复原则**：不打补丁，完善系统设计。Agent 聚焦系统 (`agentFocusManager`) 与用户选择系统 (`selectedCardIds`) 在状态所有权与生命周期上彻底解耦，Agent 状态的变更、重置与清理绝对不得侵入或破坏用户的显式操作选择。
+
 ---
 
 ## 2. 状态机模型与形态映射
@@ -96,8 +98,28 @@ Agent 指针在动作生命周期中自适应变幻形态：
 
 ---
 
-## 5. 架构合规性自查
+## 5. Agent 任务生命周期与指针状态复位规范 (Agent State Reset Spec)
+
+**核心原则：不打补丁，完善系统设计**
+
+1. **控制逻辑与视觉展示完全解耦 (Decoupling Control from Speech)**：
+   * `isAgentRunning` 作为衡量 Agent 是否处于实际运行中的控制标识，仅由运行循环 (`handleRunAgent`)、出图质检队列 (`isProcessingInspectQueueRef`) 及思考状态 (`isAgentThinking`) 共同决定。
+   * **绝对禁止**将 `isThinkingOrLoadingPhrase(agentState.speak)` 等视觉文本解析逻辑注入到 `isAgentRunning` 布尔控制标识中，避免展示层残留文本反向绑架控制逻辑导致卡死。
+
+2. **统一幂等复位函数 (`resetAgentStateToDefault`)**：
+   * 系统定义统一且幂等的复位收拢点：同步将 `agentFocusManager.setCursorMode('default')`、`agentFocusManager.clearAll(0)` 以及 React `agentState` (`cursorMode: 'default'`, `isActive: false`, `isMoving: false`, 思考/加载语气清理) 毫秒级归零。
+   * 在以下 4 个终态触发点统一收拢复位：
+     1. 任务完成/失败/取消 (`status === 'completed' | 'failed' | 'cancelled'`) 且出图队列已清空；
+     2. `handleRunAgent` 终态 `finally` 且出图队列已清空；
+     3. 出图检视队列 (`processInspectQueue`) 消费完毕的 `finally` 阶段；
+     4. 安全网 Hook (`useEffect`) 监测到 Agent 退出运行态且队列为空。
+
+---
+
+## 6. 架构合规性自查
 
 * [x] **数据与 DOM 解耦**：聚焦系统仅维护 `Set<cardId>` 与纯元数据，不引用任何 DOM 节点；
 * [x] **人机路径 1:1 对齐**：严格遵守《03-human-path-execution-contract.md》，必须先有工具和物理动作，后有页面聚焦事实；
-* [x] **SSOT 确定性**：仅由 JSON 转译节点输出驱动，无自然语言幻觉风险。
+* [x] **SSOT 确定性**：仅由 JSON 转译节点输出驱动，无自然语言幻觉风险；
+* [x] **不打补丁系统设计**：控制标识与视觉气泡彻底解耦，终态收拢幂等复位。
+

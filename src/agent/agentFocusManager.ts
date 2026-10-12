@@ -128,24 +128,45 @@ class AgentFocusManager {
     this.notify();
   }
 
-  public setPrimaryFocus(cardId: string | null, role: AgentFocusRole = 'inspect', sourceTool = 'manual') {
+  public batchRemoveFocus(cardIds: string[]) {
+    if (!Array.isArray(cardIds) || cardIds.length === 0) return;
+    let changed = false;
+    cardIds.forEach(id => {
+      if (this.focusedMap.delete(id)) changed = true;
+      if (this.primaryCardId === id) {
+        this.primaryCardId = null;
+        changed = true;
+      }
+      if (this.referenceCardIds.delete(id)) changed = true;
+    });
+    if (changed) {
+      this.notify();
+    }
+  }
+
+  public getFocusedCardIds(): string[] {
+    const ids = new Set<string>();
+    if (this.primaryCardId) ids.add(this.primaryCardId);
+    this.referenceCardIds.forEach(id => ids.add(id));
+    this.focusedMap.forEach((_, id) => ids.add(id));
+    return Array.from(ids);
+  }
+
+  public setPrimaryFocus(cardId: string | null, role: AgentFocusRole = 'inspect', sourceTool = 'manual', keepReferences: boolean = false) {
     if (this.fadeTimer) {
       clearTimeout(this.fadeTimer);
       this.fadeTimer = null;
     }
 
-    if (!cardId) {
-      if (this.primaryCardId) {
-        this.focusedMap.delete(this.primaryCardId);
-        this.primaryCardId = null;
-        this.notify();
-      }
-      return;
+    if (!keepReferences) {
+      this.focusedMap.clear();
+      this.referenceCardIds.clear();
     }
 
-    // Retain references, update primary
-    if (this.primaryCardId && this.primaryCardId !== cardId && !this.referenceCardIds.has(this.primaryCardId)) {
-      this.focusedMap.delete(this.primaryCardId);
+    if (!cardId) {
+      this.primaryCardId = null;
+      this.notify();
+      return;
     }
 
     this.primaryCardId = cardId;
@@ -251,21 +272,21 @@ class AgentFocusManager {
           ? scope.replace('canvas.card.', '') 
           : (scope.startsWith('card_') ? scope : null);
         if (cardId) {
-          this.setPrimaryFocus(cardId, 'inspect', 'page.inspect');
+          this.setPrimaryFocus(cardId, 'inspect', 'page.inspect', true);
         }
       }
     } else if (call.name === 'card.inspect') {
       const cardId = call.arguments?.cardId;
       if (typeof cardId === 'string' && cardId) {
         this.setCursorMode('inspect');
-        this.setPrimaryFocus(cardId, 'inspect', 'card.inspect');
+        this.setPrimaryFocus(cardId, 'inspect', 'card.inspect', true);
       }
     } else if (call.name === 'card.detectLandmarks' || (call.name as string) === 'card.annotateElements') {
       const cardId = call.arguments?.cardId || call.arguments?.targetCardId;
       if (typeof cardId === 'string' && cardId) {
         const cleanCardId = cardId.startsWith('canvas.card.') ? cardId.replace('canvas.card.', '') : cardId;
         this.setCursorMode('working');
-        this.setPrimaryFocus(cleanCardId, 'working', call.name);
+        this.setPrimaryFocus(cleanCardId, 'working', call.name, true);
       }
     } else if (call.name === 'card.generate') {
       const targetCardId = call.arguments?.targetCardId;
@@ -281,19 +302,21 @@ class AgentFocusManager {
         sourceTool: 'card.generate',
         cursorMode: 'working',
       });
-    } else if (call.name === 'ui.actAndObserve') {
-      const targetId = String(call.arguments?.targetId || '');
+    } else if (call.name === 'ui.actAndObserve' || call.name.startsWith('mouse.') || call.name.startsWith('ui.')) {
+      const targetId = String(call.arguments?.targetId || call.arguments?.targetComponentId || call.arguments?.cardId || '');
       this.setCursorMode('interact');
       if (targetId.startsWith('canvas.card.')) {
         const cardId = targetId.replace('canvas.card.', '');
-        this.setPrimaryFocus(cardId, 'interact', 'ui.actAndObserve');
+        this.setPrimaryFocus(cardId, 'interact', call.name, true);
       } else if (targetId.startsWith('card_') || targetId.includes('.card.')) {
         const cardId = targetId.split('.')[0] || targetId;
-        this.setPrimaryFocus(cardId, 'interact', 'ui.actAndObserve');
+        this.setPrimaryFocus(cardId, 'interact', call.name, true);
+      } else if (this.primaryCardId) {
+        this.setPrimaryFocus(this.primaryCardId, 'interact', call.name, true);
       }
     } else if (call.name === 'sys.endTask') {
-      // Clear with 2.5s graceful fade-out
-      this.clearAll(2500);
+      this.setCursorMode('default');
+      this.clearAll(500);
     }
   }
 }
