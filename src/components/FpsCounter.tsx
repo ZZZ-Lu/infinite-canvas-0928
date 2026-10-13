@@ -58,9 +58,8 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false })
   return (
     <div 
       id="fps-counter"
-      className={`fixed right-6 z-[100] flex items-center gap-1.5 px-2.5 py-1.5 bg-gray-100/90 dark:bg-neutral-800/90 backdrop-blur-md border border-gray-200/80 dark:border-[#404040]/80 shadow-md rounded-[16px] text-[10px] font-bold font-mono select-none transition-all duration-300 ${
-        hasActiveTask ? 'bottom-[195px]' : 'bottom-6'
-      }`}
+      onPointerDown={e => e.stopPropagation()}
+      className="fixed top-4 left-1/2 -translate-x-1/2 z-[100] flex items-center gap-1.5 px-3 h-[36px] bg-gray-100/90 dark:bg-neutral-800/90 backdrop-blur-md border border-gray-200/80 dark:border-[#404040]/80 shadow-md rounded-2xl corner-squircle text-[11px] font-bold font-mono select-none"
     >
       <span ref={dotRef} className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
       <span className="text-gray-400 dark:text-neutral-500">FPS:</span>

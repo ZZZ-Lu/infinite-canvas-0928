@@ -1745,6 +1745,173 @@ ${effectiveRequirement}
     };
   }
 
+  // Sub-Model Endpoint 1: High-Speed Verification of Cropped Image Patch
+  app.post('/api/agent/verify-landmark-crop', async (req, res) => {
+    try {
+      const { cropDataUrl, label, description, apiKey, model } = req.body || {};
+      if (!cropDataUrl || !label) {
+        return res.status(400).json({ error: 'Missing cropDataUrl or label' });
+      }
+
+      const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(model || 'deepseek-v4-flash', apiKey);
+
+      const verifySystemPrompt = `你是一个严谨的多模态视觉核验专家。
+你的任务是：观察输入的目标局部裁剪图，判断画面中是否真实、明确地包含了所声明的目标主体【${label}】。
+注意：
+1. 若画面中明显包含该目标（哪怕只是特写或局部），判定为有效匹配 match: true；
+2. 若画面中是一片空地、背景色块、无关杂物，或者目标主体严重缺失/与【${label}】明显不符，判定为 match: false；
+3. 请以极高确定性输出 JSON：
+{
+  "match": true | false,
+  "confidence": 0.0 ~ 1.0,
+  "reason": "简短判定理由"
+}
+严格只返回合法 JSON，严禁任何额外解释。`;
+
+      const requestPayload = {
+        model: actualModel,
+        response_format: { type: 'json_object' },
+        thinking: { type: 'disabled' },
+        extra_body: { thinking: { type: 'disabled' } },
+        messages: [
+          { role: 'system', content: verifySystemPrompt },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image_url',
+                image_url: { url: cropDataUrl, detail: 'low' }
+              },
+              {
+                type: 'text',
+                text: `核验目标：【${label}】${description ? `（特征参考：${description}）` : ''}。该局部画面中是否真实包含该目标？`
+              }
+            ]
+          }
+        ]
+      };
+
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${keyToUse}`
+        },
+        body: JSON.stringify(requestPayload)
+      });
+
+      if (!response.ok) {
+        // Fallback: if verification API fails, be permissive to avoid accidentally dropping valid items
+        return res.json({ match: true, confidence: 0.8, reason: 'Verification API unavailable, defaulted to pass' });
+      }
+
+      const data = await parseChatCompletionResponse(response, false);
+      const parsed = robustParseJson(data.content || '{}') || {};
+      const match = parsed.match !== false && (parsed.valid !== false);
+      const confidence = typeof parsed.confidence === 'number' ? parsed.confidence : 0.85;
+
+      res.json({
+        match,
+        confidence,
+        reason: parsed.reason || (match ? '核验通过' : '局部画面未匹配目标')
+      });
+    } catch (err: any) {
+      console.warn('Verify landmark crop error:', err);
+      res.json({ match: true, confidence: 0.8, reason: 'Self-check exception fallback to pass' });
+    }
+  });
+
+  // Sub-Model Endpoint 2: High-Precision Single-Target Re-Annotation
+  app.post('/api/agent/detect-single-landmark', async (req, res) => {
+    try {
+      const { imageUrl, label, description, apiKey, model } = req.body || {};
+      if (!imageUrl || !label) {
+        return res.status(400).json({ error: 'Missing imageUrl or label' });
+      }
+
+      const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(model || 'deepseek-v4-flash', apiKey);
+
+      const singlePrompt = `你是一个单目标极高精度视觉定位定位专家。
+你的唯一任务是：在全图画面中，全力聚焦搜寻单个指定目标【${label}】。
+请仅输出这一个目标的紧密 2D 归一化包围盒 "box_2d": [ymin, xmin, ymax, xmax]（0~1000 范围整数，紧贴像素边缘）。
+若画面中确实不存在该目标，请诚实返回 "box_2d": null。
+
+输出格式规范（严格返回纯 JSON，严禁 Markdown）：
+{
+  "found": true | false,
+  "label": "${label}",
+  "box_2d": [ymin, xmin, ymax, xmax] | null,
+  "confidence": 0.0 ~ 1.0,
+  "description": "目标在画面中的位置与视觉特征简述"
+}`;
+
+      const requestPayload = {
+        model: actualModel,
+        response_format: { type: 'json_object' },
+        thinking: { type: 'disabled' },
+        extra_body: { thinking: { type: 'disabled' } },
+        messages: [
+          { role: 'system', content: singlePrompt },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image_url',
+                image_url: { url: imageUrl, detail: 'low' }
+              },
+              {
+                type: 'text',
+                text: `请在全图中精准定位单一目标：【${label}】${description ? `（特征描述：${description}）` : ''}`
+              }
+            ]
+          }
+        ]
+      };
+
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${keyToUse}`
+        },
+        body: JSON.stringify(requestPayload)
+      });
+
+      if (!response.ok) {
+        return res.json({ found: false, box_2d: null, error: 'Model failed' });
+      }
+
+      const data = await parseChatCompletionResponse(response, false);
+      const parsed = robustParseJson(data.content || '{}') || {};
+
+      let box_2d: [number, number, number, number] | null = null;
+      const rawBox = Array.isArray(parsed.box_2d) ? parsed.box_2d : (Array.isArray(parsed.box) ? parsed.box : null);
+      if (rawBox && rawBox.length === 4) {
+        const [b0, b1, b2, b3] = rawBox.map((v: any) => typeof v === 'number' ? v : parseFloat(v) || 0);
+        const isThousandScale = Math.max(b0, b1, b2, b3) > 100;
+        const scale = isThousandScale ? 10 : 1;
+        const ymin = Math.min(b0, b2) / scale;
+        const ymax = Math.max(b0, b2) / scale;
+        const xmin = Math.min(b1, b3) / scale;
+        const xmax = Math.max(b1, b3) / scale;
+        box_2d = [ymin, xmin, ymax, xmax];
+      }
+
+      const found = (parsed.found !== false) && !!box_2d;
+
+      res.json({
+        found,
+        label,
+        box_2d,
+        confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.9,
+        description: parsed.description || label
+      });
+    } catch (err: any) {
+      console.warn('Detect single landmark error:', err);
+      res.json({ found: false, box_2d: null, error: err.message });
+    }
+  });
+
   // Catch-all 404 for unmatched /api routes - ALWAYS return JSON, never fallback to Vite SPA HTML
   app.all('/api/*', (req, res) => {
     res.status(404).json({ success: false, error: `API route not found: ${req.method} ${req.path}` });

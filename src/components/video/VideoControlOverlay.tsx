@@ -43,7 +43,7 @@ export const VideoControlOverlay: React.FC<VideoControlOverlayProps> = ({
       {!isPlaying ? (
         <div className="absolute inset-0 flex items-center justify-center bg-black/25 hover:bg-black/35 transition-colors pointer-events-none">
           <div
-            className="rounded-full bg-white/40 dark:bg-black/50 border border-white/30 dark:border-white/10 shadow-xl flex items-center justify-center transform hover:scale-105 transition-transform cursor-pointer pointer-events-auto group-data-[scale-micro=true]/canvas:!scale-100"
+            className="rounded-full bg-white/40 dark:bg-black/50 border border-white/30 dark:border-white/10 shadow-xl flex items-center justify-center transform hover:scale-105 transition-transform cursor-pointer pointer-events-auto group-data-[scale-nano=true]/canvas:!scale-100"
             style={{
               width: playButtonDiameter,
               height: playButtonDiameter,
@@ -83,7 +83,7 @@ export const VideoControlOverlay: React.FC<VideoControlOverlayProps> = ({
       {/* Progress Bar Controller Overlay */}
       {showControlBar && (
         <div
-          className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent p-4 pt-12 flex flex-col gap-2 transition-opacity duration-200 opacity-0 group-hover/video:opacity-100 group-data-[scale-micro=true]/canvas:hidden"
+          className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent p-4 pt-12 flex flex-col gap-2 transition-opacity duration-200 opacity-0 group-hover/video:opacity-100 group-data-[scale-nano=true]/canvas:hidden"
           onPointerDown={(e) => {
             if (e.button === 0) e.stopPropagation();
           }}

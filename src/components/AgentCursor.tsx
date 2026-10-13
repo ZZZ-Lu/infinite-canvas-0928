@@ -92,6 +92,7 @@ interface AgentCursorProps {
   isIdle?: boolean;
   isZooming?: boolean;
   isAgentRunning?: boolean;
+  isAgentThinking?: boolean;
   selectedCards?: CardData[];
   quickInput?: QuickInputConfig | null;
   onClickPointer?: () => void;
@@ -127,6 +128,17 @@ function isThinkingPhrase(text?: string): boolean {
   if (!text) return false;
   const clean = text.trim();
   if (!clean) return false;
+  if (
+    clean.includes('正在操作') || 
+    clean.includes('正在标注') || 
+    clean.includes('正在生成') || 
+    clean.includes('排队渲染') ||
+    clean.includes('正在查看') ||
+    clean.includes('正在对照') ||
+    clean.includes('正在质检')
+  ) {
+    return false;
+  }
   return (
     clean === '...' ||
     clean === '…' ||
@@ -137,7 +149,6 @@ function isThinkingPhrase(text?: string): boolean {
     clean === '图生好了，我先看下...' ||
     clean === '图生好了，我先看下' ||
     clean.includes('正在思考') ||
-    clean.includes('排队渲染') ||
     clean.includes('正在拉取')
   );
 }
@@ -266,6 +277,7 @@ export function AgentCursor({
   isIdle = true, 
   isZooming = false, 
   isAgentRunning,
+  isAgentThinking,
   selectedCards = [],
   quickInput, 
   onClickPointer, 
@@ -291,7 +303,9 @@ export function AgentCursor({
   const [submittedUserPrompt, setSubmittedUserPrompt] = useState<string | null>(null);
 
   const rawIsThinking = isThinkingPhrase(agentState.speak);
-  const isActuallyThinking = (isAgentRunning !== false) && rawIsThinking;
+  const isActuallyThinking = isAgentThinking !== undefined
+    ? isAgentThinking
+    : ((isAgentRunning !== false) && rawIsThinking);
 
   const dynamicPromptText = useMemo(() => {
     return buildDynamicSelectionPrompt(selectedCards || []);
@@ -332,10 +346,12 @@ export function AgentCursor({
     agentState.speak === '我能帮什么忙？';
 
   // When Agent is actively running/executing, it is strictly in execution/thinking mode:
-  // Display active agent speak if available, otherwise strictly show "正在思考..."
+  // Display active agent speak if available, otherwise show "正在思考..." during thinking or "正在操作..." during execution
   // Never fall back to dynamic selection prompt ("选了X张图片...") during execution!
   const effectiveAgentSpeak = isAgentRunning
-    ? (agentState.speak && !agentState.speak.startsWith('选了') && agentState.speak !== '我能帮什么忙？' ? agentState.speak : "正在思考...")
+    ? (agentState.speak && !agentState.speak.startsWith('选了') && agentState.speak !== '我能帮什么忙？' 
+        ? agentState.speak 
+        : (isActuallyThinking ? "正在思考..." : "正在操作..."))
     : (quickInput?.isOpen && submitStep === 'idle' && isDefaultOrSelectionSpeak)
       ? dynamicPromptText
       : (rawIsThinking && isAgentRunning === false)
@@ -343,7 +359,7 @@ export function AgentCursor({
         : (agentState.speak || (quickInput?.isOpen ? dynamicPromptText : undefined));
 
   const effectiveIsThinking = isAgentRunning
-    ? isThinkingPhrase(effectiveAgentSpeak)
+    ? (isAgentThinking !== undefined ? (isAgentThinking && isThinkingPhrase(effectiveAgentSpeak)) : isThinkingPhrase(effectiveAgentSpeak))
     : (quickInput?.isOpen && submitStep === 'idle' && rawIsThinking)
       ? false
       : isActuallyThinking;
@@ -619,7 +635,7 @@ export function AgentCursor({
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
         >
-          {agentState.cursorMode === 'working' && isAgentRunning !== false ? (
+          {agentState.cursorMode === 'working' && isAgentRunning !== false && !effectiveIsThinking ? (
             <svg
               width="36"
               height="36"

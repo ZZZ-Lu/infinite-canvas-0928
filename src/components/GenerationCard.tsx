@@ -23,7 +23,7 @@ import {
   Copy
 } from 'lucide-react';
 import { isCardIntersectingRectangle } from '../utils/viewportCulling';
-import { getBottomPanelHeight, getPromptAreaHeight, calculatePromptLines } from '../utils/cardLayout';
+import { getBottomPanelHeight, getPromptAreaHeight } from '../utils/cardLayout';
 import { CardImageCanvas } from './CardImageCanvas';
 import { fullImageCache, originalImageCache } from '../utils/imageTextureCache';
 import { ScriptProject } from '../types/script';
@@ -366,9 +366,9 @@ export interface CardData {
   referenceImages?: Array<{
     url: string;
     thumbnailUrl?: string;
-    microLodThumbnailUrl?: string; // 64px max edge
-    fullDetailThumbnailUrl?: string; // 128px max edge
-    closeupThumbnailUrl?: string; // 256px max edge
+    microLodThumbnailUrl?: string; // 32px max edge (0.5x LOD)
+    fullDetailThumbnailUrl?: string; // 64px max edge (0.5x LOD)
+    closeupThumbnailUrl?: string; // 128px max edge (0.5x LOD)
     name?: string;
     fileData?: Blob;
     sourceCardId?: string;
@@ -3182,7 +3182,11 @@ export const GenerationCard = React.memo(function GenerationCard({
     };
   }, [scale, tx, ty]);
 
-  const dpr = showOriginal ? Math.min(scale.get(), 8.0) : 1;
+  const screenDpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
+  const dpr = Math.min(
+    Math.max(screenDpr, (currentScale || 1) * screenDpr),
+    8.0
+  );
   const { width: w, height: h } = getCardSize(data);
 
   const isAssetCard = Boolean(data.fileName || data.isAsset);
@@ -3191,10 +3195,6 @@ export const GenerationCard = React.memo(function GenerationCard({
   // Bottom panel container is ALWAYS rendered for generation cards (!isAssetCard)
   const shouldRenderBottomPanel = !isAssetCard;
 
-  // Low-LOD Skeleton Overlay:
-  // Visible initially on mount / loading (!isTagsReady) or when scale < 0.4.
-  // Positioned as an overlay over high-LOD component, transitions opacity from 1 down to 0 over 700ms.
-  const isLowLodSkeleton = currentScale < 0.4 || !isTagsReady;
   
   useEffect(() => {
     if (videoRef.current && videoRef.current.readyState >= 2) {
@@ -3739,9 +3739,9 @@ export const GenerationCard = React.memo(function GenerationCard({
       : data.referenceImageUrl ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }] : [];
 
     Promise.all([
+      generateImageThumbnail(file, 32, 0.90),
       generateImageThumbnail(file, 64, 0.90),
-      generateImageThumbnail(file, 128, 0.90),
-      generateImageThumbnail(file, 256, 0.90)
+      generateImageThumbnail(file, 128, 0.90)
     ]).then(([micro, full, closeup]) => {
       thumbCache.set(objectUrl, closeup);
       onUpdate(id, {
@@ -3781,9 +3781,9 @@ export const GenerationCard = React.memo(function GenerationCard({
     const url = asset.referenceImage || '';
     if (url) {
       Promise.all([
+        generateImageThumbnail(url, 32, 0.90).catch(() => ''),
         generateImageThumbnail(url, 64, 0.90).catch(() => ''),
-        generateImageThumbnail(url, 128, 0.90).catch(() => ''),
-        generateImageThumbnail(url, 256, 0.90).catch(() => '')
+        generateImageThumbnail(url, 128, 0.90).catch(() => '')
       ]).then(([micro, full, closeup]) => {
         const newRef = {
           url,
@@ -4127,9 +4127,9 @@ export const GenerationCard = React.memo(function GenerationCard({
           : [];
       const url = refItem.url;
       Promise.all([
+        generateImageThumbnail(url, 32, 0.90).catch(() => ''),
         generateImageThumbnail(url, 64, 0.90).catch(() => ''),
-        generateImageThumbnail(url, 128, 0.90).catch(() => ''),
-        generateImageThumbnail(url, 256, 0.90).catch(() => '')
+        generateImageThumbnail(url, 128, 0.90).catch(() => '')
       ]).then(([micro, full, closeup]) => {
         const newRef = {
           url,
@@ -4508,6 +4508,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       <motion.div
         initial={false}
         animate={{ scale: 1, opacity: 1, y: 0 }}
+        transition={{ duration: 0 }}
         transformTemplate={(_, generated) => generated.replace(/translateZ\([^)]+\)/g, '')}
         className={`flex flex-col gap-3 group items-start relative ${isAssetCard ? 'asset-card' : 'generation-card'}`}
         style={{ transformOrigin: '50% 50%' }}
@@ -4638,16 +4639,16 @@ export const GenerationCard = React.memo(function GenerationCard({
             pickerSelectionIndex && pickerSelectionIndex > 0
               ? 'translate-y-0'
               : isAgentTarget && isSelected
-                ? 'border-transparent shadow-[0_0_20px_rgba(59,130,246,0.35),0_0_25px_rgba(168,85,247,0.45)] translate-y-0'
+                ? 'shadow-[0_0_20px_rgba(59,130,246,0.35),0_0_25px_rgba(168,85,247,0.45)] translate-y-0'
               : isAgentTarget
-                ? 'border-transparent shadow-[0_0_25px_rgba(168,85,247,0.45),0_20px_40px_-8px_rgba(0,0,0,0.18)] dark:shadow-[0_0_30px_rgba(168,85,247,0.55),0_24px_48px_-8px_rgba(0,0,0,0.65)] translate-y-0'
+                ? 'shadow-[0_0_25px_rgba(168,85,247,0.45),0_20px_40px_-8px_rgba(0,0,0,0.18)] dark:shadow-[0_0_30px_rgba(168,85,247,0.55),0_24px_48px_-8px_rgba(0,0,0,0.65)] translate-y-0'
                 : isSelected 
-                  ? 'border-transparent shadow-[0_20px_40px_-8px_rgba(0,0,0,0.2),0_12px_24px_-6px_rgba(0,0,0,0.12)] dark:shadow-[0_24px_48px_-8px_rgba(0,0,0,0.6)] translate-y-0' 
+                  ? 'shadow-[0_20px_40px_-8px_rgba(0,0,0,0.2),0_12px_24px_-6px_rgba(0,0,0,0.12)] dark:shadow-[0_24px_48px_-8px_rgba(0,0,0,0.6)] translate-y-0' 
                   : isPickerTarget
-                    ? 'border-transparent shadow-[0_20px_40px_-8px_rgba(0,0,0,0.2),0_12px_24px_-6px_rgba(0,0,0,0.12)] dark:shadow-[0_24px_48px_-8px_rgba(0,0,0,0.6)]'
+                    ? 'shadow-[0_20px_40px_-8px_rgba(0,0,0,0.2),0_12px_24px_-6px_rgba(0,0,0,0.12)] dark:shadow-[0_24px_48px_-8px_rgba(0,0,0,0.6)]'
                     : isPickerSelectable
-                      ? 'border border-gray-300 dark:border-neutral-600 shadow-[0_1px_3px_rgba(0,0,0,0.1)] translate-y-0 hover:shadow-[0_8px_16px_rgba(59,130,246,0.25)] hover:border-blue-400 dark:hover:border-blue-400/80 hover:outline hover:outline-2 hover:outline-blue-400/50 cursor-pointer'
-                      : 'border border-gray-200/90 dark:border-[#404040]/90 shadow-[0_1px_2px_rgba(0,0,0,0.06),0_0_1px_rgba(0,0,0,0.08)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)] translate-y-0 hover:shadow-[0_3px_8px_rgba(0,0,0,0.08)] hover:border-gray-300 dark:hover:border-neutral-600'
+                      ? 'ring-1 ring-inset ring-gray-300 dark:ring-neutral-600 shadow-[0_1px_3px_rgba(0,0,0,0.1)] translate-y-0 hover:shadow-[0_8px_16px_rgba(59,130,246,0.25)] hover:ring-blue-400 dark:hover:ring-blue-400/80 hover:outline hover:outline-2 hover:outline-blue-400/50 cursor-pointer'
+                      : 'ring-1 ring-inset ring-gray-200/90 dark:ring-[#404040]/90 shadow-[0_1px_2px_rgba(0,0,0,0.06),0_0_1px_rgba(0,0,0,0.08)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)] translate-y-0 hover:shadow-[0_3px_8px_rgba(0,0,0,0.08)] hover:ring-gray-300 dark:hover:ring-neutral-600'
           }`}
           style={{ 
             width: w, 
@@ -4708,14 +4709,18 @@ export const GenerationCard = React.memo(function GenerationCard({
               <span className="w-1.5 h-1.5 rounded-full bg-white animate-ping" />
               <span className="text-white text-[10px] font-bold tracking-wide whitespace-nowrap">
                 {agentFocusRole === 'interact'
-                  ? 'Mira 正在操作'
+                  ? (isAgentThinking ? 'Mira 正在思考' : 'Mira 正在操作')
                   : agentFocusRole === 'working' 
-                    ? ((data.state === 'generating' || isAgentThinking) ? 'Mira 正在思考' : 'Mira 正在操作') 
+                    ? (data.state === 'generating' 
+                        ? 'Mira 正在生成' 
+                        : isAgentThinking 
+                          ? 'Mira 正在思考' 
+                          : 'Mira 正在操作') 
                     : agentFocusRole === 'reference' 
                       ? 'Mira 参考素材' 
                       : agentFocusRole === 'inspect' 
                         ? (agentInspectScenario === 'qc' ? 'Mira 正在质检' : agentInspectScenario === 'compare' ? 'Mira 正在对照' : 'Mira 正在查看') 
-                        : 'Mira 正在操作'}
+                        : (isAgentThinking ? 'Mira 正在思考' : 'Mira 正在操作')}
               </span>
             </div>
           </div>
@@ -5287,7 +5292,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       {/* Bottom Layer: Light Panel (Always rendered for generation cards) */}
       {shouldRenderBottomPanel && (
       <div 
-        className={`generation-card-bottom-panel relative pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 ${isLowLodSkeleton ? 'rounded-none' : 'squircle'} p-4 gap-2 w-[480px] border border-gray-200/80 dark:border-[#404040] cursor-default self-start transform-gpu [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
+        className={`generation-card-bottom-panel relative pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 squircle p-4 gap-2 w-[480px] border border-gray-200/80 dark:border-[#404040] cursor-default self-start transform-gpu [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
         isSelected 
           ? 'shadow-[0_16px_36px_-6px_rgba(0,0,0,0.12),0_8px_16px_-4px_rgba(0,0,0,0.06)] dark:shadow-[0_20px_40px_-6px_rgba(0,0,0,0.45)]' 
           : 'shadow-[0_1px_3px_rgba(0,0,0,0.05),0_1px_2px_rgba(0,0,0,0.03)] dark:shadow-none'
@@ -5863,53 +5868,6 @@ export const GenerationCard = React.memo(function GenerationCard({
         </div>
         </div>
 
-        {/* Low-LOD Skeleton Component: Overlay Layer on top, cross-fades opacity from 1 down to 0 over 400ms */}
-        <div 
-          className={`generation-card-bottom-panel-skeleton lod-crossfade absolute inset-0 z-10 p-4 rounded-none bg-gray-100 dark:bg-neutral-800 flex flex-col gap-3 select-none transition-opacity duration-400 ease-out ${
-            isLowLodSkeleton ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
-          }`}
-          aria-hidden={!isLowLodSkeleton}
-        >
-          {/* Reference images skeleton blocks - sharp right-angle */}
-          <div className="flex items-center gap-2 flex-wrap w-full">
-            {refList.map((_, idx) => (
-              <div key={idx} className="w-12 h-12 rounded-none bg-gray-200/80 dark:bg-neutral-700/60 flex-shrink-0" />
-            ))}
-            <div className="w-12 h-12 rounded-none border-2 border-dashed border-gray-300/80 dark:border-neutral-700/60 flex-shrink-0" />
-          </div>
-
-          {/* Text lines skeleton blocks - sharp right-angle */}
-          {(() => {
-            const promptH = getPromptAreaHeight(localPrompt);
-            const totalLines = calculatePromptLines(localPrompt);
-            const displayLineCount = Math.max(1, Math.min(13, Math.round(promptH / 22)));
-            return (
-              <div 
-                className="relative w-full flex flex-col justify-center gap-1.5 mt-1"
-                style={{ height: promptH }}
-              >
-                {Array.from({ length: displayLineCount }).map((_, i) => (
-                  <div
-                    key={i}
-                    className={`h-3.5 bg-gray-200/90 dark:bg-neutral-700/80 rounded-none ${
-                      i === displayLineCount - 1 && displayLineCount > 1 ? 'w-[55%]' : 'w-[92%]'
-                    }`}
-                  />
-                ))}
-              </div>
-            );
-          })()}
-
-          {/* Controls skeleton bar - sharp right-angle */}
-          <div className="flex items-center justify-between mt-2 pt-2 border-t border-gray-200/60 dark:border-neutral-700/50">
-            <div className="flex items-center gap-2">
-              <div className="h-7 w-16 bg-gray-200/80 dark:bg-neutral-700/60 rounded-none" />
-              <div className="h-7 w-20 bg-gray-200/80 dark:bg-neutral-700/60 rounded-none" />
-              <div className="h-7 w-14 bg-gray-200/80 dark:bg-neutral-700/60 rounded-none" />
-            </div>
-            <div className="w-8 h-8 rounded-none bg-gray-200/90 dark:bg-neutral-700/80" />
-          </div>
-        </div>
       </div>
       )}
       </motion.div>

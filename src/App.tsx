@@ -8,10 +8,11 @@ import { NanoLodCanvas } from './components/NanoLodCanvas';
 import { FpsCounter } from './components/FpsCounter';
 import { generateImageThumbnail, generateVideoThumbnail, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
 import { fastGetImageDimensions } from './utils/imageHeader';
-import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold } from './utils/viewportCulling';
+import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
 import { buildCardQuadTree, QuadTree, BoundingBox } from './utils/quadTree';
 import { getBottomPanelHeight } from './utils/cardLayout';
 import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
+import { cropBoundingBoxFromImage } from './utils/imageCropper';
 import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp } from 'lucide-react';
 import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
 import { SettingsPage } from './components/SettingsPage';
@@ -758,6 +759,17 @@ export default function App() {
     if (!s) return false;
     const clean = s.trim();
     if (!clean) return false;
+    if (
+      clean.includes('正在操作') || 
+      clean.includes('正在标注') || 
+      clean.includes('正在生成') || 
+      clean.includes('排队渲染') ||
+      clean.includes('正在查看') ||
+      clean.includes('正在对照') ||
+      clean.includes('正在质检')
+    ) {
+      return false;
+    }
     return (
       clean === '...' ||
       clean === '…' ||
@@ -767,10 +779,7 @@ export default function App() {
       clean === '正在思考' ||
       clean === '图生好了，我先看下...' ||
       clean === '图生好了，我先看下' ||
-      clean.endsWith('...') ||
-      clean.endsWith('…') ||
       clean.includes('正在思考') ||
-      clean.includes('排队渲染') ||
       clean.includes('正在拉取')
     );
   }, []);
@@ -1784,11 +1793,108 @@ export default function App() {
                 createdAt: Date.now(),
               })) : []);
 
+          // 🛡️ Silent Internal Self-Check & Atomic Delete-and-Append Re-Annotation Pipeline
+          // Operates purely in-memory on original image data, completely transparent to Agent and User
+          let verifiedElements: VisualElementAnnotation[] = [];
+          const rawImageSource = targetCard.trueOriginalFileData || targetCard.originalFileData || targetCard.fileData || effectiveUrl;
+
+          for (const elem of detectedElements) {
+            const bbox = elem.box || (elem as any).box_2d;
+            if (!bbox || !Array.isArray(bbox) || bbox.length !== 4) {
+              // Without bbox, keep element as centroid point annotation
+              verifiedElements.push(elem);
+              continue;
+            }
+
+            try {
+              // Step 1: In-Memory Bounding Box Cropping from raw image source
+              const cropResult = await cropBoundingBoxFromImage(rawImageSource, bbox as [number, number, number, number], {
+                paddingPercent: 0.05,
+                maxOutputDimension: 640
+              });
+
+              if (!cropResult?.dataUrl) {
+                // If crop fails technically, keep element to avoid accidental drops
+                verifiedElements.push(elem);
+                continue;
+              }
+
+              // Step 2: Crop Verification Sub-Model Call
+              const verifyRes = await fetch('/api/agent/verify-landmark-crop', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  cropDataUrl: cropResult.dataUrl,
+                  label: elem.label,
+                  description: elem.description,
+                  model: modelToUse,
+                  apiKey: apiKeyToSend || undefined
+                })
+              });
+
+              const verifyData = verifyRes.ok ? await verifyRes.json() : { match: true };
+
+              if (verifyData.match !== false) {
+                // Verified successfully! Keep into resolved set
+                verifiedElements.push(elem);
+              } else {
+                // Verification Failed: Execute Atomic "Delete & Append" Strategy
+                // (First discard the inaccurate bbox, then re-query model focused exclusively on this single target)
+                console.info(`[AnnotationSelfCheck] "${elem.label}" failed crop verification (${verifyData.reason || 'not matched'}), triggering single-target re-annotation...`);
+                
+                const reAnnotateRes = await fetch('/api/agent/detect-single-landmark', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    imageUrl: effectiveUrl,
+                    label: elem.label,
+                    description: elem.description,
+                    model: modelToUse,
+                    apiKey: apiKeyToSend || undefined
+                  })
+                });
+
+                if (reAnnotateRes.ok) {
+                  const reData = await reAnnotateRes.json();
+                  if (reData.found && Array.isArray(reData.box_2d) && reData.box_2d.length === 4) {
+                    const [ymin, xmin, ymax, xmax] = reData.box_2d;
+                    const cx = Math.round(((xmin + xmax) / 2) * 10) / 10;
+                    const cy = Math.round(((ymin + ymax) / 2) * 10) / 10;
+
+                    // Append refined high-precision target replacing the discarded one
+                    verifiedElements.push({
+                      ...elem,
+                      box: reData.box_2d,
+                      point: { x: cx, y: cy },
+                      description: reData.description || elem.description,
+                      source: 'ai_detected' as const
+                    });
+                    console.info(`[AnnotationSelfCheck] Successfully recovered single-target "${elem.label}" with refined box!`);
+                  } else {
+                    // Re-annotation failed or target truly absent: quietly discard, do not bother user or agent
+                    console.info(`[AnnotationSelfCheck] Discarded unverified phantom annotation "${elem.label}".`);
+                  }
+                } else {
+                  // Fallback: quietly discard the failed candidate
+                  console.info(`[AnnotationSelfCheck] Discarded failed candidate "${elem.label}".`);
+                }
+              }
+            } catch (checkErr) {
+              console.warn('[AnnotationSelfCheck] Non-fatal check error, preserving element:', checkErr);
+              verifiedElements.push(elem);
+            }
+          }
+
+          // If self-check filtered all but detected had items, retain detected as safe fallback
+          if (verifiedElements.length === 0 && detectedElements.length > 0) {
+            verifiedElements = detectedElements;
+          }
+
           const mode = options.mode || 'overwrite';
-          let finalElements = detectedElements;
+          let finalElements = verifiedElements;
           if (mode === 'append' && currentElements.length > 0) {
             const existingIds = new Set(currentElements.map(e => e.id));
-            const newToAdd = detectedElements.map(e => {
+            const newToAdd = verifiedElements.map(e => {
               if (existingIds.has(e.id)) {
                 return { ...e, id: `${e.id}_${Date.now().toString(36)}` };
               }
@@ -3166,6 +3272,7 @@ export default function App() {
   // Uses O(log N + K) QuadTree spatial index to rapidly query visible cards out of 25,000+ items in < 0.05ms.
   const [visibleCardIdSet, setVisibleCardIdSet] = useState<Set<string>>(() => new Set());
   const mountFrameCounterRef = useRef<number>(0);
+  const lastFrameDurationRef = useRef<number>(0);
   const quadTreeRef = useRef<QuadTree<CardData> | null>(null);
 
   // Synchronize QuadTree spatial index on cards change
@@ -5262,6 +5369,7 @@ export default function App() {
               }],
             }));
             try {
+              setIsAgentThinking(true);
               if (!isProcessingInspectQueueRef.current) {
                 setAgentState(prev => ({ ...prev, speak: '...', visible: true }));
               }
@@ -5303,14 +5411,20 @@ export default function App() {
                 const parsedShort = parsed.shortText || parsed.fullText || rawSpeech;
                 setAgentState(prev => ({ ...prev, speak: parsedShort, visible: true }));
               } else if (isAgentRunningRef.current) {
-                // Keep the thinking state active during multi-turn cycles and tool execution
-                setAgentState(prev => ({ ...prev, speak: "正在思考...", visible: true }));
+                const hasPendingToolCalls = Array.isArray(result.toolCalls) && result.toolCalls.length > 0;
+                setAgentState(prev => ({ 
+                  ...prev, 
+                  speak: hasPendingToolCalls ? "正在操作..." : "正在思考...", 
+                  visible: true 
+                }));
               } else {
                 setAgentState(prev => (isThinkingOrLoadingPhrase(prev.speak) ? { ...prev, speak: undefined } : prev));
               }
               
+              setIsAgentThinking(false);
               return result;
             } catch (error) {
+              setIsAgentThinking(false);
               if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) {
                 return { narration: [], toolCalls: [], complete: false };
               }
@@ -5330,6 +5444,27 @@ export default function App() {
             }
           },
           executeTool: async (call, task, signal) => {
+            setIsAgentThinking(false);
+
+            // Synchronize active operation text during tool execution
+            let actionSpeak = '正在操作...';
+            if (call.name === 'card.annotateElements' || call.name === 'card.detectLandmarks') {
+              actionSpeak = '正在标注画面元素...';
+            } else if (call.name === 'card.generate') {
+              actionSpeak = '正在生成新卡片...';
+            } else if (call.name === 'card.inspect' || call.name === 'page.inspect') {
+              actionSpeak = '正在观察画面...';
+            } else if (call.name === 'ui.actAndObserve' || call.name.startsWith('mouse.')) {
+              actionSpeak = '正在操作界面...';
+            }
+
+            setAgentState(prev => {
+              if (!prev.speak || isThinkingOrLoadingPhrase(prev.speak) || prev.speak === '正在思考...') {
+                return { ...prev, speak: actionSpeak, visible: true };
+              }
+              return prev;
+            });
+
             const output = await executeAgentTool(call, task, signal);
             if (signal?.aborted) return output;
 
@@ -6618,12 +6753,13 @@ export default function App() {
     return cards.filter(card => visibleCardIdSet.has(card.id));
   }, [cards, visibleCardIdSet, tx, ty, tScale]);
 
-  // --- Strictly Frame-Based Progressive LOD Mounting Engine ---
-  // Guarantees 60fps zooming and panning fluid motion by budgeting DOM node mounting per frame (rAF).
+  // --- Density & FPS-Adaptive Progressive LOD Mounting Engine ---
+  // Adapts DOM node mounting strategy dynamically based on viewport card complexity weight and real-time frame rate:
   // 1. Under Nano-LOD (scale < threshold): NanoLodCanvas renders 2D canvas thumbnails underneath (0 DOM cards).
-  // 2. While actively dragging/zooming (gesture active): Mounts at a steady 1 card / frame budget.
-  // 3. When idle / static: Adaptive frame quotas (Macro: 1/frame, Standard: 2/frame, Micro: 3/frame).
-  // 4. Mounts progressively starting from the center of the viewport outwards.
+  // 2. High Complexity Weight / Low FPS (< 50 FPS / > 20ms frame time): DOM card mounting is paused while actively dragging/zooming to prevent layout reflows,
+  //    and mounts in frame-budgeted batches as soon as drag/zoom stops. Cards with prompt panels add extra weight so even a few cause pauses.
+  // 3. Low Complexity Weight & High FPS (>= 55 FPS): Instant streaming batch loading during active drag/zoom (2 cards every 2 frames)
+  //    so sparse cards render immediately with zero delay.
   useEffect(() => {
     if (!isDomCardsActive || isZoomAnimationActive) {
       if (!isDomCardsActive) {
@@ -6633,18 +6769,26 @@ export default function App() {
     }
 
     const isGestureActive = isZooming || isDraggingCanvasRef.current || document.getElementById('canvas-workspace')?.getAttribute('data-gesture') === 'true';
+    const renderWeight = calculateTotalRenderWeight(visibleCards);
+    const isFrameDrop = lastFrameDurationRef.current > 20.0; // Frame time > 20ms (FPS < 50)
+    const isHighDensity = renderWeight > HIGH_RENDER_WEIGHT_THRESHOLD || isFrameDrop;
+
+    // High Density / Heavy DOM / Low FPS + Active Gesture: Pause DOM mounting and culling cleanup to protect 60fps gesture smoothness
+    if (isGestureActive && isHighDensity) {
+      return;
+    }
 
     const visibleIds = new Set(visibleCards.map(c => c.id));
     const pendingCards = visibleCards.filter(c => !renderedCardIds.has(c.id));
     const hasCulled = Array.from(renderedCardIds).some(id => !visibleIds.has(id));
 
-    // If no new cards need mounting and no culled cards need unmounting (when not gesturing), we are settled
-    if (pendingCards.length === 0 && (!hasCulled || isGestureActive)) {
+    // If no new cards need mounting and no culled cards need unmounting, we are settled
+    if (pendingCards.length === 0 && !hasCulled) {
       return;
     }
 
-    // When NOT gesturing, if only culled cards need unmounting, clean them up immediately
-    if (pendingCards.length === 0 && hasCulled && !isGestureActive) {
+    // If only culled cards need unmounting after gesture stops (or during low density), clean them up
+    if (pendingCards.length === 0 && hasCulled) {
       setRenderedCardIds(prev => {
         const next = new Set<string>();
         for (const id of prev) {
@@ -6658,12 +6802,13 @@ export default function App() {
     let rafId: number;
 
     const mountStep = () => {
+      const frameStartTime = performance.now();
       mountFrameCounterRef.current++;
       const frameIndex = mountFrameCounterRef.current;
       const scaleVal = tScale.get() || 1;
-      const quota = getLodMountQuota(scaleVal, isGestureActive, frameIndex);
+      const quota = getLodMountQuota(scaleVal, isGestureActive, frameIndex, renderWeight, lastFrameDurationRef.current);
       if (quota <= 0) {
-        if (!isGestureActive && pendingCards.length > 0) {
+        if (pendingCards.length > 0) {
           rafId = requestAnimationFrame(mountStep);
         }
         return;
@@ -6692,22 +6837,36 @@ export default function App() {
         return distA - distB;
       });
 
-      const batchToMount = sortedPending.slice(0, quota).map(c => c.id);
+      const effectiveQuota = quota;
 
-      setRenderedCardIds(prev => {
-        const next = new Set<string>(prev);
-        // During gestures, keep existing mounted cards to avoid DOM relayout storms
-        if (!isGestureActive) {
-          next.clear();
+      // Time-Sliced Queue: take cards up to effectiveQuota, or yield early if frame budget (FRAME_BUDGET_MS) is exceeded
+      const batchToMount: string[] = [];
+      for (const card of sortedPending) {
+        if (batchToMount.length >= effectiveQuota) break;
+        batchToMount.push(card.id);
+        if (performance.now() - frameStartTime >= FRAME_BUDGET_MS) {
+          // Exceeded single-frame budget -> defer remaining cards in queue to next rAF frame ("推迟排队模式")
+          break;
+        }
+      }
+
+      if (batchToMount.length > 0) {
+        setRenderedCardIds(prev => {
+          const next = new Set<string>();
+          // Keep existing visible cards
           for (const id of prev) {
             if (visibleIds.has(id)) next.add(id);
           }
-        }
-        for (const id of batchToMount) {
-          next.add(id);
-        }
-        return next;
-      });
+          // Mount new batch of cards
+          for (const id of batchToMount) {
+            next.add(id);
+          }
+          return next;
+        });
+      }
+
+      // Record frame step processing time
+      lastFrameDurationRef.current = performance.now() - frameStartTime;
     };
 
     rafId = requestAnimationFrame(mountStep);
@@ -6958,7 +7117,7 @@ export default function App() {
       {/* Canvas Workspace for Nodes/Cards */}
       <motion.div 
         id="canvas-workspace"
-        className={`absolute top-0 left-0 transform-gpu group/canvas z-0 ${isZooming || isDraggingCanvasRef.current || isTweenZooming ? 'will-change-transform' : ''}`}
+        className={`absolute top-0 left-0 transform-gpu group/canvas ${isOverviewMode ? 'z-20' : 'z-0'} ${isZooming || isDraggingCanvasRef.current || isTweenZooming ? 'will-change-transform' : ''}`}
         data-zooming={isZooming ? 'true' : undefined}
         data-scale-micro={isMicroLod ? 'true' : undefined}
         data-scale-nano={isNanoLod ? 'true' : undefined}
@@ -7004,7 +7163,7 @@ export default function App() {
               isAgentTarget={isAgentTarget}
               agentFocusRole={agentFocusRole}
               agentInspectScenario={agentInspectScenario}
-              isAgentThinking={isAgentThinking || isAgentRunning}
+              isAgentThinking={isAgentThinking}
               isZooming={isZooming}
               allCards={cards}
               currentProject={currentProject}
@@ -7154,6 +7313,7 @@ export default function App() {
         isIdle={true}
         isZooming={isZooming}
         isAgentRunning={isAgentRunning || isProcessingInspectQueueRef.current || isAgentThinking}
+        isAgentThinking={isAgentThinking}
         selectedCards={activeSelectedCards}
         isDarkMode={isDarkMode}
         quickInput={
@@ -7218,10 +7378,11 @@ export default function App() {
                         role: 'working',
                         referenceRole: 'reference',
                         sourceTool: 'quick_input',
-                        cursorMode: 'working',
+                        cursorMode: 'default',
                       });
                     } else {
                       agentFocusManager.setPrimaryFocus(currentTarget, 'working', 'quick_input');
+                      agentFocusManager.setCursorMode('default');
                     }
                     await handleCardAgentChat(currentTarget, prompt);
                   } else {
@@ -7460,10 +7621,11 @@ export default function App() {
                       role: 'working',
                       referenceRole: 'reference',
                       sourceTool: 'context_menu',
-                      cursorMode: 'working',
+                      cursorMode: 'default',
                     });
                   } else {
                     agentFocusManager.setPrimaryFocus(currentTarget, 'working', 'context_menu');
+                    agentFocusManager.setCursorMode('default');
                   }
                   await handleCardAgentChat(currentTarget, prompt);
                 } else {

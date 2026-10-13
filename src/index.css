@@ -222,7 +222,6 @@
     opacity: 1;
   }
 }
-
 /* Initial card mount smooth fade-in for tags */
 .card-tag-fade-in {
   animation: card-tag-enter 350ms cubic-bezier(0.16, 1, 0.3, 1) forwards;

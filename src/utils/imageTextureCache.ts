@@ -52,7 +52,9 @@ export function getOrLoadCanvasImage(
 
   // Create and load image
   const img = new Image();
-  img.crossOrigin = 'anonymous';
+  if (!url.startsWith('data:') && !url.startsWith('blob:')) {
+    img.crossOrigin = 'anonymous';
+  }
   img.referrerPolicy = 'no-referrer';
 
   if (onLoaded) {

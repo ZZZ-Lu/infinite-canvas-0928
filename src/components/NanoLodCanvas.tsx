@@ -62,8 +62,10 @@ function drawCardBottomPanel(
   borderSelected: string,
   borderNormal: string,
   selectedLineWidth: number,
-  normalLineWidth: number
+  normalLineWidth: number,
+  alpha: number = 1.0
 ) {
+  if (alpha <= 0.001) return;
   const panelW = 480;
 
   const refCount = card.referenceImages?.length || 0;
@@ -78,26 +80,32 @@ function drawCardBottomPanel(
   const panelX = cardX + (cardW - panelW) / 2;
   const panelY = cardY + cardH + 12; // 12px gap matching flex flex-col gap-3 in DOM
 
+  ctx.save();
+  if (alpha < 1.0) {
+    ctx.globalAlpha = (ctx.globalAlpha || 1.0) * alpha;
+  }
+
   // Background fill (sharp right-angle corners for low LOD style)
   ctx.fillStyle = dark ? '#262626' : '#f3f4f6';
   ctx.beginPath();
   ctx.rect(panelX, panelY, panelW, panelH);
   ctx.fill();
 
-  // Border
+  // Border (matching card and panel perimeter bounds)
   ctx.strokeStyle = isSelected ? borderSelected : borderNormal;
-  ctx.lineWidth = isSelected ? selectedLineWidth : normalLineWidth;
+  const currentLw = isSelected ? selectedLineWidth : normalLineWidth;
+  ctx.lineWidth = currentLw;
   ctx.strokeRect(panelX, panelY, panelW, panelH);
 
   // Internal skeleton color blocks
   ctx.fillStyle = dark ? '#383838' : '#e2e8f0';
   let curY = panelY + 17; // 1px border + 16px padding
 
-  // 1) Reference images skeleton (sharp right-angle blocks)
+  // 1) Reference images skeleton (sharp right-angle blocks, 17px padding matching 1px border + 16px padding)
   for (let r = 0; r < refRows; r++) {
     const itemsInRow = Math.min(refCount + 1 - r * 8, 8);
     for (let i = 0; i < itemsInRow; i++) {
-      const rx = panelX + 16 + i * 56;
+      const rx = panelX + 17 + i * 56;
       const ry = curY + r * 56;
       ctx.beginPath();
       ctx.rect(rx, ry, 48, 48);
@@ -106,24 +114,26 @@ function drawCardBottomPanel(
   }
   curY += (refRows * 56 - 8) + 16; // ref items height + gap-3 (12px) + mt-1 (4px)
 
-  // 2) Prompt text skeleton lines (sharp right-angle lines)
+  // 2) Prompt text skeleton lines (sharp right-angle lines, 17px padding matching 1px border + 16px padding)
   const textTopOffset = curY + (promptAreaHeight - displayLineCount * 18) / 2;
   for (let i = 0; i < displayLineCount; i++) {
-    const lw = (i === displayLineCount - 1 && displayLineCount > 1) ? panelW * 0.55 : panelW * 0.85;
+    const lw = (i === displayLineCount - 1 && displayLineCount > 1) ? (panelW - 34) * 0.58 : (panelW - 34) * 0.88;
     ctx.beginPath();
-    ctx.rect(panelX + 16, textTopOffset + i * 22, lw, 14);
+    ctx.rect(panelX + 17, textTopOffset + i * 22, lw, 14);
     ctx.fill();
   }
 
-  // 3) Controls bottom bar & generate button (sharp right-angle)
+  // 3) Controls bottom bar & generate button (sharp right-angle, 17px padding matching 1px border + 16px padding)
   const actionBarY = panelY + panelH - 17 - 32;
   ctx.beginPath();
-  ctx.rect(panelX + 16, actionBarY + 2, 140, 28);
+  ctx.rect(panelX + 17, actionBarY + 2, 140, 28);
   ctx.fill();
 
   ctx.beginPath();
-  ctx.rect(panelX + panelW - 48, actionBarY, 32, 32);
+  ctx.rect(panelX + panelW - 49, actionBarY, 32, 32);
   ctx.fill();
+
+  ctx.restore();
 }
 
 export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function NanoLodCanvas({
@@ -147,6 +157,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafIdRef = useRef<number | null>(null);
+  const cardPanelFadeMapRef = useRef<Map<string, number>>(new Map());
   const pendingThumbGenRef = useRef<Set<string>>(new Set());
   const bakedSnapshotRef = useRef<BakedSnapshot | null>(null);
   const quadTreeRef = useRef<QuadTree<CardData> | null>(null);
@@ -338,7 +349,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         offCtx.strokeRect(card.x, card.y, dim.width, dim.height);
       } else {
         offCtx.strokeStyle = isSelected ? borderSelected : borderNormal;
-        offCtx.lineWidth = isSelected ? selectedLineWidth : normalLineWidth;
+        const currentLw = isSelected ? selectedLineWidth : normalLineWidth;
+        offCtx.lineWidth = currentLw;
         offCtx.strokeRect(card.x, card.y, dim.width, dim.height);
       }
 
@@ -471,6 +483,13 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     const selectedLineWidth = 2 / currentScale;
     const pickerSelectedLineWidth = 4 / currentScale;
 
+    const threshold = getNanoLodThreshold();
+    let hasActiveFadingCard = false;
+    const now = performance.now();
+    if (currentScale < threshold) {
+      cardPanelFadeMapRef.current.clear();
+    }
+
     // First pass: Draw unselected cards
     // Second pass: Draw selected cards on top to avoid border occlusion
     const unselectedCards: CardData[] = [];
@@ -534,12 +553,74 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     }
 
     const renderCard = (card: CardData) => {
-      // In scale >= threshold, if this card is already mounted in the DOM, AND has been fully painted/loaded,
-      // skip drawing it on Canvas (Zero-Flicker Handoff)
+      const dim = getCardSize(card);
+
+      // --- CALCULATE REALTIME NANO DRAGGING OFFSET ---
+      let cardX = card.x;
+      let cardY = card.y;
+      if (dragging) {
+        const isThisDragging = dragging.isDraggingSelected 
+          ? dragging.selectedCardIds.includes(card.id) 
+          : card.id === dragging.cardId;
+        if (isThisDragging) {
+          cardX += dragging.dx;
+          cardY += dragging.dy;
+        }
+      }
+
+      // In scale >= threshold, check if Standard LOD is already mounted and painted in DOM underneath
       const renderedSet = renderedIdsRef.current;
       const paintedSet = typeof window !== 'undefined' ? (window as any).__paintedCardIds : null;
       const isPainted = !paintedSet || paintedSet.has(card.id);
-      if (currentScale >= getNanoLodThreshold() && renderedSet && renderedSet.has(card.id) && isPainted) {
+      const isCardReadyInDom = currentScale >= threshold && Boolean(renderedSet && renderedSet.has(card.id) && isPainted);
+
+      // Determine per-card NanoLOD prompt panel alpha:
+      // NanoLOD stays 100% solid until Standard is loaded underneath.
+      // ONLY THEN does NanoLOD start its 400ms ease-out fade to reveal the loaded Standard LOD!
+      let cardPanelAlpha = 1.0;
+      if (currentScale >= threshold) {
+        if (!isCardReadyInDom) {
+          cardPanelAlpha = 1.0; // Standard is still loading underneath: keep NanoLOD solid!
+        } else {
+          let startTime = cardPanelFadeMapRef.current.get(card.id);
+          if (startTime === undefined) {
+            startTime = now;
+            cardPanelFadeMapRef.current.set(card.id, startTime);
+          }
+          const elapsed = now - startTime;
+          if (elapsed >= 400) {
+            cardPanelAlpha = 0;
+          } else {
+            hasActiveFadingCard = true;
+            const progress = elapsed / 400;
+            cardPanelAlpha = Math.max(0, Math.pow(1 - progress, 3));
+          }
+        }
+      } else {
+        cardPanelAlpha = 1.0;
+      }
+
+      // If standard card is loaded in DOM, hand off card body (skip drawing thumbnail).
+      // If prompt panel is still in its 400ms fade-out window, draw the fading panel on canvas!
+      if (isCardReadyInDom) {
+        if (cardPanelAlpha > 0 && !card.fileName && !card.isAsset) {
+          const isSelected = selectedIds.includes(card.id);
+          drawCardBottomPanel(
+            ctx,
+            card,
+            cardX,
+            cardY,
+            dim.width,
+            dim.height,
+            dark,
+            isSelected,
+            borderSelected,
+            borderNormal,
+            selectedLineWidth,
+            normalLineWidth,
+            cardPanelAlpha
+          );
+        }
         return;
       }
 
@@ -579,21 +660,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       }
       const isPickerSelected = pickerSelectionIndex > 0;
 
-      const dim = getCardSize(card);
       const screenW = dim.width * currentScale;
-
-      // --- CALCULATE REALTIME NANO DRAGGING OFFSET ---
-      let cardX = card.x;
-      let cardY = card.y;
-      if (dragging) {
-        const isThisDragging = dragging.isDraggingSelected 
-          ? dragging.selectedCardIds.includes(card.id) 
-          : card.id === dragging.cardId;
-        if (isThisDragging) {
-          cardX += dragging.dx;
-          cardY += dragging.dy;
-        }
-      }
 
       const hasMedia = Boolean(
         card.thumbnailUrl ||
@@ -720,7 +787,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
       // 3b. Bottom Panel Skeleton Color Block for Generation Cards in 2D Canvas Mode
       const isGenerationCard = !card.fileName && !card.isAsset;
-      if (isGenerationCard) {
+      if (isGenerationCard && cardPanelAlpha > 0) {
         drawCardBottomPanel(
           ctx,
           card,
@@ -733,7 +800,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
           borderSelected,
           borderNormal,
           selectedLineWidth,
-          normalLineWidth
+          normalLineWidth,
+          cardPanelAlpha
         );
       }
 
@@ -840,6 +908,10 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     if (onReadyRef.current) {
       onReadyRef.current();
     }
+
+    if (hasActiveFadingCard) {
+      scheduleDraw();
+    }
   };
 
   const scheduleDraw = () => {
@@ -917,7 +989,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     <canvas
       ref={canvasRef}
       id="nano-lod-canvas"
-      className="fixed inset-0 pointer-events-none z-0"
+      className={`fixed inset-0 pointer-events-none ${isOverviewMode ? 'z-0' : 'z-[15]'}`}
       style={{
         width: '100vw',
         height: '100vh',

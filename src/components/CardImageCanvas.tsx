@@ -122,9 +122,16 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     );
     const effectiveShowOriginal = showOriginal && !isGestureActive;
 
+    const screenDpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
+    const baseDpr = Math.max(screenDpr, currentDpr || screenDpr);
+
+    // Dynamic resolution allocation:
+    // - Full LOD (!effectiveShowOriginal): proxy image is ~1200px max edge. Cap buffer to match proxy's resolution so all 1200px details are preserved.
+    // - Original LOD (effectiveShowOriginal): high-res original texture, allow up to 8.0 DPR for deep zoom.
+    const maxFullDpr = Math.max(screenDpr, 1200 / Math.max(w, h, 1));
     const actualDpr = effectiveShowOriginal
-      ? Math.min(Math.max(window.devicePixelRatio || 1, currentDpr), 8.0)
-      : (window.devicePixelRatio || 1);
+      ? Math.min(baseDpr, 8.0)
+      : Math.min(baseDpr, maxFullDpr);
 
     const targetPxW = Math.round(w * actualDpr);
     const targetPxH = Math.round(h * actualDpr);

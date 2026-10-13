@@ -84,24 +84,85 @@ export function getNanoLodThreshold(): number {
   return 0.40;
 }
 
+export const CARD_DENSITY_HIGH_THRESHOLD = 15; // Kept for backwards compatibility
+export const HIGH_RENDER_WEIGHT_THRESHOLD = 12; // Weight threshold where DOM cards start impacting reflow
+export const FRAME_BUDGET_MS = 3.5; // Strict JS budget per frame (3.5ms) ensuring React layout and paint have >13ms to guarantee 60 FPS
+
 /**
- * Dynamic LOD-Adaptive Mounting Quotas (Strictly Frame-Based, Ultra-Light Budget)
- * 
- * Returns the maximum number of DOM cards allowed to mount into the DOM for the given frame.
- * Prioritizes 60fps zooming and panning fluid motion by strictly budgeting DOM node mounting workload.
- * 
- * - Nano-LOD (scale < threshold): Quota is 0 (pure 2D Canvas rendering, 0 DOM cards).
- * - While actively zooming or dragging (gesture active): 1 card every 4 frames (0.25 card / frame).
- * - Micro-LOD (threshold <= scale < 1.00): 1 card every 2 frames (0.5 card / frame).
- * - Standard-LOD (1.00 <= scale < 2.00): 1 card every 2 frames (0.5 card / frame).
- * - Macro-LOD (scale >= 2.00): 1 card every 4 frames (0.25 card / frame).
+ * Calculates a rendering complexity weight for a card.
+ * Cards with prompt panels, textareas, and reference images have significantly higher DOM weight
+ * and layout reflow costs during pan/zoom gestures than simple image asset cards.
  */
-export function getLodMountQuota(scale: number, isGestureActive: boolean = false, frameIndex: number = 0): number {
-  if (scale < getNanoLodThreshold()) return 0;
-  if (isGestureActive) {
-    return frameIndex % 4 === 0 ? 1 : 0;
+export function calculateCardRenderWeight(card: CardBounds): number {
+  const isGenerationCard = !card.fileName && !card.isAsset;
+  if (!isGenerationCard) {
+    return 1; // Plain image or video card: lightweight DOM
   }
-  if (scale < 1.00) return frameIndex % 2 === 0 ? 1 : 0;
-  if (scale < 2.00) return frameIndex % 2 === 0 ? 1 : 0;
-  return frameIndex % 4 === 0 ? 1 : 0;
+  let weight = 2; // Base generation card
+  if (card.prompt || (card.referenceImages && card.referenceImages.length > 0)) {
+    weight += 3; // Generation card with active prompt/action panel
+  }
+  if (card.referenceImages && card.referenceImages.length > 0) {
+    weight += card.referenceImages.length; // Extra DOM nodes per reference image chip
+  }
+  return weight;
 }
+
+/**
+ * Calculates total render weight for a set of visible cards.
+ */
+export function calculateTotalRenderWeight(cards: CardBounds[]): number {
+  let total = 0;
+  for (let i = 0; i < cards.length; i++) {
+    total += calculateCardRenderWeight(cards[i]);
+  }
+  return total;
+}
+
+/**
+ * Calculates per-frame mounting quota based on scale, gesture state, card render complexity weight, and live frame duration.
+ * - High Density / High Render Weight or Low FPS (< 50 FPS / > 20ms frame delta): Pause mounting during active drag/zoom gestures
+ *   to protect 60fps, then execute frame-budgeted micro-batch loading once gesture stops.
+ * - Low Density / High FPS (>= 55 FPS): Perform instant streaming batch loading during active drag/zoom
+ *   (1 card every 2 frames) so sparse cards appear immediately without waiting for gesture end.
+ * - Gesture Stopped: Uses strict micro-quota (1 card per frame, or 1 card per 2 frames under low FPS) trading total load duration
+ *   for 60 FPS frame smoothness ("用时间换帧数").
+ */
+export function getLodMountQuota(
+  scale: number, 
+  isGestureActive: boolean = false, 
+  frameIndex: number = 0,
+  cardCountOrWeight: number = 0,
+  lastFrameDuration: number = 0
+): number {
+  if (scale < getNanoLodThreshold()) return 0;
+  return 1; // 1 card per frame under all circumstances
+}
+
+export const UNMOUNT_TARGET_DURATION_MS = 200; // Target duration (200ms) to complete progressive DOM card unmounting during High -> Low LOD switch
+
+/**
+ * Calculates per-frame unmounting quota based on time budget and remaining culled cards.
+ * High -> Low LOD transitions happen very quickly during large-scale zoom-out,
+ * so unmounting is time-budgeted to complete smoothly within targetDurationMs (default 200ms).
+ *
+ * @param remainingCulledCount Total number of culled cards still awaiting DOM removal
+ * @param elapsedMs Elapsed time in milliseconds since this unmount session began
+ * @param targetDurationMs Target completion duration in milliseconds
+ * @returns Number of cards to unmount in the current frame
+ */
+export function getLodUnmountQuota(
+  remainingCulledCount: number,
+  elapsedMs: number,
+  targetDurationMs: number = UNMOUNT_TARGET_DURATION_MS
+): number {
+  if (remainingCulledCount <= 0) return 0;
+  if (elapsedMs >= targetDurationMs) return remainingCulledCount;
+
+  const remainingTime = Math.max(16.6, targetDurationMs - elapsedMs);
+  const remainingFrames = Math.max(1, Math.ceil(remainingTime / 16.6));
+  return Math.max(1, Math.ceil(remainingCulledCount / remainingFrames));
+}
+
+
+
