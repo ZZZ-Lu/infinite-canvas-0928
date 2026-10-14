@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
-import { AgentCursor, buildDynamicSelectionPrompt } from './components/AgentCursor';
+import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
 import { AgentContextMenu } from './components/AgentContextMenu';
 import { GenerationCard, CardData, CARD_DIMENSIONS, getCardSize, safeParseJsonResponse, compressImageBlob, resolveReferenceToPayload, SubjectLandmarks, VisualElementAnnotation } from './components/GenerationCard';
 import { WORKRALLY_IMAGE_MODELS, WORKRALLY_IMAGE_TOOL } from './config/workrallyImageModels';
@@ -472,7 +472,7 @@ export default function App() {
   const isSpacePressedRef = useRef(false);
   const wheelZoomOutAccumulatorRef = useRef(0);
   const [showOverviewPromptToast, setShowOverviewPromptToast] = useState(false);
-  const [overviewPromptProgress, setOverviewPromptProgress] = useState(0);
+  const overviewProgressBarRef = useRef<HTMLDivElement | null>(null);
   const overviewToastTimerRef = useRef<NodeJS.Timeout | null>(null);
   const resetOverviewPromptRef = useRef<() => void>(() => {});
   const enterOverviewModeRef = useRef<() => void>(() => {});
@@ -735,13 +735,14 @@ export default function App() {
     isMoving: boolean;
     speak?: string;
     lastPrompt?: string;
+    lastPromptTargetId?: string | null;
     cursorMode?: 'default' | 'inspect' | 'working' | 'interact';
   }>(() => ({ 
     x: typeof window !== 'undefined' ? window.innerWidth - 80 : 0, 
     y: typeof window !== 'undefined' ? window.innerHeight - 150 : 0, 
     visible: true, 
-    isActive: false,
-    isMoving: false,
+    isActive: false, 
+    isMoving: false, 
     cursorMode: 'default',
   }));
   const [agentFocus, setAgentFocus] = useState<AgentFocusSnapshot>(() => agentFocusManager.getSnapshot());
@@ -754,6 +755,8 @@ export default function App() {
   const [isAgentRunning, setIsAgentRunning] = useState(false);
   const isAgentRunningRef = useRef(false);
   isAgentRunningRef.current = isAgentRunning;
+  const agentStateRef = useRef(agentState);
+  agentStateRef.current = agentState;
 
   const isThinkingOrLoadingPhrase = useCallback((s?: string) => {
     if (!s) return false;
@@ -803,13 +806,15 @@ export default function App() {
     agentFocusManager.clearAll(0);
     setAgentState(prev => {
       const needsSpeakReset = isThinkingOrLoadingPhrase(prev.speak);
-      if (needsSpeakReset || prev.cursorMode !== 'default' || prev.isActive || prev.isMoving) {
+      if (needsSpeakReset || prev.cursorMode !== 'default' || prev.isActive || prev.isMoving || prev.lastPrompt || prev.lastPromptTargetId) {
         return {
           ...prev,
           cursorMode: 'default',
           isActive: false,
           isMoving: false,
           speak: needsSpeakReset ? undefined : prev.speak,
+          lastPrompt: undefined,
+          lastPromptTargetId: undefined,
         };
       }
       return prev;
@@ -837,6 +842,40 @@ export default function App() {
     onAskResolve?: (answer: string) => void;
   } | null>(null);
   const [cardDrafts, setCardDrafts] = useState<Record<string, string>>({});
+  const [globalChatHistory, setGlobalChatHistory] = useState<Array<{
+    id: string;
+    role: 'user' | 'assistant';
+    text: string;
+    shortText?: string;
+    timestamp?: number;
+  }>>([]);
+
+  const getTargetContextHistory = useCallback((
+    targetId: string | null,
+    allCards: CardData[],
+    globalHistory: Array<{ id: string; role: 'user' | 'assistant'; text: string; shortText?: string }>
+  ): HudContextMessage | null => {
+    if (targetId) {
+      const card = allCards.find(c => c.id === targetId);
+      if (!card || !card.chatHistory || card.chatHistory.length === 0) return null;
+      const cleanHistory = card.chatHistory.filter(m => !m.text.includes('生好了，我先看下'));
+      const lastMsg = cleanHistory[cleanHistory.length - 1];
+      if (!lastMsg) return null;
+      return {
+        text: (lastMsg as any).shortText || lastMsg.text,
+        speaker: lastMsg.role === 'assistant' ? 'agent' : 'user',
+      };
+    } else {
+      if (!globalHistory || globalHistory.length === 0) return null;
+      const cleanHistory = globalHistory.filter(m => !m.text.includes('生好了，我先看下'));
+      const lastMsg = cleanHistory[cleanHistory.length - 1];
+      if (!lastMsg) return null;
+      return {
+        text: lastMsg.shortText || lastMsg.text,
+        speaker: lastMsg.role === 'assistant' ? 'agent' : 'user',
+      };
+    }
+  }, []);
 
   // Load drafts from IndexedDB on startup
   useEffect(() => {
@@ -856,13 +895,13 @@ export default function App() {
   useEffect(() => {
     const onDown = () => { isUserPointerDownRef.current = true; };
     const onUp = () => { isUserPointerDownRef.current = false; };
-    window.addEventListener('pointerdown', onDown);
-    window.addEventListener('pointerup', onUp);
-    window.addEventListener('pointercancel', onUp);
+    window.addEventListener('pointerdown', onDown, true);
+    window.addEventListener('pointerup', onUp, true);
+    window.addEventListener('pointercancel', onUp, true);
     return () => {
-      window.removeEventListener('pointerdown', onDown);
-      window.removeEventListener('pointerup', onUp);
-      window.removeEventListener('pointercancel', onUp);
+      window.removeEventListener('pointerdown', onDown, true);
+      window.removeEventListener('pointerup', onUp, true);
+      window.removeEventListener('pointercancel', onUp, true);
     };
   }, []);
 
@@ -2684,18 +2723,60 @@ export default function App() {
           setHistory({ past: [], present: processedSaved, future: [] });
           loadedProjectIdRef.current = currentProjectId;
 
-          // Asynchronously pre-generate 64px thumbnails for historical cards missing them
-          setTimeout(() => {
+          // Asynchronously pre-generate thumbnails for historical cards in an idle queue,
+          // batching all updates to avoid multiple React re-renders during project entry
+          const scheduleInitialThumbnails = () => {
             if (!mounted) return;
-            processedSaved.forEach(async (card) => {
-              if (!card.thumbnailUrl && (card.fileData || card.imageUrl || card.originalImageUrl)) {
+            const cardsNeedingThumb = processedSaved.filter(c => !c.thumbnailUrl && (c.fileData || c.imageUrl || c.originalImageUrl));
+            if (cardsNeedingThumb.length === 0) return;
+
+            let idx = 0;
+            const generatedBatch: Record<string, string> = {};
+
+            const processNext = async () => {
+              if (!mounted) return;
+              // If user is actively gesturing, defer until idle
+              if (
+                isUserPointerDownRef.current || 
+                (window as any).isDraggingCard || 
+                (window as any).__nanoDragging ||
+                isDraggingCanvasRef.current ||
+                isZoomingRef.current ||
+                document.getElementById('canvas-workspace')?.getAttribute('data-gesture') === 'true'
+              ) {
+                setTimeout(processNext, 1200);
+                return;
+              }
+
+              if (idx < cardsNeedingThumb.length) {
+                const card = cardsNeedingThumb[idx++];
                 const thumb = await getOrCreateMediaThumbnail(card);
-                if (thumb && mounted) {
-                  setCards(prev => prev.map(c => c.id === card.id ? { ...c, thumbnailUrl: thumb } : c), false);
+                if (thumb) {
+                  generatedBatch[card.id] = thumb;
+                }
+                // Yield to main thread via requestIdleCallback or setTimeout
+                if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
+                  (window as any).requestIdleCallback(processNext, { timeout: 1000 });
+                } else {
+                  setTimeout(processNext, 60);
+                }
+              } else {
+                // Batch commit all generated thumbnails in ONE single setCards call
+                const hasUpdates = Object.keys(generatedBatch).length > 0;
+                if (hasUpdates && mounted) {
+                  setCards(prev => prev.map(c => generatedBatch[c.id] ? { ...c, thumbnailUrl: generatedBatch[c.id] } : c), false);
                 }
               }
-            });
-          }, 300);
+            };
+
+            processNext();
+          };
+
+          if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
+            (window as any).requestIdleCallback(scheduleInitialThumbnails, { timeout: 2000 });
+          } else {
+            setTimeout(scheduleInitialThumbnails, 1000);
+          }
         } else {
           // If this is the default project, check if legacy un-scoped cards exist first
           let fallbackCards: CardData[] | null = null;
@@ -2904,6 +2985,41 @@ export default function App() {
         ...updates
       };
     }), shouldPush);
+  }, []);
+
+  // Batched thumbnail updates to prevent rapid re-rendering thrashing during gestures or load
+  const pendingThumbnailsRef = useRef<Map<string, string>>(new Map());
+  const thumbnailCommitTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const handleBatchThumbnailGenerated = useCallback((id: string, thumbnailUrl: string) => {
+    pendingThumbnailsRef.current.set(id, thumbnailUrl);
+    if (thumbnailCommitTimerRef.current) return;
+
+    const flushThumbnails = () => {
+      thumbnailCommitTimerRef.current = null;
+      if (pendingThumbnailsRef.current.size === 0) return;
+      // If user is actively gesturing, delay commit further to protect 60fps
+      if (
+        isDraggingCanvasRef.current || 
+        isZoomingRef.current || 
+        (window as any).isDraggingCard || 
+        (window as any).__nanoDragging ||
+        document.getElementById('canvas-workspace')?.getAttribute('data-gesture') === 'true' ||
+        document.getElementById('canvas-workspace')?.getAttribute('data-zooming') === 'true' ||
+        document.getElementById('canvas-workspace')?.getAttribute('data-panning') === 'true'
+      ) {
+        thumbnailCommitTimerRef.current = setTimeout(flushThumbnails, 800);
+        return;
+      }
+      const map = new Map<string, string>(pendingThumbnailsRef.current);
+      pendingThumbnailsRef.current.clear();
+      setCards(prev => prev.map(c => {
+        const thumb = map.get(c.id);
+        return thumb ? { ...c, thumbnailUrl: thumb } : c;
+      }), false);
+    };
+
+    thumbnailCommitTimerRef.current = setTimeout(flushThumbnails, 300);
   }, []);
 
   // Fork / Duplicate Card with intelligent collision avoidance and optional auto-generate
@@ -3288,14 +3404,33 @@ export default function App() {
       cullingThrottleTimerRef.current = null;
     }
 
+    // STRICT ZERO STATE-UPDATE DURING ACTIVE GESTURE:
+    // Panning or card dragging must never trigger React state updates (setVisibleCardIdSet)
+    // to protect 60fps gesture smoothness. Full culling sync happens on pointer up / style restore.
+    const isGestureActive = Boolean(
+      isDraggingCanvasRef.current ||
+      isZoomingRef.current ||
+      (window as any).isDraggingCard ||
+      (window as any).__nanoDragging ||
+      (typeof document !== 'undefined' && (
+        document.getElementById('canvas-workspace')?.getAttribute('data-gesture') === 'true' ||
+        document.getElementById('canvas-workspace')?.getAttribute('data-panning') === 'true' ||
+        document.getElementById('canvas-workspace')?.getAttribute('data-zooming') === 'true'
+      ))
+    );
+
+    if (!_forceImmediate && isGestureActive) {
+      return;
+    }
+
     const currentScale = tScale.get() || 1;
     const currentTx = tx.get();
     const currentTy = ty.get();
     const vpWidth = window.innerWidth;
     const vpHeight = window.innerHeight;
 
-    // Add scale-adaptive pre-load buffer zone
-    const buffer = Math.max(40, Math.min(150, Math.round(150 * Math.sqrt(currentScale))));
+    // Scale-adaptive pre-load buffer zone (300px~600px) to prevent boundary flickers
+    const buffer = Math.max(300, Math.min(600, Math.round(450 * Math.sqrt(currentScale))));
 
     // World coordinates query bounding box
     const queryBounds: BoundingBox = {
@@ -3522,6 +3657,11 @@ export default function App() {
 
   useEffect(() => {
     const unsub = tScale.on('change', (s) => {
+      // Strictly defer React state updates during active zoom/drag gestures.
+      // Eliminates the 60% scale boundary frame spike by avoiding React re-renders mid-gesture.
+      if (isZoomingRef.current || isDraggingCanvasRef.current) {
+        return;
+      }
       const threshold = getNanoLodThreshold();
       const isMicro = s < threshold;
       const isNano = s < threshold;
@@ -3541,8 +3681,11 @@ export default function App() {
     return unsub;
   }, [tScale, triggerLodFadeIn, cancelLodFade]);
 
-  // Set of DOM-mounted card IDs (asynchronous frame-budgeted progressive mounting)
+  // Set of DOM-mounted card IDs (Center-Out Sequential Queue)
   const [renderedCardIds, setRenderedCardIds] = useState<Set<string>>(() => new Set());
+  const renderedCardIdsRef = useRef<Set<string>>(renderedCardIds);
+  renderedCardIdsRef.current = renderedCardIds;
+  const wheelStopTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   const handleCardDrag = useCallback((id: string, dx: number, dy: number) => {
     // No-op. Real-time dragging is now fully handled in DOM by GenerationCard.tsx (Master-Slave architecture).
@@ -5015,17 +5158,24 @@ export default function App() {
       }
     }
     if (call.name === 'user.ask') {
-      const question = String(call.arguments.question || '需要您的确认或输入：');
-      task.negotiationLog.push({ role: 'agent', content: question, timestamp: Date.now() });
-      
-      const parsed = parseAgentCommunication(question);
-      const displayQuestion = parsed.shortText || parsed.fullText || question;
+      const currentSpeak = agentStateRef.current?.speak;
+      const rawQuestion = call.arguments?.question ? String(call.arguments.question) : '';
+      const parsedQuestion = rawQuestion ? parseAgentCommunication(rawQuestion) : null;
+      const fallbackQuestion = parsedQuestion?.shortText || parsedQuestion?.fullText || rawQuestion || '需要您的确认或输入：';
 
-      setAgentState(prev => ({
-        ...prev,
-        speak: displayQuestion,
-        visible: true,
-      }));
+      // 🌟 核心升级：优先直接沿用当前轮次模型已输出的【简版回答】（用户沟通简版），无需在工具调用中二度重复发问！
+      const hasValidCurrentSpeak = currentSpeak && !isThinkingOrLoadingPhrase(currentSpeak) && currentSpeak !== '正在思考...' && currentSpeak !== '正在操作...';
+      const displayQuestion = hasValidCurrentSpeak ? currentSpeak : fallbackQuestion;
+
+      task.negotiationLog.push({ role: 'agent', content: displayQuestion, timestamp: Date.now() });
+
+      if (!hasValidCurrentSpeak) {
+        setAgentState(prev => ({
+          ...prev,
+          speak: displayQuestion,
+          visible: true,
+        }));
+      }
 
       const targetCardId = task.cardContext?.cardId || task.cardContext?.targetId || agentFocus.primaryCardId || null;
 
@@ -5458,12 +5608,14 @@ export default function App() {
               actionSpeak = '正在操作界面...';
             }
 
-            setAgentState(prev => {
-              if (!prev.speak || isThinkingOrLoadingPhrase(prev.speak) || prev.speak === '正在思考...') {
-                return { ...prev, speak: actionSpeak, visible: true };
-              }
-              return prev;
-            });
+            if (call.name !== 'user.ask') {
+              setAgentState(prev => {
+                if (!prev.speak || isThinkingOrLoadingPhrase(prev.speak) || prev.speak === '正在思考...') {
+                  return { ...prev, speak: actionSpeak, visible: true };
+                }
+                return prev;
+              });
+            }
 
             const output = await executeAgentTool(call, task, signal);
             if (signal?.aborted) return output;
@@ -5668,6 +5820,29 @@ export default function App() {
                     ]
                   };
                 }));
+              }
+            } else {
+              // Canvas global task sync to globalChatHistory:
+              const answers = task.events.filter(e => e.type === 'answer' && e.text && e.text.trim() && !e.text.includes('生好了，我先看下'));
+              if (answers.length > 0) {
+                setGlobalChatHistory(prevHistory => {
+                  const currentHistory = prevHistory.filter(m => !m.text.includes('生好了，我先看下'));
+                  const newAnswers = answers.filter(a => !currentHistory.some(m => m.id === a.id));
+                  if (newAnswers.length === 0) return prevHistory;
+                  return [
+                    ...currentHistory,
+                    ...newAnswers.map(a => {
+                      const parsed = parseAgentCommunication(a.text);
+                      return {
+                        id: a.id,
+                        role: 'assistant' as const,
+                        text: parsed.fullText,
+                        shortText: parsed.shortText,
+                        timestamp: a.createdAt || Date.now(),
+                      };
+                    })
+                  ];
+                });
               }
             }
           },
@@ -5888,6 +6063,8 @@ export default function App() {
   }, [agentQuickInput]);
 
   const isDraggingCanvasRef = useRef(false);
+  const hasActivatedPanRef = useRef(false);
+  const panStartPointerRef = useRef({ x: 0, y: 0 });
 
   // Intent-driven lazy restoration logic
   const restoreCanvasStyles = useCallback(() => {
@@ -5972,7 +6149,9 @@ export default function App() {
       overviewToastTimerRef.current = null;
     }
     setShowOverviewPromptToast(false);
-    setOverviewPromptProgress(0);
+    if (overviewProgressBarRef.current) {
+      overviewProgressBarRef.current.style.width = '0%';
+    }
   }, []);
   resetOverviewPromptRef.current = resetOverviewPrompt;
 
@@ -6168,8 +6347,12 @@ export default function App() {
     if (prevScale <= 0.105) {
       wheelZoomOutAccumulatorRef.current += 1;
       const progress = Math.min(1, wheelZoomOutAccumulatorRef.current / 8);
-      setOverviewPromptProgress(progress);
-      setShowOverviewPromptToast(true);
+      if (!showOverviewPromptToast) {
+        setShowOverviewPromptToast(true);
+      }
+      if (overviewProgressBarRef.current) {
+        overviewProgressBarRef.current.style.width = `${progress * 100}%`;
+      }
 
       if (overviewToastTimerRef.current) {
         clearTimeout(overviewToastTimerRef.current);
@@ -6344,8 +6527,12 @@ export default function App() {
         const step = isDiscreteWheel ? 1 : Math.max(e.deltaY / 100, 0.25);
         wheelZoomOutAccumulatorRef.current += step;
         const progress = Math.min(1, wheelZoomOutAccumulatorRef.current / 8);
-        setOverviewPromptProgress(progress);
-        setShowOverviewPromptToast(true);
+        if (!showOverviewPromptToast) {
+          setShowOverviewPromptToast(true);
+        }
+        if (overviewProgressBarRef.current) {
+          overviewProgressBarRef.current.style.width = `${progress * 100}%`;
+        }
 
         if (overviewToastTimerRef.current) {
           clearTimeout(overviewToastTimerRef.current);
@@ -6376,19 +6563,28 @@ export default function App() {
         isZoomingRef.current = true;
         setIsZooming(true);
 
-        // Synchronously pause all active videos to free hardware decoders during zoom
-        try {
-          const allVideos = document.querySelectorAll('video');
-          allVideos.forEach(v => {
-            if (!v.paused) {
-              v.pause();
-              v.setAttribute('data-was-playing', 'true');
-            }
-          });
-        } catch (err) {
-          console.warn('Failed to pause background videos during zoom:', err);
-        }
+        // Offload background video pauses to next animation frame to prevent wheel tick jank
+        requestAnimationFrame(() => {
+          try {
+            const allVideos = document.querySelectorAll('video');
+            allVideos.forEach(v => {
+              if (!v.paused) {
+                v.pause();
+                v.setAttribute('data-was-playing', 'true');
+              }
+            });
+          } catch (err) {
+            console.warn('Failed to pause background videos during zoom:', err);
+          }
+        });
       }
+
+      // Instantly abort active mount queue on wheel tick to protect 60fps
+      window.dispatchEvent(new CustomEvent('abort-mount-queue'));
+      if (wheelStopTimerRef.current) clearTimeout(wheelStopTimerRef.current);
+      wheelStopTimerRef.current = setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('resume-mount-queue'));
+      }, 70);
 
       // 2. Clear the fallback timeout on every wheel tick
       clearTimeout(zoomTimeoutRef.current);
@@ -6564,29 +6760,12 @@ export default function App() {
     
     // Bypass React state to eliminate the 16ms start-of-drag stutter
     isDraggingCanvasRef.current = true;
+    hasActivatedPanRef.current = false;
+    window.dispatchEvent(new CustomEvent('abort-mount-queue'));
     
     document.body.style.cursor = 'grabbing';
-    
-    const workspace = document.getElementById('canvas-workspace');
-    if (workspace) {
-      workspace.setAttribute('data-panning', 'true');
-      workspace.setAttribute('data-gesture', 'true');
-    }
-
-    // Synchronously pause all active videos to free hardware decoders during canvas drag
-    try {
-      const allVideos = document.querySelectorAll('video');
-      allVideos.forEach(v => {
-        if (!v.paused) {
-          v.pause();
-          v.setAttribute('data-was-playing', 'true');
-        }
-      });
-    } catch (err) {
-      console.warn('Failed to pause background videos during canvas drag:', err);
-    }
-    
     lastPointer.current = { x: e.clientX, y: e.clientY };
+    panStartPointerRef.current = { x: e.clientX, y: e.clientY };
     containerRef.current?.setPointerCapture(e.pointerId);
   };
 
@@ -6603,6 +6782,33 @@ export default function App() {
       const dx = e.clientX - lastPointer.current.x;
       const dy = e.clientY - lastPointer.current.y;
       lastPointer.current = { x: e.clientX, y: e.clientY };
+
+      // Activate heavy degradation ONLY after actual movement threshold is reached
+      if (!hasActivatedPanRef.current) {
+        const moveDist = Math.hypot(e.clientX - panStartPointerRef.current.x, e.clientY - panStartPointerRef.current.y);
+        if (moveDist > 3) {
+          hasActivatedPanRef.current = true;
+          const workspace = document.getElementById('canvas-workspace');
+          if (workspace) {
+            workspace.setAttribute('data-panning', 'true');
+            workspace.setAttribute('data-gesture', 'true');
+          }
+          // Offload background video pauses to next animation frame to prevent pointerdown jank
+          requestAnimationFrame(() => {
+            try {
+              const allVideos = document.querySelectorAll('video');
+              allVideos.forEach(v => {
+                if (!v.paused) {
+                  v.pause();
+                  v.setAttribute('data-was-playing', 'true');
+                }
+              });
+            } catch (err) {
+              console.warn('Failed to pause background videos during canvas drag:', err);
+            }
+          });
+        }
+      }
       
       const newX = tx.get() + dx;
       const newY = ty.get() + dy;
@@ -6705,10 +6911,11 @@ export default function App() {
       nanoDragRef.current = null;
     }
 
-    // Reset idle timer after drag
+    // Reset idle timer after drag: 300ms idle fallback
     if (e.button === 1) {
       clearTimeout(zoomTimeoutRef.current);
       zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 300);
+      window.dispatchEvent(new CustomEvent('resume-mount-queue'));
     }
     
     setSelectionBox(null);
@@ -6753,42 +6960,53 @@ export default function App() {
     return cards.filter(card => visibleCardIdSet.has(card.id));
   }, [cards, visibleCardIdSet, tx, ty, tScale]);
 
-  // --- Density & FPS-Adaptive Progressive LOD Mounting Engine ---
-  // Adapts DOM node mounting strategy dynamically based on viewport card complexity weight and real-time frame rate:
-  // 1. Under Nano-LOD (scale < threshold): NanoLodCanvas renders 2D canvas thumbnails underneath (0 DOM cards).
-  // 2. High Complexity Weight / Low FPS (< 50 FPS / > 20ms frame time): DOM card mounting is paused while actively dragging/zooming to prevent layout reflows,
-  //    and mounts in frame-budgeted batches as soon as drag/zoom stops. Cards with prompt panels add extra weight so even a few cause pauses.
-  // 3. Low Complexity Weight & High FPS (>= 55 FPS): Instant streaming batch loading during active drag/zoom (2 cards every 2 frames)
-  //    so sparse cards render immediately with zero delay.
-  useEffect(() => {
-    if (!isDomCardsActive || isZoomAnimationActive) {
+  // --- Center-Out Event-Driven Interruptible Mount Queue ---
+  // Replaces fixed timers and arbitrary batch quotas with a human-centric priority queue:
+  // 1. Sorts unmounted visible cards by Euclidean distance to viewport center (Center -> Perimeter).
+  // 2. Mounts cards sequentially: Card 1 mounts -> awaits paint completion handshake -> Card 2 mounts -> ...
+  // 3. Fully interruptible (Abort token): Wheel or drag gestures instantly halt the queue (0ms latency),
+  //    and re-launch from the newly centered coordinates once motion stops.
+  const mountQueueAbortRef = useRef<{ aborted: boolean }>({ aborted: false });
+  const isQueueProcessingRef = useRef(false);
+  const visibleCardsRef = useRef<CardData[]>([]);
+
+  const abortMountQueue = useCallback(() => {
+    mountQueueAbortRef.current.aborted = true;
+    mountQueueAbortRef.current = { aborted: true };
+    isQueueProcessingRef.current = false;
+  }, []);
+
+  const runCenterOutMountQueue = useCallback(() => {
+    if (!isDomCardsActive || isZoomAnimationActiveRef.current) {
       if (!isDomCardsActive) {
         setRenderedCardIds(prev => prev.size === 0 ? prev : new Set());
       }
       return;
     }
 
-    const isGestureActive = isZooming || isDraggingCanvasRef.current || document.getElementById('canvas-workspace')?.getAttribute('data-gesture') === 'true';
-    const renderWeight = calculateTotalRenderWeight(visibleCards);
-    const isFrameDrop = lastFrameDurationRef.current > 20.0; // Frame time > 20ms (FPS < 50)
-    const isHighDensity = renderWeight > HIGH_RENDER_WEIGHT_THRESHOLD || isFrameDrop;
-
-    // High Density / Heavy DOM / Low FPS + Active Gesture: Pause DOM mounting and culling cleanup to protect 60fps gesture smoothness
-    if (isGestureActive && isHighDensity) {
+    // Check if any gesture is actively occurring (wheel, pan, card drag)
+    const currentWorkspace = document.getElementById('canvas-workspace');
+    const isGestureActive = Boolean(
+      isZoomingRef.current ||
+      isDraggingCanvasRef.current ||
+      (window as any).isDraggingCard ||
+      (window as any).__nanoDragging ||
+      currentWorkspace?.getAttribute('data-gesture') === 'true' ||
+      currentWorkspace?.getAttribute('data-zooming') === 'true' ||
+      currentWorkspace?.getAttribute('data-panning') === 'true'
+    );
+    if (isGestureActive) {
+      abortMountQueue();
       return;
     }
 
-    const visibleIds = new Set(visibleCards.map(c => c.id));
-    const pendingCards = visibleCards.filter(c => !renderedCardIds.has(c.id));
-    const hasCulled = Array.from(renderedCardIds).some(id => !visibleIds.has(id));
+    const currentVisible = visibleCardsRef.current;
+    const visibleIds = new Set(currentVisible.map(c => c.id));
+    const currentMounted = renderedCardIdsRef.current;
 
-    // If no new cards need mounting and no culled cards need unmounting, we are settled
-    if (pendingCards.length === 0 && !hasCulled) {
-      return;
-    }
-
-    // If only culled cards need unmounting after gesture stops (or during low density), clean them up
-    if (pendingCards.length === 0 && hasCulled) {
+    // 1. Instantly unmount any culled cards that moved outside the viewport
+    const hasCulled = Array.from(currentMounted).some(id => !visibleIds.has(id));
+    if (hasCulled) {
       setRenderedCardIds(prev => {
         const next = new Set<string>();
         for (const id of prev) {
@@ -6796,85 +7014,117 @@ export default function App() {
         }
         return next;
       });
-      return;
     }
 
-    let rafId: number;
+    // 2. Identify unmounted visible cards
+    const pending = currentVisible.filter(c => !currentMounted.has(c.id));
+    if (pending.length === 0) return;
 
-    const mountStep = () => {
-      const frameStartTime = performance.now();
-      mountFrameCounterRef.current++;
-      const frameIndex = mountFrameCounterRef.current;
-      const scaleVal = tScale.get() || 1;
-      const quota = getLodMountQuota(scaleVal, isGestureActive, frameIndex, renderWeight, lastFrameDurationRef.current);
-      if (quota <= 0) {
-        if (pendingCards.length > 0) {
-          rafId = requestAnimationFrame(mountStep);
+    // 3. Cancel any previous queue session and create fresh cancellation token
+    mountQueueAbortRef.current.aborted = true;
+    const abortToken = { aborted: false };
+    mountQueueAbortRef.current = abortToken;
+
+    // 4. Sort strictly from viewport Center outward (Center -> Perimeter)
+    const currentScale = tScale.get() || 1;
+    const centerX = (window.innerWidth / 2 - tx.get()) / currentScale;
+    const centerY = (window.innerHeight / 2 - ty.get()) / currentScale;
+
+    const sortedQueue = [...pending].sort((a, b) => {
+      // Top priority: Agent focused cards (Primary & References)
+      const aAgent = Boolean(agentFocus.primaryCardId === a.id || agentFocus.referenceCardIds.includes(a.id));
+      const bAgent = Boolean(agentFocus.primaryCardId === b.id || agentFocus.referenceCardIds.includes(b.id));
+      if (aAgent && !bAgent) return -1;
+      if (!aAgent && bAgent) return 1;
+
+      const aSel = selectedCardIdsRef.current.includes(a.id);
+      const bSel = selectedCardIdsRef.current.includes(b.id);
+      if (aSel && !bSel) return -1;
+      if (!aSel && bSel) return 1;
+
+      const dimA = getCardSize(a);
+      const dimB = getCardSize(b);
+      const distA = Math.pow((a.x + dimA.width / 2) - centerX, 2) + Math.pow((a.y + dimA.height / 2) - centerY, 2);
+      const distB = Math.pow((b.x + dimB.width / 2) - centerX, 2) + Math.pow((b.y + dimB.height / 2) - centerY, 2);
+      return distA - distB;
+    });
+
+    // 5. Strict Time-Slicing Frame-Budget Queue ("Trading Time for Framerate"):
+    // Limits JS execution to strictly <= 3.0ms per frame, ensuring >80% of frame time
+    // is reserved for browser Layout, Paint, and Compositing, guaranteeing buttery 60/120 FPS.
+    (async () => {
+      isQueueProcessingRef.current = true;
+      let currentIndex = 0;
+
+      while (currentIndex < sortedQueue.length) {
+        if (abortToken.aborted) {
+          isQueueProcessingRef.current = false;
+          return;
         }
-        return;
-      }
 
-      // Calculate distance to viewport center for center-out progressive reveal
-      const centerX = (window.innerWidth / 2 - tx.get()) / scaleVal;
-      const centerY = (window.innerHeight / 2 - ty.get()) / scaleVal;
+        const frameStartTime = performance.now();
+        const batchToMount: CardData[] = [];
 
-      const sortedPending = [...pendingCards].sort((a, b) => {
-        // Preemptive top priority for Agent-focused cards (Primary & References)
-        const aAgentFocused = Boolean(agentFocus.primaryCardId === a.id || agentFocus.referenceCardIds.includes(a.id));
-        const bAgentFocused = Boolean(agentFocus.primaryCardId === b.id || agentFocus.referenceCardIds.includes(b.id));
-        if (aAgentFocused && !bAgentFocused) return -1;
-        if (!aAgentFocused && bAgentFocused) return 1;
-
-        const aSel = selectedCardIdsRef.current.includes(a.id);
-        const bSel = selectedCardIdsRef.current.includes(b.id);
-        if (aSel && !bSel) return -1;
-        if (!aSel && bSel) return 1;
-
-        const dimA = getCardSize(a);
-        const dimB = getCardSize(b);
-        const distA = Math.pow((a.x + dimA.width / 2) - centerX, 2) + Math.pow((a.y + dimA.height / 2) - centerY, 2);
-        const distB = Math.pow((b.x + dimB.width / 2) - centerX, 2) + Math.pow((b.y + dimB.height / 2) - centerY, 2);
-        return distA - distB;
-      });
-
-      const effectiveQuota = quota;
-
-      // Time-Sliced Queue: take cards up to effectiveQuota, or yield early if frame budget (FRAME_BUDGET_MS) is exceeded
-      const batchToMount: string[] = [];
-      for (const card of sortedPending) {
-        if (batchToMount.length >= effectiveQuota) break;
-        batchToMount.push(card.id);
-        if (performance.now() - frameStartTime >= FRAME_BUDGET_MS) {
-          // Exceeded single-frame budget -> defer remaining cards in queue to next rAF frame ("推迟排队模式")
-          break;
+        // Accumulate cards into this frame's batch until strict 2.8ms JS time budget is reached
+        while (currentIndex < sortedQueue.length) {
+          batchToMount.push(sortedQueue[currentIndex]);
+          currentIndex++;
+          // For generation cards with heavy DOM, limit to 1-2 per frame to keep JS work strictly under 3ms
+          if (performance.now() - frameStartTime >= 2.8 || batchToMount.length >= 2) {
+            break;
+          }
         }
-      }
 
-      if (batchToMount.length > 0) {
-        setRenderedCardIds(prev => {
-          const next = new Set<string>();
-          // Keep existing visible cards
-          for (const id of prev) {
-            if (visibleIds.has(id)) next.add(id);
-          }
-          // Mount new batch of cards
-          for (const id of batchToMount) {
-            next.add(id);
-          }
-          return next;
+        if (batchToMount.length > 0) {
+          const batchIds = new Set(batchToMount.map(c => c.id));
+
+          // Single micro-batched state update for this frame
+          setRenderedCardIds(prev => {
+            let hasNew = false;
+            for (const id of batchIds) {
+              if (!prev.has(id)) {
+                hasNew = true;
+                break;
+              }
+            }
+            if (!hasNew) return prev;
+            const next = new Set(prev);
+            for (const id of batchIds) {
+              next.add(id);
+            }
+            return next;
+          });
+        }
+
+        // Yield control back to browser Compositor for Paint & Layout
+        await new Promise<void>(resolve => {
+          requestAnimationFrame(() => resolve());
         });
+
+        if (abortToken.aborted) {
+          isQueueProcessingRef.current = false;
+          return;
+        }
       }
+      isQueueProcessingRef.current = false;
+    })();
+  }, [isDomCardsActive, tx, ty, tScale, agentFocus, abortMountQueue]);
 
-      // Record frame step processing time
-      lastFrameDurationRef.current = performance.now() - frameStartTime;
-    };
+  useEffect(() => {
+    visibleCardsRef.current = visibleCards;
+    runCenterOutMountQueue();
+  }, [visibleCards, runCenterOutMountQueue, mountEpoch]);
 
-    rafId = requestAnimationFrame(mountStep);
-
+  useEffect(() => {
+    const handleAbort = () => abortMountQueue();
+    const handleResume = () => runCenterOutMountQueue();
+    window.addEventListener('abort-mount-queue', handleAbort);
+    window.addEventListener('resume-mount-queue', handleResume);
     return () => {
-      cancelAnimationFrame(rafId);
+      window.removeEventListener('abort-mount-queue', handleAbort);
+      window.removeEventListener('resume-mount-queue', handleResume);
     };
-  }, [isDomCardsActive, isZoomAnimationActive, mountEpoch, visibleCards, renderedCardIds, tx, ty, tScale, isZooming]);
+  }, [abortMountQueue, runCenterOutMountQueue]);
 
   return (
     <div 
@@ -7061,7 +7311,7 @@ export default function App() {
         }}
       />
 
-      {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.40 or during staggered DOM loading) */}
+      {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.60 or during staggered DOM loading) */}
       {(() => {
         const targetCardIds = new Set<string>();
         if (agentFocus.primaryCardId) targetCardIds.add(agentFocus.primaryCardId);
@@ -7098,6 +7348,18 @@ export default function App() {
             isOverviewMode={isOverviewMode}
             isActive={
               isNanoCanvasActive || 
+              isDraggingCanvasRef.current ||
+              isZooming ||
+              Boolean(
+                (window as any).isDraggingCard || 
+                (window as any).__nanoDragging ||
+                (typeof document !== 'undefined' && (
+                  document.getElementById('canvas-workspace')?.getAttribute('data-gesture') === 'true' ||
+                  document.getElementById('canvas-workspace')?.getAttribute('data-panning') === 'true' ||
+                  document.getElementById('canvas-workspace')?.getAttribute('data-zooming') === 'true'
+                ))
+              ) ||
+              (renderedCardIds.size < cards.length && cards.length > 0) ||
               (renderedCardIds.size < visibleCards.length && visibleCards.length > 0) ||
               (() => {
                 if (typeof window === 'undefined') return false;
@@ -7108,7 +7370,7 @@ export default function App() {
             }
             onReady={handleNanoCanvasReady}
             onThumbnailGenerated={(id, thumbnailUrl) => {
-              handleUpdateCard(id, { thumbnailUrl }, false);
+              handleBatchThumbnailGenerated(id, thumbnailUrl);
             }}
           />
         );
@@ -7125,7 +7387,7 @@ export default function App() {
         style={{ transformOrigin: '0 0', x: tx, y: ty, scale: tScale }}
       >
 
-        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.40), unmount all DOM cards for ultra-fast Hybrid Canvas rendering */}
+        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.60), unmount all DOM cards for ultra-fast Hybrid Canvas rendering */}
         {!isOverviewMode && isDomCardsActive && visibleCards.map(card => {
           if (!renderedCardIds.has(card.id)) return null;
           const hasImage = Boolean(card.imageUrl || card.originalImageUrl || card.thumbnailUrl);
@@ -7322,8 +7584,14 @@ export default function App() {
                 isOpen: true,
                 targetId: agentQuickInput.targetId,
                 placeholder: agentQuickInput.placeholder || "输入你的想法...",
+                contextHistory: getTargetContextHistory(
+                  agentQuickInput.targetId,
+                  cardsRef.current.length > 0 ? cardsRef.current : cards,
+                  globalChatHistory
+                ),
                 lastReply: agentQuickInput.lastReply,
                 focusTrigger: agentQuickInput.focusTrigger,
+                onAskResolve: agentQuickInput.onAskResolve,
                 value: cardDrafts[agentQuickInput.targetId || 'global'] || '',
                 onChange: (text: string) => {
                   const target = agentQuickInput.targetId || 'global';
@@ -7337,6 +7605,17 @@ export default function App() {
                     setCardDrafts(prev => ({ ...prev, [currentKey]: '' }));
                     deleteDraft(currentKey);
                     setAgentQuickInput(null);
+                    if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
+                    isAgentRunningRef.current = true;
+                    setIsAgentThinking(true);
+                    setIsAgentRunning(true);
+                    setAgentState(prev => ({
+                      ...prev,
+                      lastPrompt: prompt,
+                      lastPromptTargetId: agentQuickInput.targetId,
+                      speak: "正在思考...",
+                      visible: true
+                    }));
                     askResolver(prompt);
                     return;
                   }
@@ -7352,6 +7631,7 @@ export default function App() {
                   setAgentState(prev => ({
                     ...prev,
                     lastPrompt: prompt,
+                    lastPromptTargetId: currentTarget,
                     speak: "正在思考...",
                     visible: true
                   }));
@@ -7386,6 +7666,15 @@ export default function App() {
                     }
                     await handleCardAgentChat(currentTarget, prompt);
                   } else {
+                    setGlobalChatHistory(prev => [
+                      ...prev,
+                      {
+                        id: `msg_global_user_${Date.now()}`,
+                        role: 'user',
+                        text: prompt,
+                        timestamp: Date.now(),
+                      }
+                    ]);
                     await handleRunAgent(prompt);
                   }
                 },
@@ -7601,6 +7890,7 @@ export default function App() {
                 setAgentState(prev => ({
                   ...prev,
                   lastPrompt: prompt,
+                  lastPromptTargetId: currentTarget || null,
                   speak: "正在思考...",
                   visible: true,
                 }));
@@ -7629,6 +7919,15 @@ export default function App() {
                   }
                   await handleCardAgentChat(currentTarget, prompt);
                 } else {
+                  setGlobalChatHistory(prev => [
+                    ...prev,
+                    {
+                      id: `msg_global_user_${Date.now()}`,
+                      role: 'user',
+                      text: prompt,
+                      timestamp: Date.now(),
+                    }
+                  ]);
                   await handleRunAgent(prompt);
                 }
               }}
@@ -7737,8 +8036,9 @@ export default function App() {
             <div className="relative overflow-hidden flex items-center justify-center px-5 py-2 rounded-full bg-white/95 dark:bg-[#252528]/95 backdrop-blur-md border border-neutral-200/90 dark:border-neutral-700/80 shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:shadow-[0_8px_30px_rgb(0,0,0,0.35)] text-xs md:text-sm font-medium text-neutral-800 dark:text-neutral-100 min-w-[200px]">
               {/* Full-bleed background progress bar from left to right */}
               <div 
+                ref={overviewProgressBarRef}
                 className="absolute inset-y-0 left-0 bg-blue-500/20 dark:bg-blue-400/25 border-r border-blue-500/50 dark:border-blue-400/50 transition-[width] duration-150 ease-out pointer-events-none"
-                style={{ width: `${Math.min(100, Math.max(0, overviewPromptProgress * 100))}%` }}
+                style={{ width: '0%' }}
               />
               <span className="relative z-10 tracking-wide font-medium">继续缩小进入全景视图</span>
             </div>

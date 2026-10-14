@@ -76,12 +76,12 @@ export function isCardIntersectingRectangle(
 }
 
 /**
- * Nano-LOD Scale Threshold: 0.40 (40%)
- * Scale < 0.40 renders via NanoLodCanvas (2D Canvas mode with color blocks).
- * Scale >= 0.40 renders via DOM cards mode (interactive prompt component).
+ * Nano-LOD Scale Threshold: 0.60 (60%)
+ * Scale < 0.60 renders via NanoLodCanvas (2D Canvas mode with color blocks).
+ * Scale >= 0.60 renders via DOM cards mode (interactive prompt component).
  */
 export function getNanoLodThreshold(): number {
-  return 0.40;
+  return 0.60;
 }
 
 export const CARD_DENSITY_HIGH_THRESHOLD = 15; // Kept for backwards compatibility
@@ -120,13 +120,10 @@ export function calculateTotalRenderWeight(cards: CardBounds[]): number {
 }
 
 /**
- * Calculates per-frame mounting quota based on scale, gesture state, card render complexity weight, and live frame duration.
- * - High Density / High Render Weight or Low FPS (< 50 FPS / > 20ms frame delta): Pause mounting during active drag/zoom gestures
- *   to protect 60fps, then execute frame-budgeted micro-batch loading once gesture stops.
- * - Low Density / High FPS (>= 55 FPS): Perform instant streaming batch loading during active drag/zoom
- *   (1 card every 2 frames) so sparse cards appear immediately without waiting for gesture end.
- * - Gesture Stopped: Uses strict micro-quota (1 card per frame, or 1 card per 2 frames under low FPS) trading total load duration
- *   for 60 FPS frame smoothness ("用时间换帧数").
+ * Calculates per-frame mounting quota based on scale, gesture state, and live frame duration.
+ * - Active Gesture: STRICT ZERO-MOUNT (returns 0). Guarantees 60 FPS gesture smoothness during active drag/zoom.
+ * - Gesture Settled & Idle: Mounts in frame-budgeted batches (4-6 cards per frame, or 2 under heavy frame duration)
+ *   so cards settle in minimal React render cycles rather than dragging across dozens of single-card frames.
  */
 export function getLodMountQuota(
   scale: number, 
@@ -136,7 +133,9 @@ export function getLodMountQuota(
   lastFrameDuration: number = 0
 ): number {
   if (scale < getNanoLodThreshold()) return 0;
-  return 1; // 1 card per frame under all circumstances
+  if (isGestureActive) return 0; // Strictly zero DOM mounting during gesture!
+  if (lastFrameDuration > 20.0) return 2;
+  return 6;
 }
 
 export const UNMOUNT_TARGET_DURATION_MS = 200; // Target duration (200ms) to complete progressive DOM card unmounting during High -> Low LOD switch

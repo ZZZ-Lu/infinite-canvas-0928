@@ -93,9 +93,12 @@
   pointer-events: none !important;
 }
 
-#canvas-workspace[data-zooming="true"] *:not(.generation-card-bottom-panel):not(.generation-card-bottom-panel *):not(.card-header-tag):not(.card-header-tag *):not(.lod-crossfade):not(.lod-crossfade *),
-#canvas-workspace[data-panning="true"] *:not(.generation-card-bottom-panel):not(.generation-card-bottom-panel *):not(.card-header-tag):not(.card-header-tag *):not(.lod-crossfade):not(.lod-crossfade *),
-#canvas-workspace[data-gesture="true"] *:not(.generation-card-bottom-panel):not(.generation-card-bottom-panel *):not(.card-header-tag):not(.card-header-tag *):not(.lod-crossfade):not(.lod-crossfade *) {
+#canvas-workspace[data-zooming="true"] .generation-card,
+#canvas-workspace[data-panning="true"] .generation-card,
+#canvas-workspace[data-gesture="true"] .generation-card,
+#canvas-workspace[data-zooming="true"] .asset-card,
+#canvas-workspace[data-panning="true"] .asset-card,
+#canvas-workspace[data-gesture="true"] .asset-card {
   transition: none !important;
   transition-duration: 0s !important;
   animation: none !important;
@@ -117,43 +120,20 @@
   transition: none !important;
 }
 
-/* 4K Performance & Intent-Driven Lazy Degradation: Keep cards visible but strip heavy effects */
-
-#canvas-workspace[data-zooming="true"] .squircle:not(.card-header-tag):not(.card-header-tag *),
-#canvas-workspace[data-panning="true"] .squircle:not(.card-header-tag):not(.card-header-tag *),
-#canvas-workspace[data-gesture="true"] .squircle:not(.card-header-tag):not(.card-header-tag *),
-#canvas-workspace[data-zooming="true"] .corner-squircle:not(.card-header-tag):not(.card-header-tag *),
-#canvas-workspace[data-panning="true"] .corner-squircle:not(.card-header-tag):not(.card-header-tag *),
-#canvas-workspace[data-gesture="true"] .corner-squircle:not(.card-header-tag):not(.card-header-tag *),
-.drag-degraded:not(.card-header-tag):not(.card-header-tag *),
-.drag-degraded .squircle:not(.card-header-tag):not(.card-header-tag *),
-.drag-degraded .corner-squircle:not(.card-header-tag):not(.card-header-tag *) {
+/* Ultra-fast degradation targeting strictly the 2 main card containers per card (10 elements total for 5 cards) */
+#canvas-workspace[data-zooming="true"] .generation-card-body,
+#canvas-workspace[data-panning="true"] .generation-card-body,
+#canvas-workspace[data-gesture="true"] .generation-card-body,
+#canvas-workspace[data-zooming="true"] .generation-card-bottom-panel,
+#canvas-workspace[data-panning="true"] .generation-card-bottom-panel,
+#canvas-workspace[data-gesture="true"] .generation-card-bottom-panel,
+#canvas-workspace[data-zooming="true"] .asset-card,
+#canvas-workspace[data-panning="true"] .asset-card,
+#canvas-workspace[data-gesture="true"] .asset-card,
+.drag-degraded.generation-card-body,
+.drag-degraded.generation-card-bottom-panel {
   corner-shape: unset !important;
   box-shadow: none !important;
-  border-radius: 12px !important;
-}
-
-/* Card header text labels (.card-header-tag) retain full squircle shape and do not degrade */
-.card-header-tag,
-.card-header-tag * {
-  corner-shape: squircle !important;
-}
-
-#canvas-workspace[data-zooming="true"] .generation-card-body.squircle,
-#canvas-workspace[data-panning="true"] .generation-card-body.squircle,
-#canvas-workspace[data-gesture="true"] .generation-card-body.squircle,
-.drag-degraded .generation-card-body.squircle {
-  border-radius: 12px !important;
-}
-
-#canvas-workspace[data-zooming="true"] .generation-card-bottom-panel,
-#canvas-workspace[data-zooming="true"] .generation-card-bottom-panel.squircle,
-#canvas-workspace[data-panning="true"] .generation-card-bottom-panel,
-#canvas-workspace[data-panning="true"] .generation-card-bottom-panel.squircle,
-#canvas-workspace[data-gesture="true"] .generation-card-bottom-panel,
-#canvas-workspace[data-gesture="true"] .generation-card-bottom-panel.squircle,
-.drag-degraded.generation-card-bottom-panel,
-.drag-degraded .generation-card-bottom-panel {
   border-radius: 12px !important;
 }
 

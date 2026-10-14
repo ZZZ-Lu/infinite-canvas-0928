@@ -484,11 +484,6 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     const pickerSelectedLineWidth = 4 / currentScale;
 
     const threshold = getNanoLodThreshold();
-    let hasActiveFadingCard = false;
-    const now = performance.now();
-    if (currentScale < threshold) {
-      cardPanelFadeMapRef.current.clear();
-    }
 
     // First pass: Draw unselected cards
     // Second pass: Draw selected cards on top to avoid border occlusion
@@ -574,53 +569,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       const isPainted = !paintedSet || paintedSet.has(card.id);
       const isCardReadyInDom = currentScale >= threshold && Boolean(renderedSet && renderedSet.has(card.id) && isPainted);
 
-      // Determine per-card NanoLOD prompt panel alpha:
-      // NanoLOD stays 100% solid until Standard is loaded underneath.
-      // ONLY THEN does NanoLOD start its 400ms ease-out fade to reveal the loaded Standard LOD!
-      let cardPanelAlpha = 1.0;
-      if (currentScale >= threshold) {
-        if (!isCardReadyInDom) {
-          cardPanelAlpha = 1.0; // Standard is still loading underneath: keep NanoLOD solid!
-        } else {
-          let startTime = cardPanelFadeMapRef.current.get(card.id);
-          if (startTime === undefined) {
-            startTime = now;
-            cardPanelFadeMapRef.current.set(card.id, startTime);
-          }
-          const elapsed = now - startTime;
-          if (elapsed >= 400) {
-            cardPanelAlpha = 0;
-          } else {
-            hasActiveFadingCard = true;
-            const progress = elapsed / 400;
-            cardPanelAlpha = Math.max(0, Math.pow(1 - progress, 3));
-          }
-        }
-      } else {
-        cardPanelAlpha = 1.0;
-      }
-
-      // If standard card is loaded in DOM, hand off card body (skip drawing thumbnail).
-      // If prompt panel is still in its 400ms fade-out window, draw the fading panel on canvas!
+      // Instant seamless handoff: if standard card is rendered and painted in DOM, DOM handles the prompt panel directly!
       if (isCardReadyInDom) {
-        if (cardPanelAlpha > 0 && !card.fileName && !card.isAsset) {
-          const isSelected = selectedIds.includes(card.id);
-          drawCardBottomPanel(
-            ctx,
-            card,
-            cardX,
-            cardY,
-            dim.width,
-            dim.height,
-            dark,
-            isSelected,
-            borderSelected,
-            borderNormal,
-            selectedLineWidth,
-            normalLineWidth,
-            cardPanelAlpha
-          );
-        }
         return;
       }
 
@@ -717,8 +667,16 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         }
         hasDrawnThumbnail = true;
       } else if (hasMedia && !isGenerating) {
-        // Trigger background thumbnail generation for visible cards without thumbnail
-        if (!pendingThumbGenRef.current.has(card.id)) {
+        // Trigger background thumbnail generation ONLY when idle (never during active drag, pan, or zoom gesture)
+        const isWorkspaceGesturing = typeof document !== 'undefined' && Boolean(
+          document.getElementById('canvas-workspace')?.getAttribute('data-gesture') === 'true' ||
+          document.getElementById('canvas-workspace')?.getAttribute('data-zooming') === 'true' ||
+          document.getElementById('canvas-workspace')?.getAttribute('data-panning') === 'true' ||
+          (window as any).isDraggingCard ||
+          (window as any).__nanoDragging
+        );
+
+        if (!isWorkspaceGesturing && !pendingThumbGenRef.current.has(card.id)) {
           pendingThumbGenRef.current.add(card.id);
           getOrCreateMediaThumbnail(card).then((generatedUrl) => {
             pendingThumbGenRef.current.delete(card.id);
@@ -787,7 +745,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
       // 3b. Bottom Panel Skeleton Color Block for Generation Cards in 2D Canvas Mode
       const isGenerationCard = !card.fileName && !card.isAsset;
-      if (isGenerationCard && cardPanelAlpha > 0) {
+      if (isGenerationCard) {
         drawCardBottomPanel(
           ctx,
           card,
@@ -801,7 +759,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
           borderNormal,
           selectedLineWidth,
           normalLineWidth,
-          cardPanelAlpha
+          1.0
         );
       }
 
@@ -908,10 +866,6 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     if (onReadyRef.current) {
       onReadyRef.current();
     }
-
-    if (hasActiveFadingCard) {
-      scheduleDraw();
-    }
   };
 
   const scheduleDraw = () => {
@@ -939,24 +893,22 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     }
   }, [isActive]);
 
-  // Re-draw when data changes
+  // Re-draw when data changes (renderedCardIds excluded to prevent canvas redraw thrashing on DOM card mount)
   useEffect(() => {
     if (isActive) {
       scheduleDraw();
     }
-  }, [cards, selectedCardIds, renderedCardIds, agentTargetCardId, agentTargetCardIds, agentReferenceCardIds, agentFocusMap, pickerSession, isDarkMode, isOverviewMode, dotModeThreshold, isActive]);
+  }, [cards, selectedCardIds, agentTargetCardId, agentTargetCardIds, agentReferenceCardIds, agentFocusMap, pickerSession, isDarkMode, isOverviewMode, dotModeThreshold, isActive]);
 
-  // Listen to custom nano dragging and card painted events for local, non-react repaint
+  // Listen to custom nano dragging events for local, non-react repaint
   useEffect(() => {
     if (!isActive) return;
     const handleRepaint = () => {
       scheduleDraw();
     };
     window.addEventListener('nano-dragging', handleRepaint);
-    window.addEventListener('card-painted', handleRepaint);
     return () => {
       window.removeEventListener('nano-dragging', handleRepaint);
-      window.removeEventListener('card-painted', handleRepaint);
     };
   }, [isActive]);
 

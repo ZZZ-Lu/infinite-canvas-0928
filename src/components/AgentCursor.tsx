@@ -61,16 +61,23 @@ export function buildDynamicSelectionPrompt(cards: CardData[]): string {
   return `选了 ${total} 个卡片，需要我做什么？`;
 }
 
+export interface HudContextMessage {
+  text: string;
+  speaker: 'user' | 'agent';
+}
+
 export interface QuickInputConfig {
   isOpen: boolean;
   targetId: string | null;
   placeholder?: string;
+  contextHistory?: HudContextMessage | null;
   lastReply?: string;
   onSubmit: (text: string) => void;
   onClose: () => void;
   focusTrigger?: number;
   value: string;
   onChange: (text: string) => void;
+  onAskResolve?: ((answer: string) => void) | null;
 }
 
 interface AgentCursorProps {
@@ -82,6 +89,7 @@ interface AgentCursorProps {
     isMoving: boolean;
     speak?: string;
     lastPrompt?: string;
+    lastPromptTargetId?: string | null;
     cursorMode?: 'default' | 'inspect' | 'working' | 'interact';
   };
   transform: {
@@ -297,10 +305,18 @@ export function AgentCursor({
   const quickInputRef = useRef<HTMLInputElement>(null);
 
   // Submit stage machine:
-  // Step 1: 'user-at-row2' - User's dialogue first moves to the 2nd row
-  // Step 2: 'user-at-row1' - User's dialogue promoted to 1st row, while agent's new dialogue emerges and grows in 2nd row
-  const [submitStep, setSubmitStep] = useState<'idle' | 'user-at-row2' | 'user-at-row1'>('idle');
+  const [submitStep, setSubmitStep] = useState<'idle' | 'submitting'>('idle');
   const [submittedUserPrompt, setSubmittedUserPrompt] = useState<string | null>(null);
+
+  const submitTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (submitTimerRef.current) {
+        clearTimeout(submitTimerRef.current);
+      }
+    };
+  }, []);
 
   const rawIsThinking = isThinkingPhrase(agentState.speak);
   const isActuallyThinking = isAgentThinking !== undefined
@@ -311,63 +327,121 @@ export function AgentCursor({
     return buildDynamicSelectionPrompt(selectedCards || []);
   }, [selectedCards]);
 
-  // When quickInput opens or target card changes, settle state and clear any old transient submitted prompt
+  // When regular quickInput opens or target card changes, settle state and clear any old transient submitted prompt.
+  // When user.ask triggers quickInput (onAskResolve is present), preserve the user's prompt in Row 1!
   useEffect(() => {
-    if (quickInput?.isOpen) {
+    if (quickInput?.isOpen && !quickInput?.onAskResolve) {
       setSubmitStep('idle');
       setSubmittedUserPrompt(null);
     }
-  }, [quickInput?.isOpen, quickInput?.targetId]);
+  }, [quickInput?.isOpen, quickInput?.targetId, quickInput?.onAskResolve]);
 
   useEffect(() => {
-    if (!agentState.speak && !quickInput?.isOpen) {
+    if (!agentState.speak && !agentState.lastPrompt && !quickInput?.isOpen) {
       setSubmitStep('idle');
       setSubmittedUserPrompt(null);
     }
-  }, [agentState.speak, quickInput?.isOpen]);
+  }, [agentState.speak, agentState.lastPrompt, quickInput?.isOpen]);
 
-  // Row 1 (Top History/Context):
-  // 1. While quickInput is open: strictly show THIS specific card's conversation history (quickInput.lastReply).
-  //    If this card has no history, Row 1 is null.
-  // 2. When submitting and user text is temporarily in Row 2 (Stage 1, 260ms): Row 1 is null.
-  // 3. During task execution & agent response (quickInput is closed, agent is active):
-  //    Row 1 displays the prompt issued for this task (submittedUserPrompt || agentState.lastPrompt).
-  const rawHistoryText = quickInput?.isOpen
-    ? (quickInput.lastReply || null)
-    : (
-        submitStep === 'user-at-row2'
-          ? null
-          : (submittedUserPrompt || agentState.lastPrompt || null)
-      );
+  useEffect(() => {
+    if (!isAgentRunning && !isActuallyThinking && !quickInput?.isOpen && submitStep === 'idle') {
+      if (!agentState.speak) {
+        setSubmittedUserPrompt(null);
+      }
+    }
+  }, [isAgentRunning, isActuallyThinking, quickInput?.isOpen, submitStep, agentState.speak]);
+
+  const isSubmitting = submitStep === 'submitting';
+
+  // Row 1 (Top History/Context Message Model):
+  // Structured data-driven message model with intrinsic speaker identity:
+  // 1. If user has actively submitted a prompt in this input: speaker is 'user'.
+  // 2. If running active task or in user.ask workflow for this target: speaker is 'user'.
+  // 3. Otherwise (idle inspection), strictly use target-scoped contextHistory from active target.
+  const rawRow1Message = useMemo<HudContextMessage | null>(() => {
+    // 1. Active submission stream in this cursor
+    if (submittedUserPrompt && submittedUserPrompt.trim()) {
+      return {
+        text: submittedUserPrompt.trim(),
+        speaker: 'user',
+      };
+    }
+
+    // 2. Active task or user.ask execution
+    const isExecutionActive = isAgentRunning || Boolean(quickInput?.onAskResolve);
+    if (isExecutionActive && agentState.lastPrompt && agentState.lastPrompt.trim()) {
+      const scopeMatches = !agentState.lastPromptTargetId || agentState.lastPromptTargetId === (quickInput?.targetId || 'global');
+      if (scopeMatches) {
+        return {
+          text: agentState.lastPrompt.trim(),
+          speaker: 'user',
+        };
+      }
+    }
+
+    // 3. Target-scoped persistent context history (from card's chatHistory or canvas globalHistory)
+    if (quickInput?.contextHistory) {
+      return quickInput.contextHistory;
+    }
+
+    // 4. Legacy fallback for lastReply (if contextHistory not explicitly provided)
+    if (quickInput?.isOpen && quickInput.lastReply && quickInput.lastReply.trim() && !quickInput.onAskResolve) {
+      return {
+        text: quickInput.lastReply.trim(),
+        speaker: 'agent',
+      };
+    }
+
+    return null;
+  }, [submittedUserPrompt, isAgentRunning, quickInput?.isOpen, quickInput?.onAskResolve, quickInput?.targetId, quickInput?.contextHistory, quickInput?.lastReply, agentState.lastPrompt, agentState.lastPromptTargetId]);
 
   const isDefaultOrSelectionSpeak = !agentState.speak ||
     rawIsThinking ||
     agentState.speak.startsWith('选了') ||
     agentState.speak === '我能帮什么忙？';
 
-  // When Agent is actively running/executing, it is strictly in execution/thinking mode:
-  // Display active agent speak if available, otherwise show "正在思考..." during thinking or "正在操作..." during execution
-  // Never fall back to dynamic selection prompt ("选了X张图片...") during execution!
-  const effectiveAgentSpeak = isAgentRunning
-    ? (agentState.speak && !agentState.speak.startsWith('选了') && agentState.speak !== '我能帮什么忙？' 
-        ? agentState.speak 
-        : (isActuallyThinking ? "正在思考..." : "正在操作..."))
-    : (quickInput?.isOpen && submitStep === 'idle' && isDefaultOrSelectionSpeak)
-      ? dynamicPromptText
-      : (rawIsThinking && isAgentRunning === false)
-        ? undefined
-        : (agentState.speak || (quickInput?.isOpen ? dynamicPromptText : undefined));
+  // Effective agent speak for Row 2:
+  // If user has submitted a prompt:
+  //   - Never revert to dynamic selection prompt ("选了X张图片...") or greeting ("我能帮什么忙？")!
+  //   - If agentState.speak has actual agent text (not selection or generic greeting), show it.
+  //   - Otherwise show "正在思考..." during thinking/submitting.
+  // When Agent is actively running/executing without submittedUserPrompt:
+  //   - Strictly execution/thinking mode: show active speak or fallback to "正在思考..." / "正在操作...".
+  // When idle and quickInput is open:
+  //   - Show dynamic selection prompt.
+  const effectiveAgentSpeak = submittedUserPrompt
+    ? (agentState.speak && !agentState.speak.startsWith('选了') && agentState.speak !== '我能帮什么忙？' && !isThinkingPhrase(agentState.speak)
+        ? agentState.speak
+        : "正在思考...")
+    : (isAgentRunning
+        ? (agentState.speak && !agentState.speak.startsWith('选了') && agentState.speak !== '我能帮什么忙？' 
+            ? agentState.speak 
+            : (isActuallyThinking ? "正在思考..." : "正在操作..."))
+        : (quickInput?.isOpen && submitStep === 'idle' && isDefaultOrSelectionSpeak)
+            ? dynamicPromptText
+            : (rawIsThinking && isAgentRunning === false)
+              ? undefined
+              : (agentState.speak || (quickInput?.isOpen ? dynamicPromptText : undefined)));
 
-  const effectiveIsThinking = isAgentRunning
-    ? (isAgentThinking !== undefined ? (isAgentThinking && isThinkingPhrase(effectiveAgentSpeak)) : isThinkingPhrase(effectiveAgentSpeak))
-    : (quickInput?.isOpen && submitStep === 'idle' && rawIsThinking)
-      ? false
-      : isActuallyThinking;
+  const effectiveIsThinking = submittedUserPrompt
+    ? (agentState.speak && !agentState.speak.startsWith('选了') && agentState.speak !== '我能帮什么忙？' && !isThinkingPhrase(agentState.speak)
+        ? false
+        : true)
+    : (isAgentRunning
+        ? (isAgentThinking !== undefined ? (isAgentThinking && isThinkingPhrase(effectiveAgentSpeak)) : isThinkingPhrase(effectiveAgentSpeak))
+        : (quickInput?.isOpen && submitStep === 'idle' && rawIsThinking)
+          ? false
+          : isActuallyThinking);
 
-  // Deduplication guard: Never display identical text simultaneously in Row 1 and Row 2
-  const historyText = rawHistoryText && rawHistoryText.trim() !== (effectiveAgentSpeak || '').trim()
-    ? rawHistoryText
-    : null;
+  // Deduplication guard: Never display identical text simultaneously in Row 1 and Row 2 (except during submit upward motion)
+  const row1Message = useMemo<HudContextMessage | null>(() => {
+    if (!rawRow1Message) return null;
+    if (isSubmitting) return rawRow1Message;
+    if (effectiveAgentSpeak && rawRow1Message.text === effectiveAgentSpeak.trim()) {
+      return null;
+    }
+    return rawRow1Message;
+  }, [rawRow1Message, isSubmitting, effectiveAgentSpeak]);
 
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -375,19 +449,22 @@ export function AgentCursor({
     const clean = val.trim();
     if (!clean || submitStep !== 'idle') return;
 
-    // Stage 1 (0ms): User's dialogue takes over Row 2 from Row 3 below
+    // Upward scroll stream: User text takes flight from Row 3 to Row 1, Row 2 exits upward past Row 1 and hides
     setSubmittedUserPrompt(clean);
-    setSubmitStep('user-at-row2');
+    setSubmitStep('submitting');
 
-    // Stage 2 (260ms): User's dialogue is pushed up into Row 1; Agent's new dialogue grows from left-to-right in Row 2
-    setTimeout(() => {
-      setSubmitStep('user-at-row1');
+    if (submitTimerRef.current) {
+      clearTimeout(submitTimerRef.current);
+    }
+
+    submitTimerRef.current = setTimeout(() => {
       quickInput?.onSubmit(clean);
-    }, 260);
+      setSubmitStep('idle');
+    }, 320);
   };
 
-  const row2Content = submitStep === 'user-at-row2'
-    ? { type: 'user' as const, text: submittedUserPrompt || '' }
+  const row2Content = isSubmitting
+    ? null
     : (effectiveAgentSpeak ? { type: 'agent' as const, text: effectiveAgentSpeak, isThinking: effectiveIsThinking } : null);
 
   // Tracks horizontal breathing morphing (squeeze & expand) for text updates within the single persistent bubble
@@ -399,12 +476,12 @@ export function AgentCursor({
       prevSpeakRef.current && 
       agentState.speak && 
       prevSpeakRef.current !== agentState.speak &&
-      submitStep !== 'user-at-row2'
+      !isSubmitting
     ) {
       setMorphTrigger(c => c + 1);
     }
     prevSpeakRef.current = agentState.speak;
-  }, [agentState.speak, submitStep]);
+  }, [agentState.speak, isSubmitting]);
 
   // Swapped: Light/Dark Mode Agent Pointer Styles Interchanged!
   const pointerFill = isDarkMode ? '#1c1c1e' : '#ffffff';
@@ -696,16 +773,27 @@ export function AgentCursor({
         {/* Stacked Agent HUD beside Cursor */}
         <div className="absolute left-7.5 top-0.5 flex flex-col gap-1.5 items-start pointer-events-none">
           {/* Primary Speech Row Anchor (Level with Agent Mouse Cursor Pointer) */}
-          <div className="relative pointer-events-none">
+          <div className="relative pointer-events-none min-h-[30px] flex items-center">
             {/* Row 1: Memory shelf - Anchored stably ABOVE Row 2 */}
             <AnimatePresence>
-              {historyText && (
+              {row1Message && (
                 <motion.div
-                  key={historyText}
-                  initial={{ opacity: 0, y: 6, scale: 0.95 }}
+                  key={row1Message.text}
+                  initial={isSubmitting ? { opacity: 1, y: 64, scale: 1 } : { opacity: 0, scale: 0.82, y: 0 }}
                   animate={{ opacity: 0.88, y: 0, scale: 0.96 }}
-                  exit={{ opacity: 0, y: -6, scale: 0.92 }}
-                  transition={{ duration: 0.24, ease: [0.16, 1, 0.3, 1] }}
+                  exit={isSubmitting ? { 
+                    opacity: 0, 
+                    y: -30, 
+                    scale: 0.92,
+                    transition: { duration: 0.24, ease: [0.16, 1, 0.3, 1] } 
+                  } : { 
+                    opacity: 0, 
+                    scale: 0.82,
+                    y: 0, 
+                    transition: { duration: 0.18, ease: [0.16, 1, 0.3, 1] } 
+                  }}
+                  transition={isSubmitting ? { duration: 0.32, ease: [0.16, 1, 0.3, 1] } : { duration: 0.20, ease: [0.16, 1, 0.3, 1] }}
+                  style={{ transformOrigin: '0% 100%' }}
                   className="absolute bottom-full mb-1.5 left-0 pointer-events-none select-none shrink-0 z-20 origin-bottom-left"
                 >
                   <div className="relative px-3 py-1 flex items-center">
@@ -718,7 +806,12 @@ export function AgentCursor({
                       }}
                     />
                     <div className="relative z-10 flex items-center max-w-[340px]" style={{ transform: 'translateZ(0)' }}>
-                      <SingleLineMarquee text={historyText} isDarkMode={isDarkMode} isHistory={true} speaker={quickInput?.isOpen ? 'agent' : 'user'} />
+                      <SingleLineMarquee 
+                        text={row1Message.text} 
+                        isDarkMode={isDarkMode} 
+                        isHistory={true} 
+                        speaker={row1Message.speaker} 
+                      />
                     </div>
                   </div>
                 </motion.div>
@@ -729,15 +822,21 @@ export function AgentCursor({
             <AnimatePresence mode="wait">
               {row2Content && (
                 <motion.div
-                  key={`${quickInput?.targetId || 'global'}-${row2Content.text}`}
-                  initial={{ opacity: 0, scale: 0.82 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  exit={{ 
+                  key={row2Content.text}
+                  initial={{ opacity: 0, scale: 0.82, y: 0 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={isSubmitting ? { 
+                    opacity: 0, 
+                    y: -50,
+                    scale: 0.92,
+                    transition: { duration: 0.28, ease: [0.16, 1, 0.3, 1] } 
+                  } : { 
                     opacity: 0, 
                     scale: 0.82,
-                    transition: { duration: 0.28, ease: 'easeInOut' } 
+                    y: 0,
+                    transition: { duration: 0.18, ease: [0.16, 1, 0.3, 1] } 
                   }}
-                  transition={{ duration: 0.38, ease: 'easeInOut' }}
+                  transition={{ duration: 0.20, ease: [0.16, 1, 0.3, 1] }}
                   style={{ transformOrigin: '0% 50%' }}
                   className="pointer-events-none select-none shrink-0 origin-left"
                 >
@@ -764,9 +863,9 @@ export function AgentCursor({
             {quickInput?.isOpen && (
               <motion.div
                 initial={{ opacity: 0, y: -2, scale: 0.96 }}
-                animate={submitStep !== 'idle' ? { opacity: 0, y: -24, scale: 0.94 } : { opacity: 1, y: 0, scale: 1 }}
-                exit={{ opacity: 0, y: -24, scale: 0.94, transition: { duration: 0.2, ease: [0.16, 1, 0.3, 1] } }}
-                transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+                animate={isSubmitting ? { opacity: 0, scale: 0.96 } : { opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.96, transition: { duration: 0.14, ease: [0.16, 1, 0.3, 1] } }}
+                transition={{ duration: 0.12, ease: [0.16, 1, 0.3, 1] }}
                 className="pointer-events-auto select-none shrink-0"
                 onPointerDown={(e) => e.stopPropagation()}
               >
@@ -812,7 +911,7 @@ export function AgentCursor({
                       }`}
                     >
                       <motion.div
-                        animate={submitStep !== 'idle' ? { y: -8, opacity: 0, scale: 0.6 } : { y: 0, opacity: 1, scale: 1 }}
+                        animate={isSubmitting ? { y: -8, opacity: 0, scale: 0.6 } : { y: 0, opacity: 1, scale: 1 }}
                         transition={{ duration: 0.14, ease: 'easeIn' }}
                       >
                         <ArrowUp size={13} strokeWidth={2.5} />

@@ -3107,6 +3107,31 @@ export const GenerationCard = React.memo(function GenerationCard({
   useEffect(() => {
     let timeout: ReturnType<typeof setTimeout>;
 
+    const evaluateOriginalImage = () => {
+      const currentData = dataRef.current;
+      const hasImage = Boolean(currentData.originalImageUrl || currentData.imageUrl);
+      if (!hasImage) return;
+
+      const s = scale.get();
+      if (s <= 2.0) {
+        if (showOriginalRef.current) setShowOriginal(false);
+        return;
+      }
+
+      const vp = {
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+        scale: s,
+        tx: tx.get(),
+        ty: ty.get()
+      };
+      if (isCardIntersectingRectangle(currentData, vp)) {
+        setShowOriginal(true);
+      } else if (showOriginalRef.current) {
+        setShowOriginal(false);
+      }
+    };
+
     const onZoom = () => {
       const currentData = dataRef.current;
       const hasImage = Boolean(currentData.originalImageUrl || currentData.imageUrl);
@@ -3120,19 +3145,7 @@ export const GenerationCard = React.memo(function GenerationCard({
 
       clearTimeout(timeout);
       timeout = setTimeout(() => {
-        const s = scale.get();
-        if (s <= 2.0 || !hasImage) return;
-
-        const vp = {
-          viewportWidth: window.innerWidth,
-          viewportHeight: window.innerHeight,
-          scale: s,
-          tx: tx.get(),
-          ty: ty.get()
-        };
-        if (isCardIntersectingRectangle(currentData, vp)) {
-          setShowOriginal(true);
-        }
+        evaluateOriginalImage();
       }, 300);
     };
 
@@ -3141,30 +3154,29 @@ export const GenerationCard = React.memo(function GenerationCard({
       const hasImage = Boolean(currentData.originalImageUrl || currentData.imageUrl);
       if (!hasImage) return;
 
-      // During purely DRAG (panning, tx/ty change):
-      // Do NOT degrade immediately! Keep showOriginal as true to maintain sharpness.
-      // Simply debounce check viewport intersection to see if we should turn showOriginal off or on.
+      clearTimeout(timeout);
+      // During active gesture, do not schedule showOriginal timers to avoid concurrent state updates
+      const workspace = typeof document !== 'undefined' ? document.getElementById('canvas-workspace') : null;
+      if (
+        (window as any).isDraggingCard || 
+        (window as any).__nanoDragging ||
+        workspace?.getAttribute('data-gesture') === 'true' ||
+        workspace?.getAttribute('data-panning') === 'true' ||
+        workspace?.getAttribute('data-zooming') === 'true'
+      ) {
+        return;
+      }
+
+      timeout = setTimeout(() => {
+        evaluateOriginalImage();
+      }, 300);
+    };
+
+    const onRestored = () => {
       clearTimeout(timeout);
       timeout = setTimeout(() => {
-        const s = scale.get();
-        if (s <= 2.0 || !hasImage) {
-          setShowOriginal(false);
-          return;
-        }
-
-        const vp = {
-          viewportWidth: window.innerWidth,
-          viewportHeight: window.innerHeight,
-          scale: s,
-          tx: tx.get(),
-          ty: ty.get()
-        };
-        if (isCardIntersectingRectangle(currentData, vp)) {
-          setShowOriginal(true);
-        } else {
-          setShowOriginal(false);
-        }
-      }, 300);
+        evaluateOriginalImage();
+      }, 50);
     };
 
     const unsubScale = scale.on('change', onZoom);
@@ -3172,6 +3184,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     const unsubTy = ty.on('change', onDrag);
 
     window.addEventListener('resize', onZoom);
+    window.addEventListener('canvas-styles-restored', onRestored);
 
     return () => {
       unsubScale();
@@ -3179,6 +3192,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       unsubTy();
       clearTimeout(timeout);
       window.removeEventListener('resize', onZoom);
+      window.removeEventListener('canvas-styles-restored', onRestored);
     };
   }, [scale, tx, ty]);
 
@@ -3272,6 +3286,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     isDragging.current = true;
     (window as any).isDraggingCard = true;
     (window as any).draggingCardId = id;
+    window.dispatchEvent(new CustomEvent('abort-mount-queue'));
     window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId: id } }));
 
     // Synchronously pause all active videos to free hardware decoders during drag
@@ -3389,6 +3404,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       (window as any).draggingCardId = null;
       window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId: id } }));
       window.dispatchEvent(new CustomEvent('card-drag-move'));
+      window.dispatchEvent(new CustomEvent('resume-mount-queue'));
 
       if (isDragging.current) {
         isDragging.current = false;
