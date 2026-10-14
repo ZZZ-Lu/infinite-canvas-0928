@@ -108,6 +108,14 @@
   transition: opacity 400ms ease-out !important;
 }
 
+/* The same Canvas text surface stays visible before, during and after camera motion. */
+#canvas-workspace[data-gesture-low="true"] {
+  opacity: 0;
+}
+.generation-prompt-area {
+  isolation: isolate;
+}
+
 #canvas-workspace[data-zooming="true"] .asset-card,
 #canvas-workspace[data-panning="true"] .asset-card,
 #canvas-workspace[data-gesture="true"] .asset-card,

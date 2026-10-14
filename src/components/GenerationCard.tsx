@@ -25,6 +25,9 @@ import {
 import { isCardIntersectingRectangle } from '../utils/viewportCulling';
 import { getBottomPanelHeight, getPromptAreaHeight } from '../utils/cardLayout';
 import { CardImageCanvas } from './CardImageCanvas';
+import { PromptCanvas } from './PromptCanvas';
+import { PromptPanelCanvas, type PanelControl } from './PromptPanelCanvas';
+import { CANVAS_IDLE_MS } from '../utils/canvasPerformance';
 import { fullImageCache, originalImageCache } from '../utils/imageTextureCache';
 import { ScriptProject } from '../types/script';
 import { generateImageThumbnail, generateVideoThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from '../utils/thumbnail';
@@ -2427,14 +2430,13 @@ export const GenerationCard = React.memo(function GenerationCard({
   const [currentScale, setCurrentScale] = useState(() => scale.get());
   useEffect(() => {
     return scale.on('change', (v) => {
-      // If we cross the 0.4 LOD boundary, trigger state update immediately so transition runs during zoom
-      const wasBelow = currentScale < 0.4;
-      const isNowBelow = v < 0.4;
-      if (wasBelow !== isNowBelow || !isZooming) {
+      // Keep card resolution and reference thumbnails stable during camera motion.
+      const workspace = document.getElementById('canvas-workspace');
+      if (!isZooming && workspace?.getAttribute('data-gesture') !== 'true') {
         setCurrentScale(v);
       }
     });
-  }, [scale, isZooming, currentScale]);
+  }, [scale, isZooming]);
 
   // Synchronize the scale immediately once zooming ends (Instant Restoration)
   useEffect(() => {
@@ -2448,6 +2450,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     if (typeof window === 'undefined') return false;
     return Boolean((window as any).__paintedCardIds?.has(id));
   });
+  const handleImageLoaded = useCallback(() => setIsCardLoaded(true), []);
   // Initial state: tags start strictly with opacity: 0 while card is loading, then smoothly fade in after load
   const [isTagsReady, setIsTagsReady] = useState(false);
 
@@ -2950,6 +2953,22 @@ export const GenerationCard = React.memo(function GenerationCard({
   const lastSavedTimeRef = useRef<number>(currentTime || 0);
   const menuContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [isPromptEditing, setIsPromptEditing] = useState(false);
+  const [isReferenceFilePickerOpen, setIsReferenceFilePickerOpen] = useState(false);
+  const [promptScrollTop, setPromptScrollTop] = useState(0);
+  const promptCursorRef = useRef<number | null>(null);
+  const activatePromptEditor = useCallback((cursor: number) => {
+    promptCursorRef.current = cursor;
+    setIsPromptEditing(true);
+  }, []);
+  useLayoutEffect(() => {
+    if (!isPromptEditing || !textareaRef.current) return;
+    const textarea = textareaRef.current;
+    textarea.focus({ preventScroll: true });
+    const cursor = promptCursorRef.current ?? textarea.value.length;
+    textarea.setSelectionRange(cursor, cursor);
+    textarea.scrollTop = promptScrollTop;
+  }, [isPromptEditing]);
   const rightTagRef = useRef<HTMLDivElement>(null);
   const [rightTagWidth, setRightTagWidth] = useState<number>(0);
   const miraTagRef = useRef<HTMLDivElement>(null);
@@ -3108,6 +3127,8 @@ export const GenerationCard = React.memo(function GenerationCard({
     let timeout: ReturnType<typeof setTimeout>;
 
     const evaluateOriginalImage = () => {
+      const workspace = document.getElementById('canvas-workspace');
+      if ((window as any).isDraggingCard || workspace?.getAttribute('data-gesture') === 'true') return;
       const currentData = dataRef.current;
       const hasImage = Boolean(currentData.originalImageUrl || currentData.imageUrl);
       if (!hasImage) return;
@@ -3140,13 +3161,16 @@ export const GenerationCard = React.memo(function GenerationCard({
       // Intent-driven lazy degradation on ZOOM (scaling):
       // Drop back to proxy immediately to save heavy rasterization
       if (showOriginalRef.current) {
+        showOriginalRef.current = false;
         setShowOriginal(false);
       }
 
       clearTimeout(timeout);
+      // The shared restoration event handles camera gestures; avoid one timer per card per frame.
+      if (document.getElementById('canvas-workspace')?.getAttribute('data-gesture') === 'true') return;
       timeout = setTimeout(() => {
         evaluateOriginalImage();
-      }, 300);
+      }, CANVAS_IDLE_MS);
     };
 
     const onDrag = () => {
@@ -3169,20 +3193,19 @@ export const GenerationCard = React.memo(function GenerationCard({
 
       timeout = setTimeout(() => {
         evaluateOriginalImage();
-      }, 300);
+      }, CANVAS_IDLE_MS);
     };
 
     const onRestored = () => {
       clearTimeout(timeout);
-      timeout = setTimeout(() => {
-        evaluateOriginalImage();
-      }, 50);
+      evaluateOriginalImage();
     };
 
     const unsubScale = scale.on('change', onZoom);
     const unsubTx = tx.on('change', onDrag);
     const unsubTy = ty.on('change', onDrag);
 
+    window.addEventListener('canvas-gesture-start', onZoom);
     window.addEventListener('resize', onZoom);
     window.addEventListener('canvas-styles-restored', onRestored);
 
@@ -3191,6 +3214,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       unsubTx();
       unsubTy();
       clearTimeout(timeout);
+      window.removeEventListener('canvas-gesture-start', onZoom);
       window.removeEventListener('resize', onZoom);
       window.removeEventListener('canvas-styles-restored', onRestored);
     };
@@ -3237,7 +3261,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     if (shouldRenderBottomPanel) {
       adjustTextareaHeight();
     }
-  }, [shouldRenderBottomPanel, localPrompt, adjustTextareaHeight]);
+  }, [shouldRenderBottomPanel, localPrompt, adjustTextareaHeight, isPromptEditing]);
 
   // Track dragging locally for 0-latency, then sync on pointer up
   const posRef = useRef({ x, y });
@@ -3358,6 +3382,7 @@ export const GenerationCard = React.memo(function GenerationCard({
         const workspace = document.getElementById('canvas-workspace');
         if (workspace) {
           workspace.setAttribute('data-gesture', 'true');
+          window.dispatchEvent(new CustomEvent('canvas-gesture-start'));
         }
 
         // Apply performance classes directly to the DOM for all dragged nodes
@@ -3411,7 +3436,7 @@ export const GenerationCard = React.memo(function GenerationCard({
 
         const movedDistance = Math.hypot(totalDx.current, totalDy.current);
         if (movedDistance > 2) {
-          // Drag occurred: Maintain persistent degradation & arm absolute idle fallback (2000ms)
+          // Keep effects degraded until the shared 300ms idle interval expires.
           if (typeof (window as any).resetGlobalZoomTimer === 'function') {
             (window as any).resetGlobalZoomTimer();
           }
@@ -4101,6 +4126,7 @@ export const GenerationCard = React.memo(function GenerationCard({
 
   // Insert mention into prompt with exact spacing: "前后分别空一格"
   const insertMention = (refItem: { name: string; url?: string; fileData?: Blob }) => {
+    setIsPromptEditing(true);
     const refName = refItem.name;
     const textarea = textareaRef.current;
     const currentPrompt = localPrompt || '';
@@ -4435,6 +4461,8 @@ export const GenerationCard = React.memo(function GenerationCard({
     ? selectedMcpModel.resolutions.map(option => (typeof option === 'object' ? option.label : option))
     : (data.isVideo ? ['720p', '1080p'] : ['1K', '2K', '4K']);
   const selectedModel = selectedMcpModel?.name || '选择模型';
+  const useNativePromptPanel = isPromptEditing || Boolean(openMenu) || mentionMenuOpen ||
+    Boolean(hoveredRefUrl || activePreviewUrl || data.generationError) || isReferenceFilePickerOpen;
   const enumParameters: McpSchemaParameter[] = data.isVideo ? [
     {
       name: 'duration',
@@ -4455,6 +4483,19 @@ export const GenerationCard = React.memo(function GenerationCard({
     default: selectedMcpModel.qualities[0].value,
   }] : []);
 
+  const panelControls: PanelControl[] = [
+    { key: 'mention', label: '引用', targetId: `mention-btn-${id}`, onClick: () => { setIsPromptEditing(true); setMentionMenuOpen(true); } },
+    { key: 'model', label: String(selectedModel), targetId: `model-btn-${id}`, onClick: () => setOpenMenu({ type: 'model', ownerId: 'user' }) },
+    ...enumParameters.map(param => {
+      const value = data.mcpParameters?.[param.name] ?? param.default ?? param.enum?.[0];
+      const label = param.name === 'quality'
+        ? ('qualities' in selectedMcpModel ? selectedMcpModel.qualities.find(option => option.value === value)?.label : undefined) || value
+        : param.name === 'duration' ? `${value}秒` : param.name === 'enable_sound' ? (value ? '有声' : '静音') : value;
+      return { key: param.name, label: String(label), targetId: `param-btn-${id}-${param.name}`, onClick: () => setOpenMenu({ type: 'param' as const, ownerId: param.name }) };
+    }),
+    { key: 'ratio', label: String(ratio), targetId: `ratio-btn-${id}`, onClick: () => setOpenMenu({ type: 'ratio', ownerId: 'user' }) },
+    { key: 'res', label: String(res), targetId: `res-btn-${id}`, onClick: () => setOpenMenu({ type: 'res', ownerId: 'user' }) },
+  ];
   // Dynamic height calculation based on hovered reference image aspect ratio
   const textareaHeight = textareaRef.current?.offsetHeight || 50;
   const targetPreviewHeight = previewDimensions
@@ -5184,7 +5225,7 @@ export const GenerationCard = React.memo(function GenerationCard({
               dpr={dpr}
               state={state}
               isZooming={isZooming}
-              onLoaded={() => setIsCardLoaded(true)}
+              onLoaded={handleImageLoaded}
               className="squircle"
             />
           )
@@ -5319,6 +5360,21 @@ export const GenerationCard = React.memo(function GenerationCard({
           minHeight: getBottomPanelHeight(localPrompt, refList.length),
         }}
       >
+        {!useNativePromptPanel ? <PromptPanelCanvas
+          height={getBottomPanelHeight(localPrompt, refList.length)} references={refList}
+          controls={panelControls} scale={scale} generating={state === 'generating'} canGenerate={Boolean(localPrompt.trim())}
+          onGenerate={handleGenerate} cardId={id}
+          onReference={index => setHoveredRefUrl(refList[index].url)}
+          onMention={index => insertMention({ ...refList[index], name: refList[index].name || `图 ${index + 1}` })}
+          onRemove={removeReferenceImage} onAdd={() => setOpenMenu({ type: 'ref', ownerId: 'user' })}
+        >
+          <div className="generation-prompt-area absolute" style={{ left: 16, top: 24 + Math.ceil((refList.length + 1) / 8) * 56, width: 446, height: getPromptAreaHeight(localPrompt) }}>
+            <PromptCanvas text={localPrompt || ''} height={getPromptAreaHeight(localPrompt)}
+              mentionNames={allMentionItems.map(item => item.name)} scale={scale}
+              editing={false} scrollTop={promptScrollTop}
+              targetId={`prompt-input-${id}`} onEdit={activatePromptEditor} disabled={state === 'generating'} />
+          </div>
+        </PromptPanelCanvas> : <>
         {/* High-LOD Interactive Prompt Component: Base Layer directly rendered underneath with full layout */}
         <div
           className="generation-card-bottom-panel-content relative z-0 flex flex-col gap-3 w-full"
@@ -5370,6 +5426,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                     data-agent-target={`ref-option-local-${id}`}
                     onClick={(e) => {
                       e.stopPropagation();
+                      setIsReferenceFilePickerOpen(true);
                       fileInputRef.current?.click();
                       setOpenMenu(null);
                     }}
@@ -5416,7 +5473,8 @@ export const GenerationCard = React.memo(function GenerationCard({
               type="file"
               accept="image/*"
               className="hidden"
-              onChange={handleLocalUpload}
+              onChange={event => { handleLocalUpload(event); setIsReferenceFilePickerOpen(false); }}
+              onCancel={() => setIsReferenceFilePickerOpen(false)}
             />
           </div>
           
@@ -5443,7 +5501,7 @@ export const GenerationCard = React.memo(function GenerationCard({
         {/* Middle: Prompt Textarea */}
         <div 
           ref={promptContainerRef}
-          className="relative w-full mt-1 min-h-[50px] flex items-center"
+          className="generation-prompt-area relative w-full mt-1 min-h-[50px] flex items-center"
           style={{
             height: activePreviewUrl
               ? expandedPromptHeight
@@ -5454,6 +5512,12 @@ export const GenerationCard = React.memo(function GenerationCard({
             transition: isRebounding ? 'height 0.24s cubic-bezier(0.16, 1, 0.3, 1)' : 'none',
           }}
         >
+          <PromptCanvas text={localPrompt || ''} height={getPromptAreaHeight(localPrompt)}
+            mentionNames={allMentionItems.map(item => item.name)} scale={scale}
+            editing={isPromptEditing} scrollTop={promptScrollTop}
+            targetId={`prompt-input-${id}`}
+            onEdit={activatePromptEditor} disabled={state === 'generating'} />
+          {isPromptEditing && <>
           {/* Highlight mirror backdrop */}
           <div
             ref={mirrorRef}
@@ -5487,7 +5551,12 @@ export const GenerationCard = React.memo(function GenerationCard({
               }
             }}
             onChange={handleTextareaChange}
-            onBlur={handleTextareaBlur}
+            onBlur={() => {
+              promptCursorRef.current = textareaRef.current?.selectionStart ?? null;
+              handleTextareaBlur();
+              setMentionMenuOpen(false);
+              setIsPromptEditing(false);
+            }}
             onKeyDown={handleTextareaKeyDown}
             onClick={(e) => checkCursorMention(e.currentTarget.value, e.currentTarget.selectionStart)}
             onSelect={(e) => checkCursorMention(e.currentTarget.value, e.currentTarget.selectionStart)}
@@ -5497,6 +5566,7 @@ export const GenerationCard = React.memo(function GenerationCard({
               }
             }}
             onScroll={() => {
+              if (textareaRef.current) setPromptScrollTop(textareaRef.current.scrollTop);
               if (mirrorRef.current && textareaRef.current) {
                 mirrorRef.current.scrollTop = textareaRef.current.scrollTop;
               }
@@ -5519,6 +5589,7 @@ export const GenerationCard = React.memo(function GenerationCard({
             }}
             rows={2}
           />
+          </>}
 
           {/* @ Mention Suggestion Dropdown */}
           {mentionMenuOpen && (
@@ -5634,6 +5705,7 @@ export const GenerationCard = React.memo(function GenerationCard({
               data-agent-target={`mention-btn-${id}`}
               onClick={(e) => {
                 e.stopPropagation();
+                setIsPromptEditing(true);
                 if (textareaRef.current) {
                   textareaRef.current.focus();
                 }
@@ -5883,7 +5955,7 @@ export const GenerationCard = React.memo(function GenerationCard({
           </button>
         </div>
         </div>
-
+        </>}
       </div>
       )}
       </motion.div>

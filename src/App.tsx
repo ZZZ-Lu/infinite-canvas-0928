@@ -9,6 +9,7 @@ import { FpsCounter } from './components/FpsCounter';
 import { generateImageThumbnail, generateVideoThumbnail, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
 import { fastGetImageDimensions } from './utils/imageHeader';
 import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
+import { CANVAS_IDLE_MS } from './utils/canvasPerformance';
 import { buildCardQuadTree, QuadTree, BoundingBox } from './utils/quadTree';
 import { getBottomPanelHeight } from './utils/cardLayout';
 import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
@@ -366,7 +367,17 @@ export default function App() {
   const updateCurrentScale = (latestScale: number) => {
     const workspace = document.getElementById('canvas-workspace');
     if (workspace) {
-      workspace.style.setProperty('--current-scale', latestScale.toString());
+      if (workspace.getAttribute('data-gesture') === 'true') {
+        // A single boundary switch lets the already-active Nano canvas take over,
+        // without reconciling/unmounting every editor in the middle of a wheel gesture.
+        const useNanoPreview = latestScale < getNanoLodThreshold();
+        if (useNanoPreview !== (workspace.getAttribute('data-gesture-low') === 'true')) {
+          if (useNanoPreview) workspace.setAttribute('data-gesture-low', 'true');
+          else workspace.removeAttribute('data-gesture-low');
+        }
+      } else {
+        workspace.style.setProperty('--current-scale', latestScale.toString());
+      }
     }
   };
   
@@ -3387,7 +3398,6 @@ export default function App() {
   // --- Viewport Spatial Culling with QuadTree (Virtualization) ---
   // Uses O(log N + K) QuadTree spatial index to rapidly query visible cards out of 25,000+ items in < 0.05ms.
   const [visibleCardIdSet, setVisibleCardIdSet] = useState<Set<string>>(() => new Set());
-  const mountFrameCounterRef = useRef<number>(0);
   const lastFrameDurationRef = useRef<number>(0);
   const quadTreeRef = useRef<QuadTree<CardData> | null>(null);
 
@@ -3685,7 +3695,6 @@ export default function App() {
   const [renderedCardIds, setRenderedCardIds] = useState<Set<string>>(() => new Set());
   const renderedCardIdsRef = useRef<Set<string>>(renderedCardIds);
   renderedCardIdsRef.current = renderedCardIds;
-  const wheelStopTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   const handleCardDrag = useCallback((id: string, dx: number, dy: number) => {
     // No-op. Real-time dragging is now fully handled in DOM by GenerationCard.tsx (Master-Slave architecture).
@@ -6068,8 +6077,24 @@ export default function App() {
 
   // Intent-driven lazy restoration logic
   const restoreCanvasStyles = useCallback(() => {
-    // If the user is actively dragging the canvas, strictly forbid restoration
-    if (isDraggingCanvasRef.current) return;
+    // Never restore while a pointer is held or a programmatic camera animation is running.
+    if (isDraggingCanvasRef.current || (window as any).isDraggingCard ||
+        (window as any).__nanoDragging || isTweenZoomingRef.current || isZoomAnimationActiveRef.current) {
+      clearTimeout(zoomTimeoutRef.current);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
+      return;
+    }
+
+    const workspace = document.getElementById('canvas-workspace');
+    const wasDegraded = isZoomingRef.current || workspace?.getAttribute('data-gesture') === 'true';
+    if (!wasDegraded && !document.querySelector('video[data-was-playing="true"]')) return;
+    clearTimeout(zoomTimeoutRef.current);
+    workspace?.removeAttribute('data-zooming');
+    workspace?.removeAttribute('data-panning');
+    workspace?.removeAttribute('data-gesture');
+    workspace?.removeAttribute('data-gesture-low');
+    workspace?.style.setProperty('--current-scale', tScale.get().toString());
+    isZoomingRef.current = false;
     
     (window as any).isDraggingCard = false;
 
@@ -6121,12 +6146,7 @@ export default function App() {
     setIsNanoLod(isMicro);
     setMountEpoch(n => (n + 1) % 1000000);
     
-    const workspace = document.getElementById('canvas-workspace');
     if (workspace) {
-      workspace.removeAttribute('data-zooming');
-      workspace.removeAttribute('data-panning');
-      workspace.removeAttribute('data-gesture');
-      isZoomingRef.current = false;
       setIsZooming(false); // MUST sync React state so it doesn't revert on next render
       window.dispatchEvent(new CustomEvent('canvas-styles-restored'));
     }
@@ -6136,11 +6156,25 @@ export default function App() {
     (window as any).resetGlobalZoomTimer = () => {
       clearTimeout(zoomTimeoutRef.current);
       // Idle Fallback: 300ms idle delay before restoring styles/textures
-      const idleDelay = 300;
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, idleDelay);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
     };
     return () => { delete (window as any).resetGlobalZoomTimer; };
   }, [restoreCanvasStyles]);
+
+  // Start the idle interval at the last actual camera change, including tween frames.
+  useEffect(() => {
+    const onCameraChange = () => {
+      const workspace = document.getElementById('canvas-workspace');
+      if (!isZoomingRef.current && workspace?.getAttribute('data-gesture') !== 'true') return;
+      clearTimeout(zoomTimeoutRef.current);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
+    };
+    const subscriptions = [tx, ty, tScale].map(value => value.on('change', onCameraChange));
+    return () => {
+      subscriptions.forEach(unsubscribe => unsubscribe());
+      clearTimeout(zoomTimeoutRef.current);
+    };
+  }, [tx, ty, tScale, restoreCanvasStyles]);
 
   const resetOverviewPrompt = useCallback(() => {
     wheelZoomOutAccumulatorRef.current = 0;
@@ -6235,7 +6269,7 @@ export default function App() {
       setIsZooming(true);
     }
     clearTimeout(zoomTimeoutRef.current);
-    zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
+    zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
     
     const animConfig: any = { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] };
     animate(tScale, targetScale, animConfig);
@@ -6271,6 +6305,7 @@ export default function App() {
         workspace.setAttribute('data-gesture', 'true');
         isZoomingRef.current = true;
         setIsZooming(true);
+        window.dispatchEvent(new CustomEvent('canvas-gesture-start'));
       }
 
       const { x, y, scale } = preOverviewTransform.current;
@@ -6282,7 +6317,7 @@ export default function App() {
       animate(ty, y, animConfig);
       
       clearTimeout(zoomTimeoutRef.current);
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
       
       preOverviewTransform.current = null;
     }
@@ -6315,7 +6350,7 @@ export default function App() {
     clearTimeout(zoomTimeoutRef.current);
     
     // 3. Set restoration timer after tween animation finishes
-    zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
+    zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
 
     // 4. Calculate coordinate transition zooming toward center of screen
     const centerX = window.innerWidth / 2;
@@ -6427,7 +6462,7 @@ export default function App() {
       targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
 
       clearTimeout(zoomTimeoutRef.current);
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 360);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
 
       animate(tScale, targetScale, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
       animate(tx, targetTx, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
@@ -6440,7 +6475,7 @@ export default function App() {
       targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
 
       clearTimeout(zoomTimeoutRef.current);
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
 
       animate(tScale, targetScale, { type: 'tween', duration: 0.40, ease: [0.16, 1, 0.3, 1] });
       animate(tx, targetTx, { type: 'tween', duration: 0.40, ease: [0.16, 1, 0.3, 1] });
@@ -6454,7 +6489,7 @@ export default function App() {
       targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
 
       clearTimeout(zoomTimeoutRef.current);
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 360);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
 
       // Set state to defer mounting until zoom animation completes
       isZoomAnimationActiveRef.current = true;
@@ -6564,6 +6599,7 @@ export default function App() {
         setIsZooming(true);
 
         // Offload background video pauses to next animation frame to prevent wheel tick jank
+        window.dispatchEvent(new CustomEvent('canvas-gesture-start'));
         requestAnimationFrame(() => {
           try {
             const allVideos = document.querySelectorAll('video');
@@ -6581,10 +6617,6 @@ export default function App() {
 
       // Instantly abort active mount queue on wheel tick to protect 60fps
       window.dispatchEvent(new CustomEvent('abort-mount-queue'));
-      if (wheelStopTimerRef.current) clearTimeout(wheelStopTimerRef.current);
-      wheelStopTimerRef.current = setTimeout(() => {
-        window.dispatchEvent(new CustomEvent('resume-mount-queue'));
-      }, 70);
 
       // 2. Clear the fallback timeout on every wheel tick
       clearTimeout(zoomTimeoutRef.current);
@@ -6596,7 +6628,7 @@ export default function App() {
       const newScale = Math.min(Math.max(0.1, prevTarget.scale * Math.exp(delta)), 5);
       
       // 3. Intent-Driven Lazy Restoration: 300ms idle fallback
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 300);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
       
       const rect = container.getBoundingClientRect();
       const cursorX = e.clientX - rect.left;
@@ -6667,7 +6699,7 @@ export default function App() {
       animate(ty, targetTy, animConfig);
       
       clearTimeout(zoomTimeoutRef.current);
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
       
       // Clear overview state to commit the new position
       preOverviewTransform.current = null;
@@ -6792,6 +6824,7 @@ export default function App() {
           if (workspace) {
             workspace.setAttribute('data-panning', 'true');
             workspace.setAttribute('data-gesture', 'true');
+            window.dispatchEvent(new CustomEvent('canvas-gesture-start'));
           }
           // Offload background video pauses to next animation frame to prevent pointerdown jank
           requestAnimationFrame(() => {
@@ -6914,7 +6947,7 @@ export default function App() {
     // Reset idle timer after drag: 300ms idle fallback
     if (e.button === 1) {
       clearTimeout(zoomTimeoutRef.current);
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 300);
+      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
       window.dispatchEvent(new CustomEvent('resume-mount-queue'));
     }
     
@@ -7049,12 +7082,12 @@ export default function App() {
       return distA - distB;
     });
 
-    // 5. Strict Time-Slicing Frame-Budget Queue ("Trading Time for Framerate"):
-    // Limits JS execution to strictly <= 3.0ms per frame, ensuring >80% of frame time
-    // is reserved for browser Layout, Paint, and Compositing, guaranteeing buttery 60/120 FPS.
+    // Mount a small batch, then observe the next frame including React/layout work.
+    // Slow frames reduce the next batch; collecting IDs alone is not a render budget.
     (async () => {
       isQueueProcessingRef.current = true;
       let currentIndex = 0;
+      let previousFrameTime: number | null = null;
 
       while (currentIndex < sortedQueue.length) {
         if (abortToken.aborted) {
@@ -7062,17 +7095,12 @@ export default function App() {
           return;
         }
 
-        const frameStartTime = performance.now();
         const batchToMount: CardData[] = [];
+        const batchLimit = lastFrameDurationRef.current > 20 ? 1 : 2;
 
-        // Accumulate cards into this frame's batch until strict 2.8ms JS time budget is reached
-        while (currentIndex < sortedQueue.length) {
+        while (currentIndex < sortedQueue.length && batchToMount.length < batchLimit) {
           batchToMount.push(sortedQueue[currentIndex]);
           currentIndex++;
-          // For generation cards with heavy DOM, limit to 1-2 per frame to keep JS work strictly under 3ms
-          if (performance.now() - frameStartTime >= 2.8 || batchToMount.length >= 2) {
-            break;
-          }
         }
 
         if (batchToMount.length > 0) {
@@ -7098,7 +7126,13 @@ export default function App() {
 
         // Yield control back to browser Compositor for Paint & Layout
         await new Promise<void>(resolve => {
-          requestAnimationFrame(() => resolve());
+          requestAnimationFrame(frameTime => {
+            if (previousFrameTime !== null) {
+              lastFrameDurationRef.current = frameTime - previousFrameTime;
+            }
+            previousFrameTime = frameTime;
+            resolve();
+          });
         });
 
         if (abortToken.aborted) {
@@ -7180,7 +7214,7 @@ export default function App() {
           animate(ty, targetTy, { type: 'tween', duration: 0.4, ease: [0.16, 1, 0.3, 1] });
           
           clearTimeout(zoomTimeoutRef.current);
-          zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, 400);
+          zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
           
           // Clear overview state to commit the new position
           preOverviewTransform.current = null;
@@ -7359,7 +7393,6 @@ export default function App() {
                   document.getElementById('canvas-workspace')?.getAttribute('data-zooming') === 'true'
                 ))
               ) ||
-              (renderedCardIds.size < cards.length && cards.length > 0) ||
               (renderedCardIds.size < visibleCards.length && visibleCards.length > 0) ||
               (() => {
                 if (typeof window === 'undefined') return false;
