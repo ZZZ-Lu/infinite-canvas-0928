@@ -1,0 +1,20 @@
+const fs=require('node:fs'),vm=require('node:vm'),ts=require('typescript'),assert=require('node:assert/strict');
+function compile(path,context){const code=ts.transpileModule(fs.readFileSync(path,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;vm.runInNewContext(code,context);return context.exports;}
+const policy=compile('src/utils/canvasRecoveryPolicy.ts',{exports:{}});
+const p=policy.createRecoveryPacer(); for(let i=0;i<30;i++)p.observeFrame(1000/120);
+assert.equal(p.idleFrames,0); assert.ok(Math.abs(p.frameBudget-1000/120)<.01);
+p.observeJob(40); assert.equal(p.idleFrames,2); p.observeFrame(50); assert.equal(p.idleFrames,4);
+for(let i=0;i<17;i++)p.observeFrame(1000/120); assert.equal(p.idleFrames,4);
+p.observeFrame(1000/120); assert.equal(p.idleFrames,3);
+for(let i=0;i<100;i++)p.observeFrame(50); assert.equal(p.idleFrames,12);
+p.resumeAfterGesture(); assert.equal(p.idleFrames,2);
+const sixty=policy.createRecoveryPacer(); for(let i=0;i<30;i++)sixty.observeFrame(1000/60);
+assert.equal(sixty.idleFrames,0); assert.ok(Math.abs(sixty.frameBudget-1000/60)<.01);
+let now=0,moving=false,id=0;const frames=new Map();
+const queue=compile('src/utils/canvasPerformance.ts',{exports:{},require:()=>policy,performance:{now:()=>now},document:{getElementById:()=>({getAttribute:n=>n==='data-gesture'&&moving?'true':null})},requestAnimationFrame:fn=>{frames.set(++id,fn);return id},cancelAnimationFrame:id=>frames.delete(id)});
+const tick=(dt=1000/120)=>{now+=dt;const pending=[...frames.values()];frames.clear();pending.forEach(fn=>fn(now));};
+let count=0;for(let i=0;i<5;i++)queue.scheduleCanvasSurface(()=>count++);
+for(let i=0;i<80;i++)tick(50);assert.equal(count,5);assert.equal(frames.size,0);
+moving=true; const cancel=queue.scheduleCanvasSurface(()=>count++);for(let i=0;i<4;i++)tick();assert.equal(count,5);cancel();assert.equal(frames.size,0);
+moving=false;queue.scheduleCanvasSurface(()=>count++);for(let i=0;i<15;i++)tick();assert.equal(count,6);
+console.log('PASS: 120/60Hz cadence, task/frame throttling, slow acceleration, bounded progress, pause/cancel/resume');

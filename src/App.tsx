@@ -9,7 +9,9 @@ import { FpsCounter } from './components/FpsCounter';
 import { generateImageThumbnail, generateVideoThumbnail, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
 import { fastGetImageDimensions } from './utils/imageHeader';
 import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
-import { CANVAS_IDLE_MS } from './utils/canvasPerformance';
+import { CANVAS_IDLE_MS, scheduleCanvasSurface } from './utils/canvasPerformance';
+import { readyPromptPanels } from './utils/promptSurfaceCache';
+import { createCardMountStore, ProgressiveGenerationCard } from './components/ProgressiveGenerationCard';
 import { buildCardQuadTree, QuadTree, BoundingBox } from './utils/quadTree';
 import { getBottomPanelHeight } from './utils/cardLayout';
 import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
@@ -3019,7 +3021,7 @@ export default function App() {
         document.getElementById('canvas-workspace')?.getAttribute('data-zooming') === 'true' ||
         document.getElementById('canvas-workspace')?.getAttribute('data-panning') === 'true'
       ) {
-        thumbnailCommitTimerRef.current = setTimeout(flushThumbnails, 800);
+        thumbnailCommitTimerRef.current = setTimeout(flushThumbnails, CANVAS_IDLE_MS);
         return;
       }
       const map = new Map<string, string>(pendingThumbnailsRef.current);
@@ -3388,11 +3390,24 @@ export default function App() {
 
   const [paintEpoch, setPaintEpoch] = useState(0);
   useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const handleCardPainted = () => {
-      setPaintEpoch(n => (n + 1) % 1000000);
+      if (timer !== null) return;
+      const flush = () => {
+        if (isZoomingRef.current || (window as any).isDraggingCard || (window as any).__nanoDragging) {
+          timer = setTimeout(flush, CANVAS_IDLE_MS);
+          return;
+        }
+        timer = null;
+        setPaintEpoch(n => (n + 1) % 1000000);
+      };
+      timer = setTimeout(flush, CANVAS_IDLE_MS);
     };
     window.addEventListener('card-painted', handleCardPainted);
-    return () => window.removeEventListener('card-painted', handleCardPainted);
+    return () => {
+      window.removeEventListener('card-painted', handleCardPainted);
+      if (timer !== null) clearTimeout(timer);
+    };
   }, []);
 
   // --- Viewport Spatial Culling with QuadTree (Virtualization) ---
@@ -3659,16 +3674,15 @@ export default function App() {
       // isDomCardsActive will be disabled by the onReady callback from NanoLodCanvas once its first frame renders
     } else {
       setIsDomCardsActive(true);
-      // Give DOM cards window to mount, paint and finish 700ms crossfade before destroying backdrop Canvas
-      const t = setTimeout(() => setIsNanoCanvasActive(false), 800);
-      return () => clearTimeout(t);
+      // Actual per-card media/panel readiness below keeps the backdrop alive.
+      setIsNanoCanvasActive(false);
     }
   }, [isNanoLod]);
 
   useEffect(() => {
     const unsub = tScale.on('change', (s) => {
       // Strictly defer React state updates during active zoom/drag gestures.
-      // Eliminates the 60% scale boundary frame spike by avoiding React re-renders mid-gesture.
+      // Eliminates the 40% scale boundary frame spike by avoiding React re-renders mid-gesture.
       if (isZoomingRef.current || isDraggingCanvasRef.current) {
         return;
       }
@@ -3692,7 +3706,11 @@ export default function App() {
   }, [tScale, triggerLodFadeIn, cancelLodFade]);
 
   // Set of DOM-mounted card IDs (Center-Out Sequential Queue)
-  const [renderedCardIds, setRenderedCardIds] = useState<Set<string>>(() => new Set());
+  const cardMountStore = useMemo(createCardMountStore, []);
+  const renderedCardIds = cardMountStore.ids;
+  const setRenderedCardIds = useCallback((update: React.SetStateAction<Set<string>>) => {
+    cardMountStore.replace(typeof update === 'function' ? update(cardMountStore.ids) : update);
+  }, [cardMountStore]);
   const renderedCardIdsRef = useRef<Set<string>>(renderedCardIds);
   renderedCardIdsRef.current = renderedCardIds;
 
@@ -6999,12 +7017,13 @@ export default function App() {
   // 2. Mounts cards sequentially: Card 1 mounts -> awaits paint completion handshake -> Card 2 mounts -> ...
   // 3. Fully interruptible (Abort token): Wheel or drag gestures instantly halt the queue (0ms latency),
   //    and re-launch from the newly centered coordinates once motion stops.
-  const mountQueueAbortRef = useRef<{ aborted: boolean }>({ aborted: false });
+  const mountQueueAbortRef = useRef<{ aborted: boolean; cancel?: () => void }>({ aborted: false });
   const isQueueProcessingRef = useRef(false);
   const visibleCardsRef = useRef<CardData[]>([]);
 
   const abortMountQueue = useCallback(() => {
     mountQueueAbortRef.current.aborted = true;
+    mountQueueAbortRef.current.cancel?.();
     mountQueueAbortRef.current = { aborted: true };
     isQueueProcessingRef.current = false;
   }, []);
@@ -7055,7 +7074,8 @@ export default function App() {
 
     // 3. Cancel any previous queue session and create fresh cancellation token
     mountQueueAbortRef.current.aborted = true;
-    const abortToken = { aborted: false };
+    mountQueueAbortRef.current.cancel?.();
+    const abortToken: { aborted: boolean; cancel?: () => void } = { aborted: false };
     mountQueueAbortRef.current = abortToken;
 
     // 4. Sort strictly from viewport Center outward (Center -> Perimeter)
@@ -7082,8 +7102,8 @@ export default function App() {
       return distA - distB;
     });
 
-    // Mount a small batch, then observe the next frame including React/layout work.
-    // Slow frames reduce the next batch; collecting IDs alone is not a render budget.
+    // Prefer gradual loading: one card per two frame boundaries.
+    // Collecting IDs alone is not a render budget or a paint-completion handshake.
     (async () => {
       isQueueProcessingRef.current = true;
       let currentIndex = 0;
@@ -7096,7 +7116,7 @@ export default function App() {
         }
 
         const batchToMount: CardData[] = [];
-        const batchLimit = lastFrameDurationRef.current > 20 ? 1 : 2;
+        const batchLimit = 1;
 
         while (currentIndex < sortedQueue.length && batchToMount.length < batchLimit) {
           batchToMount.push(sortedQueue[currentIndex]);
@@ -7106,25 +7126,27 @@ export default function App() {
         if (batchToMount.length > 0) {
           const batchIds = new Set(batchToMount.map(c => c.id));
 
-          // Single micro-batched state update for this frame
-          setRenderedCardIds(prev => {
-            let hasNew = false;
-            for (const id of batchIds) {
-              if (!prev.has(id)) {
-                hasNew = true;
-                break;
+          // Mounts and surface draws share ONE queue, rather than racing per frame.
+          await new Promise<void>(resolve => {
+            const cancel = scheduleCanvasSurface(() => {
+              abortToken.cancel = undefined;
+              if (!abortToken.aborted) {
+                setRenderedCardIds(prev => {
+                  const next = new Set(prev);
+                  let hasNew = false;
+                  for (const id of batchIds) {
+                    if (!next.has(id)) { next.add(id); hasNew = true; }
+                  }
+                  return hasNew ? next : prev;
+                });
               }
-            }
-            if (!hasNew) return prev;
-            const next = new Set(prev);
-            for (const id of batchIds) {
-              next.add(id);
-            }
-            return next;
+              resolve();
+            });
+            abortToken.cancel = () => { cancel(); resolve(); };
           });
         }
 
-        // Yield control back to browser Compositor for Paint & Layout
+        // Allow the commit to enqueue its surfaces; the shared pacer controls speed.
         await new Promise<void>(resolve => {
           requestAnimationFrame(frameTime => {
             if (previousFrameTime !== null) {
@@ -7345,7 +7367,7 @@ export default function App() {
         }}
       />
 
-      {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.60 or during staggered DOM loading) */}
+      {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.40 or during staggered DOM loading) */}
       {(() => {
         const targetCardIds = new Set<string>();
         if (agentFocus.primaryCardId) targetCardIds.add(agentFocus.primaryCardId);
@@ -7398,7 +7420,8 @@ export default function App() {
                 if (typeof window === 'undefined') return false;
                 const paintedSet = (window as any).__paintedCardIds;
                 if (!paintedSet) return visibleCards.length > 0;
-                return visibleCards.some(c => !paintedSet.has(c.id));
+                return visibleCards.some(c => !paintedSet.has(c.id) ||
+                  (!(c.fileName || c.isAsset) && !readyPromptPanels.has(c.id)));
               })()
             }
             onReady={handleNanoCanvasReady}
@@ -7420,9 +7443,8 @@ export default function App() {
         style={{ transformOrigin: '0 0', x: tx, y: ty, scale: tScale }}
       >
 
-        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.60), unmount all DOM cards for ultra-fast Hybrid Canvas rendering */}
+        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.40), unmount all DOM cards for ultra-fast Hybrid Canvas rendering */}
         {!isOverviewMode && isDomCardsActive && visibleCards.map(card => {
-          if (!renderedCardIds.has(card.id)) return null;
           const hasImage = Boolean(card.imageUrl || card.originalImageUrl || card.thumbnailUrl);
           const isPickerSelectable = Boolean(pickerSession && card.id !== pickerSession.targetCardId && hasImage);
           const pickerIndex = pickerSession 
@@ -7444,7 +7466,8 @@ export default function App() {
             : (isQuickInputTarget ? 'quickInput' : (focusItem?.sourceTool?.includes('compare') ? 'compare' : 'qc'));
 
           return (
-            <GenerationCard 
+            <ProgressiveGenerationCard
+              mountStore={cardMountStore}
               key={card.id}
               data={card}
               scale={tScale}

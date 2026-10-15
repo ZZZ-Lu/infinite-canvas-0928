@@ -1,0 +1,12 @@
+const fs = require('node:fs'), vm = require('node:vm'), ts = require('typescript'), assert = require('node:assert/strict');
+const code = ts.transpileModule(fs.readFileSync('src/utils/promptSurfaceCache.ts', 'utf8'), {compilerOptions:{module:ts.ModuleKind.CommonJS}}).outputText;
+const context = { exports:{}, document:{createElement:()=>({width:0,height:0,getContext:()=>({drawImage(){}})})} };
+vm.runInNewContext(code,context);
+const {cacheSurfaceBitmap:put,getSurfaceBitmap:get}=context.exports;
+const source={width:1024,height:1024};
+for(let i=0;i<8;i++)put(String(i),source);
+const retained=get('0'); assert.ok(retained);
+put('8',source); assert.equal(get('1'),undefined); assert.equal(get('0'),retained);
+put('oversized',{width:5000,height:5000}); assert.equal(get('oversized'),undefined);
+put('latest',{width:100,height:100}); assert.equal(get('latest').width,100);
+console.log('PASS: bitmap budget, LRU retention/eviction, oversized rejection');

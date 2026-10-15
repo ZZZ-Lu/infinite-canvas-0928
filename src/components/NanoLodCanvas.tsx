@@ -1,4 +1,5 @@
 import React, { useEffect, useRef } from 'react';
+import { readyPromptPanels } from '../utils/promptSurfaceCache';
 import { MotionValue } from 'motion/react';
 import { CardData, getCardSize } from './GenerationCard';
 import {
@@ -566,8 +567,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       // In scale >= threshold, check if Standard LOD is already mounted and painted in DOM underneath
       const renderedSet = renderedIdsRef.current;
       const paintedSet = typeof window !== 'undefined' ? (window as any).__paintedCardIds : null;
-      const isPainted = !paintedSet || paintedSet.has(card.id);
-      const isCardReadyInDom = currentScale >= threshold && Boolean(renderedSet && renderedSet.has(card.id) && isPainted);
+      const isPainted = Boolean(paintedSet?.has(card.id));
+      const panelReady = Boolean(card.fileName || card.isAsset) || readyPromptPanels.has(card.id);
+      const isCardReadyInDom = currentScale >= threshold && Boolean(renderedSet && renderedSet.has(card.id) && isPainted && panelReady);
 
       // Instant seamless handoff: if standard card is rendered and painted in DOM, DOM handles the prompt panel directly!
       if (isCardReadyInDom) {
@@ -901,6 +903,12 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   }, [cards, selectedCardIds, agentTargetCardId, agentTargetCardIds, agentReferenceCardIds, agentFocusMap, pickerSession, isDarkMode, isOverviewMode, dotModeThreshold, isActive]);
 
   // Listen to custom nano dragging events for local, non-react repaint
+  useEffect(() => {
+    if (!isActive) return;
+    window.addEventListener('card-painted', scheduleDraw);
+    return () => window.removeEventListener('card-painted', scheduleDraw);
+  }, [isActive]);
+
   useEffect(() => {
     if (!isActive) return;
     const handleRepaint = () => {

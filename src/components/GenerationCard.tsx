@@ -26,6 +26,7 @@ import { isCardIntersectingRectangle } from '../utils/viewportCulling';
 import { getBottomPanelHeight, getPromptAreaHeight } from '../utils/cardLayout';
 import { CardImageCanvas } from './CardImageCanvas';
 import { PromptCanvas } from './PromptCanvas';
+import { readyPromptPanels } from '../utils/promptSurfaceCache';
 import { PromptPanelCanvas, type PanelControl } from './PromptPanelCanvas';
 import { CANVAS_IDLE_MS } from '../utils/canvasPerformance';
 import { fullImageCache, originalImageCache } from '../utils/imageTextureCache';
@@ -2954,6 +2955,11 @@ export const GenerationCard = React.memo(function GenerationCard({
   const menuContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [isPromptEditing, setIsPromptEditing] = useState(false);
+  const [isPromptPanelHovered, setIsPromptPanelHovered] = useState(false);
+  const [nativePanelMounted, setNativePanelMounted] = useState(false);
+  const [hasPresentedPanel, setHasPresentedPanel] = useState(false);
+  const [promptBitmapReady, setPromptBitmapReady] = useState('');
+  const [panelBitmapReady, setPanelBitmapReady] = useState('');
   const [isReferenceFilePickerOpen, setIsReferenceFilePickerOpen] = useState(false);
   const [promptScrollTop, setPromptScrollTop] = useState(0);
   const promptCursorRef = useRef<number | null>(null);
@@ -2964,6 +2970,8 @@ export const GenerationCard = React.memo(function GenerationCard({
   useLayoutEffect(() => {
     if (!isPromptEditing || !textareaRef.current) return;
     const textarea = textareaRef.current;
+    // A real pointer focus already placed the native caret; do not move it.
+    if (document.activeElement === textarea) return;
     textarea.focus({ preventScroll: true });
     const cursor = promptCursorRef.current ?? textarea.value.length;
     textarea.setSelectionRange(cursor, cursor);
@@ -4031,9 +4039,9 @@ export const GenerationCard = React.memo(function GenerationCard({
     };
   }, [showAssetPicker, currentProject, assetFilter, assetSearch]);
 
-  const canvasCandidates = (allCards || []).filter(c => 
+  const canvasCandidates = useMemo(() => (allCards || []).filter(c =>
     c.id !== id && Boolean(c.imageUrl || c.originalImageUrl || c.thumbnailUrl)
-  );
+  ), [allCards, id]);
 
   // Normalized list of references for display
   const refList = data.referenceImages && data.referenceImages.length > 0
@@ -4461,7 +4469,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     ? selectedMcpModel.resolutions.map(option => (typeof option === 'object' ? option.label : option))
     : (data.isVideo ? ['720p', '1080p'] : ['1K', '2K', '4K']);
   const selectedModel = selectedMcpModel?.name || '选择模型';
-  const useNativePromptPanel = isPromptEditing || Boolean(openMenu) || mentionMenuOpen ||
+  const useNativePromptPanel = isPromptPanelHovered || isPromptEditing || Boolean(openMenu) || mentionMenuOpen ||
     Boolean(hoveredRefUrl || activePreviewUrl || data.generationError) || isReferenceFilePickerOpen;
   const enumParameters: McpSchemaParameter[] = data.isVideo ? [
     {
@@ -4496,6 +4504,34 @@ export const GenerationCard = React.memo(function GenerationCard({
     { key: 'ratio', label: String(ratio), targetId: `ratio-btn-${id}`, onClick: () => setOpenMenu({ type: 'ratio', ownerId: 'user' }) },
     { key: 'res', label: String(res), targetId: `res-btn-${id}`, onClick: () => setOpenMenu({ type: 'res', ownerId: 'user' }) },
   ];
+  // Keep the last native frame until BOTH cached surfaces contain the current content.
+  const panelRenderKey = JSON.stringify([
+    localPrompt, promptScrollTop, refList.map(ref => [ref.thumbnailUrl || ref.url, ref.name]),
+    panelControls.map(control => [control.key, control.label]), state,
+    typeof document !== 'undefined' && document.documentElement.classList.contains('dark'),
+  ]);
+  const showNativePromptPanel = useNativePromptPanel || nativePanelMounted;
+  useLayoutEffect(() => {
+    if (!hasPresentedPanel && (useNativePromptPanel ||
+        (promptBitmapReady === panelRenderKey && panelBitmapReady === panelRenderKey))) {
+      setHasPresentedPanel(true);
+    }
+  }, [hasPresentedPanel, useNativePromptPanel, promptBitmapReady, panelBitmapReady, panelRenderKey]);
+  useLayoutEffect(() => {
+    if (!shouldRenderBottomPanel || !hasPresentedPanel) return;
+    readyPromptPanels.add(id);
+    window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId: id } }));
+    return () => { readyPromptPanels.delete(id); };
+  }, [id, shouldRenderBottomPanel, hasPresentedPanel]);
+  useEffect(() => {
+    if (useNativePromptPanel) setNativePanelMounted(true);
+    else if (promptBitmapReady === panelRenderKey && panelBitmapReady === panelRenderKey) {
+      setNativePanelMounted(false);
+    }
+  }, [useNativePromptPanel, promptBitmapReady, panelBitmapReady, panelRenderKey]);
+  useLayoutEffect(() => {
+    if (showNativePromptPanel && mirrorRef.current) mirrorRef.current.scrollTop = promptScrollTop;
+  }, [showNativePromptPanel, promptScrollTop]);
   // Dynamic height calculation based on hovered reference image aspect ratio
   const textareaHeight = textareaRef.current?.offsetHeight || 50;
   const targetPreviewHeight = previewDimensions
@@ -5349,6 +5385,8 @@ export const GenerationCard = React.memo(function GenerationCard({
       {/* Bottom Layer: Light Panel (Always rendered for generation cards) */}
       {shouldRenderBottomPanel && (
       <div 
+        onPointerEnter={() => setIsPromptPanelHovered(true)}
+        onPointerLeave={() => setIsPromptPanelHovered(false)}
         className={`generation-card-bottom-panel relative pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 squircle p-4 gap-2 w-[480px] border border-gray-200/80 dark:border-[#404040] cursor-default self-start transform-gpu [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
         isSelected 
           ? 'shadow-[0_16px_36px_-6px_rgba(0,0,0,0.12),0_8px_16px_-4px_rgba(0,0,0,0.06)] dark:shadow-[0_20px_40px_-6px_rgba(0,0,0,0.45)]' 
@@ -5358,9 +5396,14 @@ export const GenerationCard = React.memo(function GenerationCard({
           marginLeft: (w - 480) / 2,
           height: getBottomPanelHeight(localPrompt, refList.length),
           minHeight: getBottomPanelHeight(localPrompt, refList.length),
+          opacity: hasPresentedPanel || showNativePromptPanel ? 1 : 0,
+          pointerEvents: hasPresentedPanel || showNativePromptPanel ? undefined : 'none',
         }}
       >
-        {!useNativePromptPanel ? <PromptPanelCanvas
+        <div className="absolute inset-0" style={{ visibility: showNativePromptPanel ? 'hidden' : 'visible' }}
+          aria-hidden={showNativePromptPanel} inert={showNativePromptPanel}>
+        <PromptPanelCanvas
+          renderKey={panelRenderKey} onReady={setPanelBitmapReady}
           height={getBottomPanelHeight(localPrompt, refList.length)} references={refList}
           controls={panelControls} scale={scale} generating={state === 'generating'} canGenerate={Boolean(localPrompt.trim())}
           onGenerate={handleGenerate} cardId={id}
@@ -5368,16 +5411,20 @@ export const GenerationCard = React.memo(function GenerationCard({
           onMention={index => insertMention({ ...refList[index], name: refList[index].name || `图 ${index + 1}` })}
           onRemove={removeReferenceImage} onAdd={() => setOpenMenu({ type: 'ref', ownerId: 'user' })}
         >
-          <div className="generation-prompt-area absolute" style={{ left: 16, top: 24 + Math.ceil((refList.length + 1) / 8) * 56, width: 446, height: getPromptAreaHeight(localPrompt) }}>
+          <div className="generation-prompt-area absolute" style={{ left: 16, right: 16, top: 24 + Math.ceil((refList.length + 1) / 8) * 56, height: getPromptAreaHeight(localPrompt) }}>
             <PromptCanvas text={localPrompt || ''} height={getPromptAreaHeight(localPrompt)}
+              renderKey={panelRenderKey} onReady={setPromptBitmapReady}
               mentionNames={allMentionItems.map(item => item.name)} scale={scale}
               editing={false} scrollTop={promptScrollTop}
               targetId={`prompt-input-${id}`} onEdit={activatePromptEditor} disabled={state === 'generating'} />
           </div>
-        </PromptPanelCanvas> : <>
+        </PromptPanelCanvas>
+        </div>
+        {showNativePromptPanel && <>
         {/* High-LOD Interactive Prompt Component: Base Layer directly rendered underneath with full layout */}
         <div
           className="generation-card-bottom-panel-content relative z-0 flex flex-col gap-3 w-full"
+          style={{ pointerEvents: useNativePromptPanel ? undefined : 'none' }}
         >
         {/* Top: Reference & Actions */}
         <div className="flex items-start justify-between relative" ref={refMenuContainerRef}>
@@ -5502,6 +5549,11 @@ export const GenerationCard = React.memo(function GenerationCard({
         <div 
           ref={promptContainerRef}
           className="generation-prompt-area relative w-full mt-1 min-h-[50px] flex items-center"
+          onClick={event => {
+            if (event.target === event.currentTarget && !isPromptEditing && state !== 'generating') {
+              activatePromptEditor(localPrompt.length);
+            }
+          }}
           style={{
             height: activePreviewUrl
               ? expandedPromptHeight
@@ -5512,12 +5564,6 @@ export const GenerationCard = React.memo(function GenerationCard({
             transition: isRebounding ? 'height 0.24s cubic-bezier(0.16, 1, 0.3, 1)' : 'none',
           }}
         >
-          <PromptCanvas text={localPrompt || ''} height={getPromptAreaHeight(localPrompt)}
-            mentionNames={allMentionItems.map(item => item.name)} scale={scale}
-            editing={isPromptEditing} scrollTop={promptScrollTop}
-            targetId={`prompt-input-${id}`}
-            onEdit={activatePromptEditor} disabled={state === 'generating'} />
-          {isPromptEditing && <>
           {/* Highlight mirror backdrop */}
           <div
             ref={mirrorRef}
@@ -5542,6 +5588,7 @@ export const GenerationCard = React.memo(function GenerationCard({
 
           <textarea
             ref={textareaRef}
+            onFocus={() => setIsPromptEditing(true)}
             data-agent-target={`prompt-input-${id}`}
             value={localPrompt}
             onPointerDown={(e) => {
@@ -5589,7 +5636,6 @@ export const GenerationCard = React.memo(function GenerationCard({
             }}
             rows={2}
           />
-          </>}
 
           {/* @ Mention Suggestion Dropdown */}
           {mentionMenuOpen && (
@@ -6084,5 +6130,3 @@ export const GenerationCard = React.memo(function GenerationCard({
     </div>
   );
 });
-
-

@@ -1,0 +1,11 @@
+const fs=require('node:fs'),vm=require('node:vm'),ts=require('typescript'),assert=require('node:assert/strict');
+const code=ts.transpileModule(fs.readFileSync('src/components/ProgressiveGenerationCard.tsx','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,jsx:ts.JsxEmit.React,esModuleInterop:true}}).outputText;
+const context={exports:{},require:name=>name==='./GenerationCard'?{GenerationCard:()=>null}:require(name)};
+vm.runInNewContext(code,context);
+const store=context.exports.createCardMountStore(), original=store.ids;
+let a=0,b=0; const off=store.subscribe('a',()=>a++); store.subscribe('b',()=>b++);
+store.replace(new Set(['a'])); assert.equal(a,1); assert.equal(b,0); assert.equal(store.ids,original);
+store.replace(new Set(['a','b'])); assert.equal(a,1); assert.equal(b,1);
+store.replace(new Set(['a','b'])); assert.equal(a,1); assert.equal(b,1);
+off(); store.replace(new Set()); assert.equal(a,1); assert.equal(b,2); assert.equal(original.size,0);
+console.log('PASS: targeted mount notifications, stable renderer Set, unsubscribe');
