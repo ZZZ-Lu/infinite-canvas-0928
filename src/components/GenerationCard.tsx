@@ -402,6 +402,7 @@ const ReferenceThumbItem = React.memo(function ReferenceThumbItem({
   item,
   idx,
   currentScale,
+  isSelected,
   removeReferenceImage,
   setOpenMenu,
   hoveredRefUrl,
@@ -420,15 +421,18 @@ const ReferenceThumbItem = React.memo(function ReferenceThumbItem({
   };
   idx: number;
   currentScale: number;
+  isSelected?: boolean;
   removeReferenceImage: (index: number) => void;
   setOpenMenu: React.Dispatch<React.SetStateAction<{ type: 'ratio' | 'res' | 'ref' | 'model' | 'param'; ownerId: string } | null>>;
   hoveredRefUrl: string | null;
   setHoveredRefUrl: React.Dispatch<React.SetStateAction<string | null>>;
   onMentionItem?: (item: { name: string; url?: string; fileData?: Blob }) => void;
 }) {
-  // Select the appropriate URL based on the scale:
+  // Select the appropriate URL based on scale and selection:
   let displaySrc = item.url;
-  if (currentScale < 1.0) {
+  if (isSelected) {
+    displaySrc = item.fullDetailThumbnailUrl || item.thumbnailUrl || item.url;
+  } else if (currentScale < 1.0) {
     displaySrc = item.microLodThumbnailUrl || item.thumbnailUrl || item.url;
   } else if (currentScale < 2.0) {
     displaySrc = item.fullDetailThumbnailUrl || item.thumbnailUrl || item.url;
@@ -2373,6 +2377,7 @@ export interface GenerationCardProps {
   tx: MotionValue<number>;
   ty: MotionValue<number>;
   isSelected?: boolean;
+  isHighLodTarget?: boolean;
   isAgentTarget?: boolean;
   agentFocusRole?: 'primary' | 'reference' | 'inspect' | 'interact' | 'working' | null;
   agentInspectScenario?: 'qc' | 'quickInput' | 'compare' | 'inspect';
@@ -2399,6 +2404,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   tx, 
   ty, 
   isSelected, 
+  isHighLodTarget,
   isAgentTarget,
   agentFocusRole,
   agentInspectScenario = 'inspect',
@@ -4469,7 +4475,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     ? selectedMcpModel.resolutions.map(option => (typeof option === 'object' ? option.label : option))
     : (data.isVideo ? ['720p', '1080p'] : ['1K', '2K', '4K']);
   const selectedModel = selectedMcpModel?.name || '选择模型';
-  const useNativePromptPanel = isPromptPanelHovered || isPromptEditing || Boolean(openMenu) || mentionMenuOpen ||
+  const useNativePromptPanel = Boolean(isHighLodTarget) || isPromptPanelHovered || isPromptEditing || Boolean(openMenu) || mentionMenuOpen ||
     Boolean(hoveredRefUrl || activePreviewUrl || data.generationError) || isReferenceFilePickerOpen;
   const enumParameters: McpSchemaParameter[] = data.isVideo ? [
     {
@@ -4764,7 +4770,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                 : isSelected 
                   ? '0 20px 40px -8px rgba(0, 0, 0, 0.22)' 
                   : undefined,
-            transitionProperty: 'box-shadow, border-color, width, height, outline-color, outline-width',
+            transitionProperty: 'box-shadow, border-color, width, height, outline-color',
             transitionDuration: '180ms',
             transitionTimingFunction: 'ease-out'
           }}
@@ -5435,6 +5441,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                 item={item}
                 idx={idx}
                 currentScale={currentScale}
+                isSelected={isHighLodTarget ?? isSelected}
                 removeReferenceImage={removeReferenceImage}
                 setOpenMenu={setOpenMenu}
                 hoveredRefUrl={hoveredRefUrl}

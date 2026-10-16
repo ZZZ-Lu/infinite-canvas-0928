@@ -23,11 +23,15 @@ export function createCardMountStore() {
     },
   };
 }
-export const ProgressiveGenerationCard = React.memo(function ProgressiveGenerationCard({ mountStore, ...props }:
-  React.ComponentProps<typeof GenerationCard> & { mountStore: ReturnType<typeof createCardMountStore> }) {
+export const ProgressiveGenerationCard = React.memo(function ProgressiveGenerationCard({ mountStore, isHighLodTarget, ...props }:
+  React.ComponentProps<typeof GenerationCard> & {
+    mountStore: ReturnType<typeof createCardMountStore>;
+    isHighLodTarget?: boolean;
+  }) {
   const id = props.data.id;
+  const isTarget = Boolean(isHighLodTarget);
   const subscribe = useCallback((listener: () => void) => mountStore.subscribe(id, listener), [id, mountStore]);
-  const snapshot = useCallback(() => mountStore.ids.has(id), [id, mountStore]);
+  const snapshot = useCallback(() => Boolean(isTarget || mountStore.ids.has(id)), [id, isTarget, mountStore]);
   const mounted = useSyncExternalStore(subscribe, snapshot, snapshot);
-  return mounted ? <GenerationCard {...props} /> : null;
+  return (mounted || isTarget) ? <GenerationCard isHighLodTarget={isTarget} {...props} /> : null;
 });

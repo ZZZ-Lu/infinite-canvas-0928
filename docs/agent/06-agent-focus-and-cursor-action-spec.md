@@ -93,7 +93,7 @@ Agent 指针在动作生命周期中自适应变幻形态：
    * 现有的 `sortedPending` 根据距离中心和 `selectedCardIds` 排序；
    * 协同系统中：`isAgentFocused(c.id)` 拥有比用户选中更高的置顶权重，确保动作系统到达前 DOM 已经渲染就绪。
 2. **NanoLodCanvas 底衬双保障**：
-   * 在超低缩放（`< 0.60`）或 DOM 极端掉帧场景下，`NanoLodCanvas` 实时订阅 `AgentFocusManager.focusedMap`；
+   * 在超低缩放（`< 0.40`）或 DOM 极端掉帧场景下，`NanoLodCanvas` 实时订阅 `AgentFocusManager.focusedMap`；
    * Canvas 负责立即在对应坐标绘制紫色外边框与角标，确保哪怕 DOM 未就绪，视觉聚焦**零延迟、零丢帧、百分之百在线**。
 
 ---
