@@ -2377,7 +2377,6 @@ export interface GenerationCardProps {
   tx: MotionValue<number>;
   ty: MotionValue<number>;
   isSelected?: boolean;
-  isHighLodTarget?: boolean;
   isAgentTarget?: boolean;
   agentFocusRole?: 'primary' | 'reference' | 'inspect' | 'interact' | 'working' | null;
   agentInspectScenario?: 'qc' | 'quickInput' | 'compare' | 'inspect';
@@ -2404,7 +2403,6 @@ export const GenerationCard = React.memo(function GenerationCard({
   tx, 
   ty, 
   isSelected, 
-  isHighLodTarget,
   isAgentTarget,
   agentFocusRole,
   agentInspectScenario = 'inspect',
@@ -4475,7 +4473,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     ? selectedMcpModel.resolutions.map(option => (typeof option === 'object' ? option.label : option))
     : (data.isVideo ? ['720p', '1080p'] : ['1K', '2K', '4K']);
   const selectedModel = selectedMcpModel?.name || '选择模型';
-  const useNativePromptPanel = Boolean(isHighLodTarget) || isPromptPanelHovered || isPromptEditing || Boolean(openMenu) || mentionMenuOpen ||
+  const useNativePromptPanel = Boolean(isSelected) || isPromptPanelHovered || isPromptEditing || Boolean(openMenu) || mentionMenuOpen ||
     Boolean(hoveredRefUrl || activePreviewUrl || data.generationError) || isReferenceFilePickerOpen;
   const enumParameters: McpSchemaParameter[] = data.isVideo ? [
     {
@@ -4770,7 +4768,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                 : isSelected 
                   ? '0 20px 40px -8px rgba(0, 0, 0, 0.22)' 
                   : undefined,
-            transitionProperty: 'box-shadow, border-color, width, height, outline-color',
+            transitionProperty: 'box-shadow, border-color, width, height, outline-color, outline-width',
             transitionDuration: '180ms',
             transitionTimingFunction: 'ease-out'
           }}
@@ -5441,7 +5439,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                 item={item}
                 idx={idx}
                 currentScale={currentScale}
-                isSelected={isHighLodTarget ?? isSelected}
+                isSelected={isSelected}
                 removeReferenceImage={removeReferenceImage}
                 setOpenMenu={setOpenMenu}
                 hoveredRefUrl={hoveredRefUrl}

@@ -286,6 +286,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     height,
     dpr,
     state,
+    isZooming,
   ]);
 
   // Clean up painted registration on unmount
@@ -300,9 +301,14 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     };
   }, [cardId]);
 
-  // Prop changes restore the required texture. Do not redraw every proxy on global idle.
+  // Listen for idle canvas styles restoration
   useEffect(() => {
+    const handleStylesRestored = () => {
+      scheduleDraw();
+    };
+    window.addEventListener('canvas-styles-restored', handleStylesRestored);
     return () => {
+      window.removeEventListener('canvas-styles-restored', handleStylesRestored);
       if (rafIdRef.current !== null) {
         cancelAnimationFrame(rafIdRef.current);
         rafIdRef.current = null;

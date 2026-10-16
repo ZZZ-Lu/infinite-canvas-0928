@@ -108,14 +108,6 @@
   transition: opacity 400ms ease-out !important;
 }
 
-/* The same Canvas text surface stays visible before, during and after camera motion. */
-#canvas-workspace[data-gesture-low="true"] {
-  opacity: 0;
-}
-.generation-prompt-area {
-  isolation: isolate;
-}
-
 #canvas-workspace[data-zooming="true"] .asset-card,
 #canvas-workspace[data-panning="true"] .asset-card,
 #canvas-workspace[data-gesture="true"] .asset-card,
@@ -128,18 +120,40 @@
   transition: none !important;
 }
 
-/* Ultra-fast degradation targeting strictly the 2 main card containers per card (10 elements total for 5 cards) */
-#canvas-workspace[data-zooming="true"] .generation-card-body,
-#canvas-workspace[data-panning="true"] .generation-card-body,
-#canvas-workspace[data-gesture="true"] .generation-card-body,
+/* GPU Raster Texture Scaling during Canvas gestures (Zoom / Pan / Drag):
+   Keep the REAL DOM prompt panel 100% visible (full text, real reference thumbnails, buttons),
+   and promote its entire container to a SINGLE GPU Composited Bitmap Texture (will-change: transform / transform: translateZ(0)).
+   Chromium's GPU Compositor scales the exact visual content of the prompt panel as a pure GPU raster image at 120 FPS,
+   preventing internal DOM re-layouts, font re-rasterizations, and low-detail skeleton replacements! */
 #canvas-workspace[data-zooming="true"] .generation-card-bottom-panel,
 #canvas-workspace[data-panning="true"] .generation-card-bottom-panel,
 #canvas-workspace[data-gesture="true"] .generation-card-bottom-panel,
+.drag-degraded.generation-card-bottom-panel {
+  opacity: 1 !important;
+  pointer-events: none !important;
+  will-change: transform !important;
+  transform: translateZ(0) !important;
+  transition: none !important;
+  corner-shape: unset !important;
+  box-shadow: none !important;
+  border-radius: 12px !important;
+}
+
+#canvas-workspace[data-zooming="true"] .generation-card-bottom-panel *,
+#canvas-workspace[data-panning="true"] .generation-card-bottom-panel *,
+#canvas-workspace[data-gesture="true"] .generation-card-bottom-panel * {
+  pointer-events: none !important;
+  transition: none !important;
+  animation: none !important;
+}
+
+#canvas-workspace[data-zooming="true"] .generation-card-body,
+#canvas-workspace[data-panning="true"] .generation-card-body,
+#canvas-workspace[data-gesture="true"] .generation-card-body,
 #canvas-workspace[data-zooming="true"] .asset-card,
 #canvas-workspace[data-panning="true"] .asset-card,
 #canvas-workspace[data-gesture="true"] .asset-card,
-.drag-degraded.generation-card-body,
-.drag-degraded.generation-card-bottom-panel {
+.drag-degraded.generation-card-body {
   corner-shape: unset !important;
   box-shadow: none !important;
   border-radius: 12px !important;

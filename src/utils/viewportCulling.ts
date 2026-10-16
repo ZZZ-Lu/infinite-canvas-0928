@@ -76,26 +76,12 @@ export function isCardIntersectingRectangle(
 }
 
 /**
- * Shared Nano/Micro/Standard LOD Scale Thresholds:
- * - Scale < 0.40: Nano-LOD (Macro panoramic overview, pure 2D Canvas color blocks)
- * - 0.40 <= Scale < 0.70 (or active gesture): Micro-LOD (Mid-range browsing, 12px rounded, GPU composited)
- * - Scale >= 0.70 (idle): Standard-LOD (Full rich DOM card, 20px squircle curvature)
+ * Shared Nano/Micro-LOD Scale Threshold: 0.40 (40%)
+ * Scale < 0.40 renders via NanoLodCanvas (2D Canvas mode with color blocks).
+ * Scale >= 0.40 renders via DOM cards mode (interactive prompt component).
  */
-export type LodTier = 'nano' | 'micro' | 'standard';
-
-export const LOD_THRESHOLDS = {
-  NANO: 0.40,
-  MICRO: 0.70,
-} as const;
-
 export function getNanoLodThreshold(): number {
-  return LOD_THRESHOLDS.NANO;
-}
-
-export function getLodTierByScale(scale: number): LodTier {
-  if (scale < LOD_THRESHOLDS.NANO) return 'nano';
-  if (scale < LOD_THRESHOLDS.MICRO) return 'micro';
-  return 'standard';
+  return 0.40;
 }
 
 export const CARD_DENSITY_HIGH_THRESHOLD = 15; // Kept for backwards compatibility

@@ -1,12 +1,15 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { MotionValue } from 'motion/react';
-import { CANVAS_IDLE_MS } from '../utils/canvasPerformance';
+import { CANVAS_IDLE_MS, scheduleCanvasSurface } from '../utils/canvasPerformance';
+
+import { layoutPromptText } from '../utils/promptTextLayout';
+import { cacheSurfaceBitmap, getSurfaceBitmap } from '../utils/promptSurfaceCache';
 
 const PLACEHOLDER = '输入文字指令，例如：清冷克制的女主，穿白衬衫...';
 
 /** A persistent text surface. Its bitmap is independent of camera motion. */
 export const PromptCanvas = React.memo(function PromptCanvas({
-  text, height, mentionNames, scale, editing, scrollTop, onEdit, disabled, targetId,
+  text, height, mentionNames, scale, editing, scrollTop, onEdit, disabled, targetId, renderKey, onReady,
 }: {
   text: string;
   height: number;
@@ -17,9 +20,14 @@ export const PromptCanvas = React.memo(function PromptCanvas({
   onEdit: (cursor: number) => void;
   disabled: boolean;
   targetId: string;
+  renderKey?: string;
+  onReady?: (key: string) => void;
 }) {
+  const readyRef = useRef(onReady);
+  readyRef.current = onReady;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const linesRef = useRef<{ text: string; start: number }[]>([]);
+  const layoutRef = useRef<{ key: string; value: ReturnType<typeof layoutPromptText> } | null>(null);
   const visibleScrollRef = useRef(0);
   const [width, setWidth] = useState(446);
   const [resolution, setResolution] = useState(() => Math.min(3, Math.max(1, scale.get()) * (window.devicePixelRatio || 1)));
@@ -55,9 +63,10 @@ export const PromptCanvas = React.memo(function PromptCanvas({
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext('2d');
     if (!canvas || !ctx) return;
+    return scheduleCanvasSurface(() => {
     canvas.width = Math.ceil(width * resolution);
     canvas.height = Math.ceil(height * resolution);
-    ctx.scale(resolution, resolution);
+    ctx.scale(canvas.width / width, canvas.height / height);
     const style = getComputedStyle(canvas);
     ctx.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
     ctx.textBaseline = 'alphabetic';
@@ -69,33 +78,21 @@ export const PromptCanvas = React.memo(function PromptCanvas({
       const pattern = new RegExp(`@(?:${names.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'g');
       for (const match of text.matchAll(pattern)) ranges.push({ start: match.index!, end: match.index! + match[0].length });
     }
-    const lines: { text: string; start: number }[] = [];
-    let line = '';
-    let start = 0;
-    let index = 0;
-    for (const char of content) {
-      if (char === '\n') {
-        lines.push({ text: line, start });
-        line = '';
-        start = index + 1;
-      } else {
-        if (line && ctx.measureText(line + char).width > width) {
-          lines.push({ text: line, start });
-          start = index;
-          line = '';
-        }
-        line += char;
-      }
-      index += char.length;
+    const layoutKey = JSON.stringify([content, width, style.font, style.letterSpacing]);
+    if (layoutRef.current?.key !== layoutKey) {
+      layoutRef.current = { key: layoutKey, value: layoutPromptText(content, width, style) };
     }
-    lines.push({ text: line, start });
+    const { lines, baseline } = layoutRef.current.value;
     linesRef.current = lines;
     const visibleScroll = Math.max(0, Math.min(scrollTop, lines.length * 22 - height));
     visibleScrollRef.current = visibleScroll;
-    const metrics = ctx.measureText('Hg');
-    const ascent = metrics.fontBoundingBoxAscent ?? metrics.actualBoundingBoxAscent;
-    const descent = metrics.fontBoundingBoxDescent ?? metrics.actualBoundingBoxDescent;
-    const baseline = (22 - ascent - descent) / 2 + ascent;
+    const bitmapKey = JSON.stringify(['text', layoutKey, width, height, canvas.width, canvas.height, mentionKey, visibleScroll, style.color, dark]);
+    const bitmap = getSurfaceBitmap(bitmapKey);
+    if (bitmap) {
+      ctx.drawImage(bitmap, 0, 0, width, height);
+      readyRef.current?.(renderKey || '');
+      return;
+    }
     lines.forEach((row, rowIndex) => {
       const y = rowIndex * 22 - visibleScroll;
       if (y + 22 <= 0 || y >= height) return;
@@ -121,7 +118,10 @@ export const PromptCanvas = React.memo(function PromptCanvas({
         ctx.fillText(segment, x, y + baseline);
       }
     });
-  }, [text, height, width, resolution, mentionKey, scrollTop, themeEpoch]);
+    cacheSurfaceBitmap(bitmapKey, canvas);
+    readyRef.current?.(renderKey || '');
+    });
+  }, [text, height, width, resolution, mentionKey, scrollTop, themeEpoch, renderKey]);
 
   return <canvas ref={canvasRef}
     data-agent-target={editing ? undefined : targetId}

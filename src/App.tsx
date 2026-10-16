@@ -8,7 +8,7 @@ import { NanoLodCanvas } from './components/NanoLodCanvas';
 import { FpsCounter } from './components/FpsCounter';
 import { generateImageThumbnail, generateVideoThumbnail, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
 import { fastGetImageDimensions } from './utils/imageHeader';
-import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, LOD_THRESHOLDS, getLodTierByScale, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
+import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
 import { CANVAS_IDLE_MS, scheduleCanvasSurface } from './utils/canvasPerformance';
 import { readyPromptPanels } from './utils/promptSurfaceCache';
 import { createCardMountStore, ProgressiveGenerationCard } from './components/ProgressiveGenerationCard';
@@ -369,7 +369,6 @@ export default function App() {
   const updateCurrentScale = (latestScale: number) => {
     const workspace = document.getElementById('canvas-workspace');
     if (workspace) {
-      workspace.style.setProperty('--current-scale', latestScale.toString());
       if (workspace.getAttribute('data-gesture') === 'true') {
         // A single boundary switch lets the already-active Nano canvas take over,
         // without reconciling/unmounting every editor in the middle of a wheel gesture.
@@ -378,6 +377,8 @@ export default function App() {
           if (useNanoPreview) workspace.setAttribute('data-gesture-low', 'true');
           else workspace.removeAttribute('data-gesture-low');
         }
+      } else {
+        workspace.style.setProperty('--current-scale', latestScale.toString());
       }
     }
   };
@@ -3626,21 +3627,18 @@ export default function App() {
     };
   }, [tx, ty, tScale, updateCircularCulling]);
 
-  // Micro-LOD state tracking (0.40 <= scale < 0.70)
-  const [isMicroLod, setIsMicroLod] = useState(() => {
-    const s = tScale.get();
-    return s >= LOD_THRESHOLDS.NANO && s < LOD_THRESHOLDS.MICRO;
-  });
-  // Nano-LOD state tracking (scale < 0.40)
-  const [isNanoLod, setIsNanoLod] = useState(() => tScale.get() < LOD_THRESHOLDS.NANO);
+  // Micro-LOD state tracking (scale < dynamic threshold)
+  const [isMicroLod, setIsMicroLod] = useState(() => tScale.get() < getNanoLodThreshold());
+  // Nano-LOD state tracking (scale < dynamic threshold)
+  const [isNanoLod, setIsNanoLod] = useState(() => tScale.get() < getNanoLodThreshold());
   // Extended Nano-LOD state to act as a backend backdrop during DOM card fade-in
-  const [isNanoCanvasActive, setIsNanoCanvasActive] = useState(() => tScale.get() < LOD_THRESHOLDS.NANO);
+  const [isNanoCanvasActive, setIsNanoCanvasActive] = useState(() => tScale.get() < getNanoLodThreshold());
   // Extended DOM card state to act as a frontend backdrop while Canvas prepares to render
-  const [isDomCardsActive, setIsDomCardsActive] = useState(() => tScale.get() >= LOD_THRESHOLDS.NANO);
+  const [isDomCardsActive, setIsDomCardsActive] = useState(() => tScale.get() >= getNanoLodThreshold());
 
   // Track LOD switch from Low -> Standard to animate text labels fade-in
   const [isLodFading, setIsLodFading] = useState(false);
-  const wasMicroLodRef = useRef(tScale.get() < LOD_THRESHOLDS.MICRO);
+  const wasMicroLodRef = useRef(tScale.get() < getNanoLodThreshold());
   const lodFadeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const triggerLodFadeIn = useCallback(() => {
@@ -3688,19 +3686,18 @@ export default function App() {
       if (isZoomingRef.current || isDraggingCanvasRef.current) {
         return;
       }
-      const tier = getLodTierByScale(s);
-      const isMicro = tier === 'micro';
-      const isNano = tier === 'nano';
-      const isSubStandard = s < LOD_THRESHOLDS.MICRO;
+      const threshold = getNanoLodThreshold();
+      const isMicro = s < threshold;
+      const isNano = s < threshold;
       
-      if (wasMicroLodRef.current && !isSubStandard) {
+      if (wasMicroLodRef.current && !isMicro) {
         // Switched from Micro/Nano to Standard LOD: trigger smooth fade-in
         triggerLodFadeIn();
-      } else if (!wasMicroLodRef.current && isSubStandard) {
+      } else if (!wasMicroLodRef.current && isMicro) {
         // Switched from Standard to Micro/Nano LOD: immediately cancel fade and hide tags
         cancelLodFade();
       }
-      wasMicroLodRef.current = isSubStandard;
+      wasMicroLodRef.current = isMicro;
 
       setIsMicroLod(isMicro);
       setIsNanoLod(isNano);
@@ -6154,19 +6151,17 @@ export default function App() {
     
     // Restore accurate LOD states now that the user has stopped zooming or dragging
     const currentScale = tScale.get();
-    const tier = getLodTierByScale(currentScale);
-    const isMicro = tier === 'micro';
-    const isNano = tier === 'nano';
-    const isSubStandard = currentScale < LOD_THRESHOLDS.MICRO;
-    if (wasMicroLodRef.current && !isSubStandard) {
+    const threshold = getNanoLodThreshold();
+    const isMicro = currentScale < threshold;
+    if (wasMicroLodRef.current && !isMicro) {
       triggerLodFadeIn();
-    } else if (!wasMicroLodRef.current && isSubStandard) {
+    } else if (!wasMicroLodRef.current && isMicro) {
       cancelLodFade();
     }
-    wasMicroLodRef.current = isSubStandard;
+    wasMicroLodRef.current = isMicro;
 
     setIsMicroLod(isMicro);
-    setIsNanoLod(isNano);
+    setIsNanoLod(isMicro);
     setMountEpoch(n => (n + 1) % 1000000);
     
     if (workspace) {
@@ -7033,24 +7028,15 @@ export default function App() {
     isQueueProcessingRef.current = false;
   }, []);
 
-  // Exclusive high-LOD focus card ID: single selection OR active canvas picker target
-  const highLodFocusCardId = useMemo(() => {
-    if (pickerSession) return pickerSession.targetCardId;
-    if (selectedCardIds.length === 1) return selectedCardIds[0];
-    return null;
-  }, [pickerSession, selectedCardIds]);
-
   const runCenterOutMountQueue = useCallback(() => {
     if (!isDomCardsActive || isZoomAnimationActiveRef.current) {
       if (!isDomCardsActive) {
         setRenderedCardIds(prev => {
-          const currentTarget = pickerSessionRef.current?.targetCardId || 
-            (selectedCardIdsRef.current.length === 1 ? selectedCardIdsRef.current[0] : null);
-          const allowed = currentTarget ? new Set([currentTarget]) : new Set<string>();
-          if (prev.size === allowed.size && Array.from(prev).every(id => allowed.has(id))) {
+          const selectedSet = new Set(selectedCardIdsRef.current);
+          if (prev.size === selectedSet.size && Array.from(prev).every(id => selectedSet.has(id))) {
             return prev;
           }
-          return allowed;
+          return selectedSet;
         });
       }
       return;
@@ -7463,8 +7449,8 @@ export default function App() {
         style={{ transformOrigin: '0 0', x: tx, y: ty, scale: tScale }}
       >
 
-        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.40), unmount all except the single focused high-LOD card */}
-        {!isOverviewMode && (isDomCardsActive ? visibleCards : (highLodFocusCardId ? visibleCards.filter(card => card.id === highLodFocusCardId) : [])).map(card => {
+        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.40), unmount all unselected DOM cards for ultra-fast Hybrid Canvas rendering */}
+        {!isOverviewMode && (isDomCardsActive ? visibleCards : visibleCards.filter(card => selectedCardIds.includes(card.id))).map(card => {
           const hasImage = Boolean(card.imageUrl || card.originalImageUrl || card.thumbnailUrl);
           const isPickerSelectable = Boolean(pickerSession && card.id !== pickerSession.targetCardId && hasImage);
           const pickerIndex = pickerSession 
@@ -7488,7 +7474,6 @@ export default function App() {
           return (
             <ProgressiveGenerationCard
               mountStore={cardMountStore}
-              isHighLodTarget={highLodFocusCardId === card.id}
               key={card.id}
               data={card}
               scale={tScale}
