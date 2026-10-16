@@ -4473,7 +4473,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     ? selectedMcpModel.resolutions.map(option => (typeof option === 'object' ? option.label : option))
     : (data.isVideo ? ['720p', '1080p'] : ['1K', '2K', '4K']);
   const selectedModel = selectedMcpModel?.name || '选择模型';
-  const useNativePromptPanel = Boolean(isSelected) || isPromptPanelHovered || isPromptEditing || Boolean(openMenu) || mentionMenuOpen ||
+  const useNativePromptPanel = isPromptPanelHovered || isPromptEditing || Boolean(openMenu) || mentionMenuOpen ||
     Boolean(hoveredRefUrl || activePreviewUrl || data.generationError) || isReferenceFilePickerOpen;
   const enumParameters: McpSchemaParameter[] = data.isVideo ? [
     {
