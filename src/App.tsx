@@ -18,7 +18,7 @@ import { getBottomPanelHeight } from './utils/cardLayout';
 import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
 import { cropBoundingBoxFromImage } from './utils/imageCropper';
 import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp } from 'lucide-react';
-import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
+import { loadCards, saveCards, subscribeCardSaves, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
 import { SettingsPage } from './components/SettingsPage';
 import { getDrafts, saveDraft, deleteDraft } from './utils/draftDb';
 import { McpKeyButton } from './components/McpKeyButton';
@@ -1054,6 +1054,12 @@ export default function App() {
 
   // State for Cards & History
   const [isLoading, setIsLoading] = useState(true);
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const loadedCardsSnapshotRef = useRef<CardData[] | null>(null);
+  const observedSaveCardsRef = useRef<CardData[]>([]);
+  useEffect(() => subscribeCardSaves(status => {
+    if (status.state === 'error') setStorageError('项目保存失败，请暂勿刷新或关闭页面：' + status.error);
+  }), []);
   const [history, setHistory] = useState<{ past: CardData[][], present: CardData[], future: CardData[][] }>({
     past: [],
     present: [],
@@ -2598,7 +2604,7 @@ export default function App() {
   const handleSelectProject = (projectId: string) => {
     if (projectId === currentProjectId) return;
     // Save current cards first before switching
-    if (loadedProjectIdRef.current === currentProjectId && !isLoading) {
+    if (loadedProjectIdRef.current === currentProjectId && !isLoading && cardsRef.current !== loadedCardsSnapshotRef.current) {
       saveCards(cardsRef.current, currentProjectId).catch(console.error);
     }
     loadedProjectIdRef.current = null;
@@ -2608,7 +2614,7 @@ export default function App() {
 
   const handleCreateProject = async (name: string) => {
     // Save current project's cards first
-    if (loadedProjectIdRef.current === currentProjectId && !isLoading) {
+    if (loadedProjectIdRef.current === currentProjectId && !isLoading && cardsRef.current !== loadedCardsSnapshotRef.current) {
       await saveCards(cardsRef.current, currentProjectId).catch(console.error);
     }
     loadedProjectIdRef.current = null;
@@ -2638,7 +2644,20 @@ export default function App() {
 
   const handleDeleteProject = async (projectId: string) => {
     if (projects.length <= 1) return;
-    await deleteCardsForProject(projectId).catch(console.error);
+    if (currentProjectId === projectId) {
+      loadedProjectIdRef.current = null;
+      setIsLoading(true);
+    }
+    try {
+      await deleteCardsForProject(projectId);
+    } catch (error) {
+      setStorageError('项目删除失败，原项目已保留。');
+      if (currentProjectId === projectId) {
+        loadedProjectIdRef.current = projectId;
+        setIsLoading(false);
+      }
+      return;
+    }
     setProjects(prev => {
       const remaining = prev.filter(p => p.id !== projectId);
       if (currentProjectId === projectId) {
@@ -2655,6 +2674,7 @@ export default function App() {
     let mounted = true;
     const fetchProjectCards = async () => {
       setIsLoading(true);
+      loadedProjectIdRef.current = null;
       await requestPersistence();
       
       // Artificial delay to allow the Gaussian blur mask to fade in smoothly
@@ -2665,7 +2685,7 @@ export default function App() {
         const saved = await loadCards(currentProjectId);
         if (!mounted) return;
         
-        if (saved && saved.length > 0) {
+        if (saved !== null) {
           const processedSaved = saved.map(card => {
             const updates: any = {};
             if (card.generationError) {
@@ -2741,6 +2761,7 @@ export default function App() {
               ...updates
             };
           });
+          loadedCardsSnapshotRef.current = processedSaved;
           setHistory({ past: [], present: processedSaved, future: [] });
           loadedProjectIdRef.current = currentProjectId;
 
@@ -2803,6 +2824,7 @@ export default function App() {
           let fallbackCards: CardData[] | null = null;
           if (currentProjectId === DEFAULT_PROJECT.id) {
             fallbackCards = await loadCards(); // legacy un-scoped key
+            if (!mounted) return;
           }
           if (fallbackCards && fallbackCards.length > 0) {
             const processedFallback = fallbackCards.map(card => {
@@ -2886,22 +2908,28 @@ export default function App() {
                 ...updates
               };
             });
+            loadedCardsSnapshotRef.current = processedFallback;
             setHistory({ past: [], present: processedFallback, future: [] });
             await saveCards(processedFallback, currentProjectId).catch(console.error);
           } else if (isInitialWorkspaceLaunchRef.current && currentProjectId === DEFAULT_PROJECT.id) {
             // First-time workspace launch: creating the initial default project
             isInitialWorkspaceLaunchRef.current = false;
             const initialCards: CardData[] = [createInitialCard()];
+            loadedCardsSnapshotRef.current = initialCards;
             setHistory({ past: [], present: initialCards, future: [] });
             await saveCards(initialCards, currentProjectId).catch(console.error);
           } else {
             // Respect the empty state: do not create initial cards simply because no cards were read
-            setHistory({ past: [], present: [], future: [] });
+            const emptyCards: CardData[] = [];
+            loadedCardsSnapshotRef.current = emptyCards;
+            setHistory({ past: [], present: emptyCards, future: [] });
           }
+          if (!mounted) return;
           loadedProjectIdRef.current = currentProjectId;
         }
       } catch (e) {
         console.error('Failed to load project cards from DB:', e);
+        if (mounted) setStorageError('项目读取失败，已停止自动保存，请勿覆盖现有数据。');
       } finally {
         if (mounted) {
           setIsLoading(false);
@@ -2913,48 +2941,40 @@ export default function App() {
     return () => { mounted = false; };
   }, [currentProjectId]);
 
-  // Save cards to IndexedDB for current project ONLY when cards belong to current project (debounced & idle-scheduled)
-  const saveCardsTimerRef = useRef<NodeJS.Timeout | null>(null);
+  // A save owns both its project and snapshot; cleanup cancels the only scheduler.
   useEffect(() => {
-    if (!isLoading && currentProjectId && loadedProjectIdRef.current === currentProjectId) {
-      if (saveCardsTimerRef.current) {
-        clearTimeout(saveCardsTimerRef.current);
-      }
-      saveCardsTimerRef.current = setTimeout(() => {
-        const doSave = () => {
-          if (isUserPointerDownRef.current || (window as any).isDraggingCard || isDraggingCanvasRef.current) {
-            // Postpone save if user is actively interacting with the canvas/cards
-            saveCardsTimerRef.current = setTimeout(doSave, 1500);
-            return;
-          }
-          saveCards(cardsRef.current, currentProjectId).catch(console.error);
-        };
-
-        if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
-          (window as any).requestIdleCallback(doSave, { timeout: 3000 });
-        } else {
-          doSave();
-        }
-      }, 1500);
-
-      return () => {
-        if (saveCardsTimerRef.current) {
-          clearTimeout(saveCardsTimerRef.current);
-        }
-      };
-    }
+    const previous = observedSaveCardsRef.current;
+    observedSaveCardsRef.current = cards;
+    if (isLoading || loadedProjectIdRef.current !== currentProjectId || cards === loadedCardsSnapshotRef.current) return;
+    // Once edited, undoing to the initially loaded array is still a real change.
+    loadedCardsSnapshotRef.current = null;
+    const previousById = new Map<string, CardData>(previous.map(card => [card.id, card] as [string, CardData]));
+    const hasNewMedia = cards.some(card => {
+      const old = previousById.get(card.id);
+      return (card.fileData && card.fileData !== old?.fileData) || (card.imageUrl && card.imageUrl !== old?.imageUrl);
+    });
+    const snapshot = cards;
+    const projectId = currentProjectId;
+    const timer = setTimeout(() => {
+      if (loadedProjectIdRef.current !== projectId) return;
+      saveCards(snapshot, projectId).catch(console.error);
+    }, hasNewMedia ? 0 : 500);
+    return () => clearTimeout(timer);
   }, [cards, isLoading, currentProjectId]);
 
-  // Synchronous flush on page reload or close to prevent in-flight video playback state from being lost
+  // Best effort only; normal saves do not depend on page teardown.
   useEffect(() => {
-    const handleBeforeUnload = () => {
-      if (currentProjectId && loadedProjectIdRef.current === currentProjectId && cardsRef.current.length > 0) {
-        saveCards(cardsRef.current, currentProjectId).catch(() => {});
+    const flush = () => {
+      if (loadedProjectIdRef.current === currentProjectId && cardsRef.current !== loadedCardsSnapshotRef.current) {
+        saveCards(cardsRef.current, currentProjectId).catch(console.error);
       }
     };
-    window.addEventListener('beforeunload', handleBeforeUnload);
+    const onVisibility = () => { if (document.visibilityState === 'hidden') flush(); };
+    window.addEventListener('beforeunload', flush);
+    document.addEventListener('visibilitychange', onVisibility);
     return () => {
-      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('beforeunload', flush);
+      document.removeEventListener('visibilitychange', onVisibility);
     };
   }, [currentProjectId]);
 
@@ -8071,6 +8091,12 @@ export default function App() {
         </button>
       </div>
 
+      {storageError && (
+        <div role="alert" className="fixed top-20 left-1/2 -translate-x-1/2 z-[9999] max-w-xl rounded-xl bg-red-950 text-white px-4 py-3 shadow-lg pointer-events-auto">
+          {storageError}
+          <button className="ml-4 underline" onClick={() => setStorageError(null)}>关闭提示</button>
+        </div>
+      )}
       {/* Toast: Overview Mode Navigation Hint */}
       <AnimatePresence>
         {isOverviewMode && (

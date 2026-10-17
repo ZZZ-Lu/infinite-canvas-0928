@@ -37,41 +37,89 @@ export async function requestPersistence(): Promise<boolean> {
   return false;
 }
 
-export async function saveCards(cards: CardData[], projectId?: string): Promise<void> {
-  const db = await openDB();
+export type CardSaveStatus = { projectId?: string; state: 'saved' | 'error'; count: number; at: number; error?: string };
+const saveListeners = new Set<(status: CardSaveStatus) => void>();
+const saveQueues = new Map<string, Promise<void>>();
+const savedSnapshots = new WeakMap<CardData[], { key: string; version: number }>();
+const savedVersions = new Map<string, number>();
+function isCurrentSnapshot(cards: CardData[], key: string) {
+  const saved = savedSnapshots.get(cards);
+  return saved?.key === key && saved.version === savedVersions.get(key);
+}
+export function subscribeCardSaves(listener: (status: CardSaveStatus) => void) {
+  saveListeners.add(listener);
+  return () => { saveListeners.delete(listener); };
+}
+
+export function saveCards(cards: CardData[], projectId?: string): Promise<void> {
   const key = projectId ? `cards_${projectId}` : 'cards';
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    const store = tx.objectStore(STORE_NAME);
-    const request = store.put(cards, key);
-    
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
+  if (isCurrentSnapshot(cards, key) && !saveQueues.has(key)) return Promise.resolve();
+  const snapshot = cards.slice();
+  const task = (saveQueues.get(key) || Promise.resolve()).catch(() => {}).then(async () => {
+    if (isCurrentSnapshot(cards, key)) return;
+    try {
+      const db = await openDB();
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction(STORE_NAME, 'readwrite');
+          tx.oncomplete = () => resolve();
+          tx.onabort = () => reject(tx.error || new Error('Card save aborted'));
+          tx.onerror = () => reject(tx.error || new Error('Card save failed'));
+          const store = tx.objectStore(STORE_NAME);
+          const old = store.get(key);
+          old.onsuccess = () => {
+            try {
+              // Atomic backup and replacement; preserve the last nonempty snapshot.
+              if (Array.isArray(old.result) && old.result.length > 0) store.put(old.result, `${key}_backup`);
+              store.put(snapshot, key);
+              store.put({ savedAt: Date.now(), count: snapshot.length }, `${key}_save_info`);
+            } catch (error) { tx.abort(); reject(error); }
+          };
+        });
+      } finally { db.close(); }
+      const version = (savedVersions.get(key) || 0) + 1;
+      savedVersions.set(key, version);
+      savedSnapshots.set(cards, { key, version });
+      saveListeners.forEach(fn => fn({ projectId, state: 'saved', count: snapshot.length, at: Date.now() }));
+    } catch (error) {
+      saveListeners.forEach(fn => fn({ projectId, state: 'error', count: snapshot.length, at: Date.now(), error: error instanceof Error ? error.message : String(error) }));
+      throw error;
+    }
   });
+  saveQueues.set(key, task);
+  const cleanup = () => { if (saveQueues.get(key) === task) saveQueues.delete(key); };
+  task.then(cleanup, cleanup);
+  return task;
 }
 
 export async function loadCards(projectId?: string): Promise<CardData[] | null> {
-  const db = await openDB();
   const key = projectId ? `cards_${projectId}` : 'cards';
+  await saveQueues.get(key)?.catch(() => {});
+  const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readonly');
     const store = tx.objectStore(STORE_NAME);
     const request = store.get(key);
     
-    request.onsuccess = () => resolve(request.result || null);
-    request.onerror = () => reject(request.error);
+    tx.oncomplete = () => { db.close(); resolve(request.result ?? null); };
+    tx.onabort = () => { db.close(); reject(tx.error || new Error('Card load aborted')); };
+    tx.onerror = () => reject(tx.error);
   });
 }
 
 export async function deleteCardsForProject(projectId: string): Promise<void> {
+  await saveQueues.get(`cards_${projectId}`)?.catch(() => {});
+  savedVersions.set(`cards_${projectId}`, (savedVersions.get(`cards_${projectId}`) || 0) + 1);
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const store = tx.objectStore(STORE_NAME);
-    const request = store.delete(`cards_${projectId}`);
-    
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
+    store.delete(`cards_${projectId}`);
+    store.delete(`cards_${projectId}_backup`);
+    store.delete(`cards_${projectId}_save_info`);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onabort = () => { db.close(); reject(tx.error || new Error('Project deletion aborted')); };
+    tx.onerror = () => reject(tx.error);
   });
 }
 
