@@ -1,5 +1,6 @@
 import { AspectRatio, CARD_DIMENSIONS, getCardSize } from '../components/GenerationCard';
 import { getBottomPanelHeight } from './cardLayout';
+import { NANO_LOD_THRESHOLD } from './cardLodAppearance';
 
 export interface CardBounds {
   id: string;
@@ -10,6 +11,7 @@ export interface CardBounds {
   customHeight?: number;
   prompt?: string;
   referenceImages?: any[];
+  referenceImageUrl?: string | null;
   fileName?: string;
   isAsset?: boolean;
 }
@@ -29,13 +31,20 @@ export interface CanvasViewport {
 export function getCardDimensions(card: CardBounds): { width: number; height: number } {
   const dim = getCardSize(card);
   const isGenerationCard = !card.fileName && !card.isAsset;
-  const visualWidth = Math.max(dim.width, 480);
+  const visualWidth = isGenerationCard ? Math.max(dim.width, 480) : dim.width;
   if (!isGenerationCard) {
     return { width: visualWidth, height: dim.height };
   }
-  const panelHeight = getBottomPanelHeight(card.prompt, card.referenceImages?.length);
+  const panelHeight = getBottomPanelHeight(card.prompt, card.referenceImages?.length || (card.referenceImageUrl ? 1 : 0));
   const visualHeight = dim.height + 12 + panelHeight;
   return { width: visualWidth, height: visualHeight };
+}
+
+export function getCardWorldBounds(card: CardBounds) {
+  const image = getCardSize(card);
+  const visual = getCardDimensions(card);
+  const left = card.x + Math.min(0, (image.width - visual.width) / 2);
+  return { minX: left, minY: card.y, maxX: left + visual.width, maxY: card.y + visual.height };
 }
 
 /**
@@ -53,13 +62,13 @@ export function isCardIntersectingRectangle(
   if (viewportWidth <= 0 || viewportHeight <= 0 || scale <= 0) return true;
 
   // Card dimensions in canvas coordinates
-  const { width: cardWidth, height: cardHeight } = getCardDimensions(card);
+  const bounds = getCardWorldBounds(card);
 
   // Card AABB in screen coordinates
-  const cardLeft = card.x * scale + tx;
-  const cardTop = card.y * scale + ty;
-  const cardRight = cardLeft + cardWidth * scale;
-  const cardBottom = cardTop + cardHeight * scale;
+  const cardLeft = bounds.minX * scale + tx;
+  const cardTop = bounds.minY * scale + ty;
+  const cardRight = bounds.maxX * scale + tx;
+  const cardBottom = bounds.maxY * scale + ty;
 
   // Add a scale-adaptive buffer zone outside screen edges for smooth pre-loading
   const buffer = Math.max(40, Math.min(150, Math.round(150 * Math.sqrt(scale))));
@@ -81,7 +90,7 @@ export function isCardIntersectingRectangle(
  * Scale >= 0.40 renders via DOM cards mode (interactive prompt component).
  */
 export function getNanoLodThreshold(): number {
-  return 0.40;
+  return NANO_LOD_THRESHOLD;
 }
 
 export const CARD_DENSITY_HIGH_THRESHOLD = 15; // Kept for backwards compatibility

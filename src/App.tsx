@@ -12,6 +12,7 @@ import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CAR
 import { CANVAS_IDLE_MS, scheduleCanvasSurface } from './utils/canvasPerformance';
 import { readyPromptPanels } from './utils/promptSurfaceCache';
 import { createCardMountStore, ProgressiveGenerationCard } from './components/ProgressiveGenerationCard';
+import { canRetireDomForNano, type LodFrame } from './utils/lodHandoff';
 import { buildCardQuadTree, QuadTree, BoundingBox } from './utils/quadTree';
 import { getBottomPanelHeight } from './utils/cardLayout';
 import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
@@ -3662,11 +3663,11 @@ export default function App() {
     if (ws) ws.removeAttribute('data-lod-fade');
   }, []);
 
-  const handleNanoCanvasReady = useCallback(() => {
-    if (isNanoLod) {
+  const handleNanoCanvasReady = useCallback((frame: LodFrame) => {
+    if (isNanoLod && canRetireDomForNano(frame, { scale: tScale.get(), tx: tx.get(), ty: ty.get() })) {
       setIsDomCardsActive(false);
     }
-  }, [isNanoLod]);
+  }, [isNanoLod, tScale, tx, ty]);
 
   useEffect(() => {
     if (isNanoLod) {
@@ -7147,7 +7148,7 @@ export default function App() {
                 });
               }
               resolve();
-            });
+            }, { label: `mount:${batchToMount[0].id}` });
             abortToken.cancel = () => { cancel(); resolve(); };
           });
         }
@@ -7449,8 +7450,8 @@ export default function App() {
         style={{ transformOrigin: '0 0', x: tx, y: ty, scale: tScale }}
       >
 
-        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.40), unmount all unselected DOM cards for ultra-fast Hybrid Canvas rendering */}
-        {!isOverviewMode && (isDomCardsActive ? visibleCards : visibleCards.filter(card => selectedCardIds.includes(card.id))).map(card => {
+        {/* Canvas Items: All cards follow the same LOD lifecycle, including selected cards. */}
+        {!isOverviewMode && isDomCardsActive && visibleCards.map(card => {
           const hasImage = Boolean(card.imageUrl || card.originalImageUrl || card.thumbnailUrl);
           const isPickerSelectable = Boolean(pickerSession && card.id !== pickerSession.targetCardId && hasImage);
           const pickerIndex = pickerSession 

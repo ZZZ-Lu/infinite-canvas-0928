@@ -1,0 +1,15 @@
+const fs=require('node:fs'),vm=require('node:vm'),ts=require('typescript'),assert=require('node:assert/strict');
+const context={exports:{}};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/utils/cardLayout.ts','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS}}).outputText,context);
+const {getReferencePreviewLayout:layout}=context.exports;
+const portrait=layout('',{width:480,height:960});
+assert.equal(portrait.promptHeight,50);assert.equal(portrait.height,280);assert.equal(portrait.expands,true);
+const longPrompt=Array(20).fill('a line').join('\n');
+const enough=layout(longPrompt,{width:480,height:960});
+assert.equal(enough.promptHeight,300);assert.equal(enough.height,300);assert.equal(enough.expands,false);
+const panorama=layout('',{width:4000,height:100});
+assert.equal(panorama.height,80);assert.equal(panorama.expands,true);
+assert.equal(layout('',null).height,200);
+assert.equal(layout('',{width:0,height:0}).height,200);
+assert.equal(layout(longPrompt,null).height,300);
+console.log('PASS: preview expands only when needed, tall prompt unchanged, portrait/panorama bounds, unknown/invalid dimensions');

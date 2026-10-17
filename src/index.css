@@ -2,7 +2,7 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 @utility squircle {
-  border-radius: 20px;
+  border-radius: var(--card-corner-radius, 20px);
   corner-shape: squircle;
 }
 

@@ -1,5 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import { readyPromptPanels } from '../utils/promptSurfaceCache';
+import { cardOutline, strokeCardOutline, drawEmptyCardIcon, isStandardCardLod } from '../utils/cardLodAppearance';
+import type { LodFrame } from '../utils/lodHandoff';
 import { MotionValue } from 'motion/react';
 import { CardData, getCardSize } from './GenerationCard';
 import {
@@ -8,7 +10,7 @@ import {
   thumbCache,
 } from '../utils/thumbnail';
 import { calculateObjectCover, fullImageCache } from '../utils/imageTextureCache';
-import { getNanoLodThreshold } from '../utils/viewportCulling';
+import { getNanoLodThreshold, getCardWorldBounds } from '../utils/viewportCulling';
 import { getBottomPanelHeight, getPromptAreaHeight, calculatePromptLines } from '../utils/cardLayout';
 import { buildCardQuadTree, QuadTree, BoundingBox } from '../utils/quadTree';
 
@@ -37,7 +39,7 @@ export interface NanoLodCanvasProps {
   isOverviewMode?: boolean;
   dotModeThreshold?: number;
   isActive: boolean;
-  onReady?: () => void;
+  onReady?: (frame: LodFrame) => void;
   onThumbnailGenerated?: (id: string, thumbnailUrl: string) => void;
 }
 
@@ -157,6 +159,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   onThumbnailGenerated,
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const squircleSupported = useRef(CSS.supports('corner-shape', 'squircle')).current;
   const rafIdRef = useRef<number | null>(null);
   const cardPanelFadeMapRef = useRef<Map<string, number>>(new Map());
   const pendingThumbGenRef = useRef<Set<string>>(new Set());
@@ -448,7 +451,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       }
       ctx.restore();
       if (onReadyRef.current) {
-        onReadyRef.current();
+        onReadyRef.current({ scale: currentScale, tx: currentTx, ty: currentTy });
       }
       return;
     }
@@ -518,12 +521,15 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         }
       }
 
-      // Instant AABB culling with dragging offset
+      // Include the bottom prompt panel, not just the image body. The spatial
+      // index and this final draw check must agree during the DOM handoff.
+      const bounds = getCardWorldBounds(card);
+      const dx = cx - card.x, dy = cy - card.y;
       if (
-        cx + dim.width < vpLeft ||
-        cx > vpRight ||
-        cy + dim.height < vpTop ||
-        cy > vpBottom
+        bounds.maxX + dx < vpLeft ||
+        bounds.minX + dx > vpRight ||
+        bounds.maxY + dy < vpTop ||
+        bounds.minY + dy > vpBottom
       ) {
         continue;
       }
@@ -565,17 +571,18 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       }
 
       const isSelected = selectedIds.includes(card.id);
-      // In scale >= threshold or for selected cards, check if Standard/Native LOD is already mounted and painted in DOM underneath
+      // At standard scale, hand off only to DOM cards that are mounted and painted.
       const renderedSet = renderedIdsRef.current;
       const paintedSet = typeof window !== 'undefined' ? (window as any).__paintedCardIds : null;
       const isPainted = Boolean(paintedSet?.has(card.id));
       const panelReady = Boolean(card.fileName || card.isAsset) || readyPromptPanels.has(card.id);
-      const isCardReadyInDom = (currentScale >= threshold || isSelected) && Boolean(renderedSet && (renderedSet.has(card.id) || isSelected) && isPainted && panelReady);
+      const isCardReadyInDom = currentScale >= threshold && Boolean(renderedSet?.has(card.id) && isPainted && panelReady);
 
       // Instant seamless handoff: if card is rendered and painted in DOM, DOM handles rendering directly!
       if (isCardReadyInDom) {
         return;
       }
+
 
       // If we are in High LOD (scale >= threshold), and the card is currently being dragged in DOM,
       // skip rendering it on the canvas completely so that we don't leave any "ghost" behind.
@@ -624,7 +631,13 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         card.trueOriginalFileData
       );
       const isGenerating = card.state === 'generating';
-
+      const standard = isStandardCardLod(currentScale);
+      if (standard) {
+        ctx.save();
+        ctx.translate(cardX, cardY);
+        ctx.clip(cardOutline(dim.width, dim.height, true, squircleSupported));
+        ctx.translate(-cardX, -cardY);
+      }
       // 1. Solid Base Fill (sharp straight rectangle for maximum throughput)
       if (isGenerating) {
         ctx.fillStyle = colorGenerating;
@@ -645,7 +658,10 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         card.originalImageUrl;
 
       let drawSourceImg: HTMLImageElement | null = null;
-      if (thumbUrl) {
+      const full = standard && card.imageUrl ? fullImageCache.get(card.imageUrl) : undefined;
+      if (full?.complete && full.naturalWidth > 0) {
+        drawSourceImg = full;
+      } else if (thumbUrl) {
         drawSourceImg = getOrLoadThumbImage(thumbUrl, scheduleDraw);
       } else if (card.imageUrl && fullImageCache.has(card.imageUrl)) {
         const cached = fullImageCache.get(card.imageUrl);
@@ -690,6 +706,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         }
       }
 
+      if (standard) ctx.restore();
+      const strokeOutline = (x = cardX, y = cardY, width = dim.width, height = dim.height) =>
+        strokeCardOutline(ctx, x, y, width, height, standard, squircleSupported);
       const focusItem = agentFocusMapRef.current?.[card.id];
       const targetIds = agentTargetCardIdsRef.current;
       const isAgentTargetInSet = Boolean(
@@ -708,7 +727,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       if (isPickerSelected) {
         ctx.strokeStyle = borderPickerSelected;
         ctx.lineWidth = pickerSelectedLineWidth;
-        ctx.strokeRect(cardX, cardY, dim.width, dim.height);
+        strokeOutline();
       } else if (isAgentPrimary) {
         if (isSelected) {
           // Dual co-presence: half user blue (#3b82f6) + half agent purple (#a45cf8) diagonal gradient stroke
@@ -719,37 +738,35 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
           grad.addColorStop(1, '#a45cf8');
           ctx.strokeStyle = grad;
           ctx.lineWidth = selectedLineWidth;
-          ctx.strokeRect(cardX - 0.5, cardY - 0.5, dim.width + 1, dim.height + 1);
+          strokeOutline(cardX - 0.5, cardY - 0.5, dim.width + 1, dim.height + 1);
         } else {
           ctx.strokeStyle = borderAgentTarget;
           ctx.lineWidth = selectedLineWidth * 1.25;
-          ctx.strokeRect(cardX, cardY, dim.width, dim.height);
+          strokeOutline();
         }
       } else if (isAgentRef) {
         ctx.strokeStyle = borderAgentTarget;
         ctx.lineWidth = normalLineWidth * 1.5;
         ctx.setLineDash([4, 4]);
-        ctx.strokeRect(cardX, cardY, dim.width, dim.height);
+        strokeOutline();
         ctx.setLineDash([]);
       } else if (isPickerTarget) {
         ctx.strokeStyle = borderPickerTarget;
         ctx.lineWidth = selectedLineWidth;
-        ctx.strokeRect(cardX, cardY, dim.width, dim.height);
+        strokeOutline();
       } else if (isSelected) {
         ctx.strokeStyle = borderSelected;
         ctx.lineWidth = selectedLineWidth;
-        ctx.strokeRect(cardX, cardY, dim.width, dim.height);
+        strokeOutline();
       } else {
         ctx.strokeStyle = borderNormal;
         ctx.lineWidth = normalLineWidth;
-        ctx.strokeRect(cardX, cardY, dim.width, dim.height);
+        strokeOutline();
       }
 
       // 3b. Bottom Panel Skeleton Color Block for Generation Cards in 2D Canvas Mode
       const isGenerationCard = !card.fileName && !card.isAsset;
       if (isGenerationCard) {
-        // Selected card's prompt panel presents at original highest LOD in DOM; skip skeleton on canvas
-        if (!isSelected) {
           drawCardBottomPanel(
             ctx,
             card,
@@ -765,7 +782,6 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
             normalLineWidth,
             1.0
           );
-        }
       }
 
       // 4. Center indicator / video play badge
@@ -799,7 +815,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         // Fallback indicator when thumbnail is still generating/loading
         const cx = cardX + dim.width / 2;
         const cy = cardY + dim.height / 2;
-        if (hasMedia) {
+        if (standard) {
+          drawEmptyCardIcon(ctx, cx, cy, dark);
+        } else if (hasMedia) {
           const r = Math.max(2.5 / currentScale, 2);
           ctx.fillStyle = iconMediaColor;
           ctx.beginPath();
@@ -869,7 +887,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     ctx.restore();
     
     if (onReadyRef.current) {
-      onReadyRef.current();
+      onReadyRef.current({ scale: currentScale, tx: currentTx, ty: currentTy });
     }
   };
 
@@ -909,7 +927,11 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   useEffect(() => {
     if (!isActive) return;
     window.addEventListener('card-painted', scheduleDraw);
-    return () => window.removeEventListener('card-painted', scheduleDraw);
+    window.addEventListener('card-surface-ready', scheduleDraw);
+    return () => {
+      window.removeEventListener('card-painted', scheduleDraw);
+      window.removeEventListener('card-surface-ready', scheduleDraw);
+    };
   }, [isActive]);
 
   useEffect(() => {
@@ -946,7 +968,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     };
   }, [scale, tx, ty, isActive]);
 
-  if (!isActive) return null;
+  // Keep the same canvas through LOD switches. Activation schedules its next
+  // draw; DOM retirement is acknowledged only by that completed frame.
 
   return (
     <canvas

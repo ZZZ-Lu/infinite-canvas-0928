@@ -4,6 +4,7 @@ import { motion, AnimatePresence, MotionValue, useAnimationControls } from 'moti
 import { 
   RefreshCw,
   Plus,
+  Minus,
   ChevronDown,
   ArrowUp,
   Layers,
@@ -23,10 +24,13 @@ import {
   Copy
 } from 'lucide-react';
 import { isCardIntersectingRectangle } from '../utils/viewportCulling';
-import { getBottomPanelHeight, getPromptAreaHeight } from '../utils/cardLayout';
+import { getBottomPanelHeight, getPromptAreaHeight, getPromptSurfaceLayout, getReferencePreviewLayout } from '../utils/cardLayout';
 import { CardImageCanvas } from './CardImageCanvas';
 import { PromptCanvas } from './PromptCanvas';
-import { readyPromptPanels } from '../utils/promptSurfaceCache';
+import { readyPromptPanels, getCardSurfaceRevision } from '../utils/promptSurfaceCache';
+import { cardCornerStyle, CARD_PANEL_WIDTH, EMPTY_CARD_PATHS } from '../utils/cardLodAppearance';
+import { getStandardReferencePreview, resolveReferencePreviewSource } from '../utils/referencePreview';
+import { referenceDisplayName, shortenReferenceMentions } from '../utils/referenceName';
 import { PromptPanelCanvas, type PanelControl } from './PromptPanelCanvas';
 import { CANVAS_IDLE_MS } from '../utils/canvasPerformance';
 import { fullImageCache, originalImageCache } from '../utils/imageTextureCache';
@@ -446,19 +450,6 @@ const ReferenceThumbItem = React.memo(function ReferenceThumbItem({
   const togglePreview = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (targetUrl) {
-      if (!refDimensionsCache.has(targetUrl)) {
-        const img = new Image();
-        img.referrerPolicy = 'no-referrer';
-        img.src = targetUrl;
-        img.onload = () => {
-          if (img.naturalWidth && img.naturalHeight) {
-            refDimensionsCache.set(targetUrl, {
-              width: img.naturalWidth,
-              height: img.naturalHeight,
-            });
-          }
-        };
-      }
       setHoveredRefUrl(prev => prev === targetUrl ? null : targetUrl);
     }
   };
@@ -489,7 +480,7 @@ const ReferenceThumbItem = React.memo(function ReferenceThumbItem({
           title="点击在提示词中@此参考图"
         >
           <span className="text-[6.5px] font-bold text-[#3b82f6] dark:text-blue-400 select-none block truncate leading-normal text-left tracking-tight hover:underline">
-            @{item.name || `图 ${idx + 1}`}
+            @{referenceDisplayName(item.name || `图 ${idx + 1}`)}
           </span>
         </button>
 
@@ -531,7 +522,7 @@ const ReferenceThumbItem = React.memo(function ReferenceThumbItem({
         className="absolute -top-1 -right-1 w-3.5 h-3.5 bg-red-500 hover:bg-red-600 text-white rounded-full flex items-center justify-center opacity-0 group-hover/thumb:opacity-100 transition-opacity duration-150 shadow-md z-30 p-0 cursor-pointer"
         title="移除参考图"
       >
-        <X className="w-2 h-2 stroke-[3]" />
+        <Minus className="w-2 h-2 stroke-[3]" />
       </button>
     </div>
   );
@@ -2793,7 +2784,8 @@ export const GenerationCard = React.memo(function GenerationCard({
   }, [isVideo, imageUrl, data.thumbnailUrl, localThumbnailUrl, id, data.fileData]);
 
   // Local buffered prompt state for 0-latency typing (decouples typing from full canvas re-render)
-  const [localPrompt, setLocalPrompt] = useState(prompt || '');
+  const referenceNames = data.referenceImages?.map(ref => ref.name || '').filter(Boolean) || (data.referenceImageName ? [data.referenceImageName] : []);
+  const [localPrompt, setLocalPrompt] = useState(() => shortenReferenceMentions(prompt || '', referenceNames));
   const localPromptRef = useRef(localPrompt);
   localPromptRef.current = localPrompt;
   const isTypingRef = useRef(false);
@@ -2847,7 +2839,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   // Synchronize from external data.prompt when not actively typing or when external prompt changed significantly
   useEffect(() => {
     if (!isTypingRef.current && (prompt || '') !== localPromptRef.current) {
-      setLocalPrompt(prompt || '');
+      setLocalPrompt(shortenReferenceMentions(prompt || '', referenceNames));
     }
   }, [prompt]);
 
@@ -2875,9 +2867,11 @@ export const GenerationCard = React.memo(function GenerationCard({
   const [assetFilter, setAssetFilter] = useState<'all' | 'characters' | 'locations' | 'props'>('all');
   const [assetSearch, setAssetSearch] = useState('');
   const [hoveredRefUrl, setHoveredRefUrl] = useState<string | null>(null);
+  const [referencePreviewImage, setReferencePreviewImage] = useState<{ referenceUrl: string; src: string } | null>(null);
   const [activePreviewUrl, setActivePreviewUrl] = useState<string | null>(null);
   const [isRebounding, setIsRebounding] = useState(false);
   const reboundTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const reboundCompletionTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // @ Mention State
   const [mentionMenuOpen, setMentionMenuOpen] = useState(false);
@@ -2891,60 +2885,26 @@ export const GenerationCard = React.memo(function GenerationCard({
 
   useEffect(() => {
     if (hoveredRefUrl) {
+      if (reboundCompletionTimerRef.current) clearTimeout(reboundCompletionTimerRef.current);
       if (reboundTimerRef.current) {
         clearTimeout(reboundTimerRef.current);
         reboundTimerRef.current = null;
       }
       setIsRebounding(false);
+      setPreviewDimensions(refDimensionsCache.get(hoveredRefUrl) || null);
       setActivePreviewUrl(hoveredRefUrl);
     }
   }, [hoveredRefUrl]);
 
   useEffect(() => {
     return () => {
+      if (reboundCompletionTimerRef.current) clearTimeout(reboundCompletionTimerRef.current);
       if (reboundTimerRef.current) {
         clearTimeout(reboundTimerRef.current);
       }
     };
   }, []);
 
-  useEffect(() => {
-    if (!hoveredRefUrl) {
-      setPreviewDimensions(null);
-      return;
-    }
-
-    const cached = refDimensionsCache.get(hoveredRefUrl);
-    if (cached) {
-      setPreviewDimensions(cached);
-      return;
-    }
-
-    let isMounted = true;
-    const img = new Image();
-    img.referrerPolicy = 'no-referrer';
-    img.src = hoveredRefUrl;
-
-    const onDims = () => {
-      if (!isMounted) return;
-      const dims = {
-        width: img.naturalWidth || 16,
-        height: img.naturalHeight || 9,
-      };
-      refDimensionsCache.set(hoveredRefUrl, dims);
-      setPreviewDimensions(dims);
-    };
-
-    if (img.complete && img.naturalWidth > 0) {
-      onDims();
-    } else {
-      img.onload = onDims;
-    }
-
-    return () => {
-      isMounted = false;
-    };
-  }, [hoveredRefUrl]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const refMenuContainerRef = useRef<HTMLDivElement>(null);
   
@@ -4054,6 +4014,22 @@ export const GenerationCard = React.memo(function GenerationCard({
       ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }]
       : [];
 
+  const previewReference = refList.find(reference => reference.url === hoveredRefUrl);
+  const previewSource = previewReference ? resolveReferencePreviewSource(previewReference, allCards || []) : null;
+  useEffect(() => {
+    if (!hoveredRefUrl || !previewSource) return;
+    let active = true;
+    getStandardReferencePreview(previewSource).then(src => {
+      if (active) setReferencePreviewImage({ referenceUrl: hoveredRefUrl, src });
+    }).catch(() => {
+      // Keep the existing small thumbnail if proxy generation fails; never load
+      // the original into the expanded preview as a fallback.
+    });
+    return () => { active = false; };
+  }, [hoveredRefUrl, previewSource]);
+  const previewDisplaySrc = referencePreviewImage?.referenceUrl === hoveredRefUrl
+    ? referencePreviewImage.src : previewReference?.thumbnailUrl;
+
   // All candidate references and assets (unfiltered for prompt highlighting and parsing)
   const allMentionItems = useMemo(() => {
     const items: Array<{
@@ -4136,10 +4112,22 @@ export const GenerationCard = React.memo(function GenerationCard({
     return allMentionItems.filter(it => it.name.toLowerCase().includes(q) || (it.subtitle && it.subtitle.toLowerCase().includes(q)));
   }, [allMentionItems, mentionQuery]);
 
+  useLayoutEffect(() => {
+    if (!mentionMenuOpen) return;
+    const list = mentionMenuRef.current?.querySelector<HTMLElement>('[role="listbox"]');
+    const selected = list?.querySelector<HTMLElement>('[aria-selected="true"]');
+    if (!list || !selected) return;
+    // Scroll only this popup, without moving the page or the canvas camera.
+    const top = selected.offsetTop - list.offsetTop;
+    const bottom = top + selected.offsetHeight;
+    if (top < list.scrollTop) list.scrollTop = top;
+    else if (bottom > list.scrollTop + list.clientHeight) list.scrollTop = bottom - list.clientHeight;
+  }, [mentionMenuOpen, selectedMentionIndex, filteredMentionCandidates]);
+
   // Insert mention into prompt with exact spacing: "前后分别空一格"
   const insertMention = (refItem: { name: string; url?: string; fileData?: Blob }) => {
     setIsPromptEditing(true);
-    const refName = refItem.name;
+    const refName = referenceDisplayName(refItem.name);
     const textarea = textareaRef.current;
     const currentPrompt = localPrompt || '';
     const cursor = textarea?.selectionStart ?? currentPrompt.length;
@@ -4248,11 +4236,13 @@ export const GenerationCard = React.memo(function GenerationCard({
     if (match) {
       const query = match[1];
       // Check if this is already an exact completed mention name
-      const isExactCompleted = query.length > 0 && allMentionItems.some(item => item.name === query);
+      const isExactCompleted = query.length > 0 && allMentionItems.some(item => item.name === query || referenceDisplayName(item.name) === query);
       if (!isExactCompleted) {
         setMentionMenuOpen(true);
         setMentionQuery(query);
-        setSelectedMentionIndex(0);
+        // Selection/key-up events also recheck the same @ query. Preserve the
+        // keyboard highlight unless the query changes or the list just opens.
+        if (!mentionMenuOpen || query !== mentionQuery) setSelectedMentionIndex(0);
         return;
       }
     }
@@ -4287,19 +4277,23 @@ export const GenerationCard = React.memo(function GenerationCard({
   };
 
   const handleTextareaKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     if (mentionMenuOpen && filteredMentionCandidates.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
+        e.stopPropagation();
         setSelectedMentionIndex(prev => (prev + 1) % filteredMentionCandidates.length);
         return;
       }
       if (e.key === 'ArrowUp') {
         e.preventDefault();
+        e.stopPropagation();
         setSelectedMentionIndex(prev => (prev - 1 + filteredMentionCandidates.length) % filteredMentionCandidates.length);
         return;
       }
       if (e.key === 'Enter' || e.key === 'Tab') {
         e.preventDefault();
+        e.stopPropagation();
         const selected = filteredMentionCandidates[selectedMentionIndex];
         if (selected) {
           insertMention(selected);
@@ -4308,6 +4302,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       }
       if (e.key === 'Escape') {
         e.preventDefault();
+        e.stopPropagation();
         setMentionMenuOpen(false);
         return;
       }
@@ -4322,7 +4317,7 @@ export const GenerationCard = React.memo(function GenerationCard({
 
         // Find all reference mentions in currentPrompt
         const candidateNames = allMentionItems
-          .map(c => c.name)
+          .flatMap(c => [c.name, referenceDisplayName(c.name)])
           .filter(Boolean)
           .sort((a, b) => b.length - a.length);
 
@@ -4405,7 +4400,7 @@ export const GenerationCard = React.memo(function GenerationCard({
 
     // Use full list of candidate references so typing never filters out highlights
     const names = allMentionItems
-      .map(c => c.name)
+      .flatMap(c => [c.name, referenceDisplayName(c.name)])
       .filter(Boolean)
       .sort((a, b) => b.length - a.length);
 
@@ -4515,6 +4510,11 @@ export const GenerationCard = React.memo(function GenerationCard({
     typeof document !== 'undefined' && document.documentElement.classList.contains('dark'),
   ]);
   const showNativePromptPanel = useNativePromptPanel || nativePanelMounted;
+  const surfaceRevision = getCardSurfaceRevision(
+    localPrompt === (data.prompt || '') && ratio === data.ratio && res === data.res
+      ? data : { ...data, prompt: localPrompt, ratio, res },
+    typeof document !== 'undefined' && document.documentElement.classList.contains('dark'),
+  );
   useLayoutEffect(() => {
     if (!hasPresentedPanel && (useNativePromptPanel ||
         (promptBitmapReady === panelRenderKey && panelBitmapReady === panelRenderKey))) {
@@ -4523,9 +4523,21 @@ export const GenerationCard = React.memo(function GenerationCard({
   }, [hasPresentedPanel, useNativePromptPanel, promptBitmapReady, panelBitmapReady, panelRenderKey]);
   useLayoutEffect(() => {
     if (!shouldRenderBottomPanel || !hasPresentedPanel) return;
-    readyPromptPanels.add(id);
-    window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId: id } }));
-    return () => { readyPromptPanels.delete(id); };
+    // Layout readiness is not presentation readiness. Keep the fallback until
+    // the browser has had a frame to present the newly visible panel.
+    let secondFrame: number | undefined;
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        readyPromptPanels.add(id);
+        window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId: id } }));
+      });
+    });
+    return () => {
+      cancelAnimationFrame(firstFrame);
+      if (secondFrame !== undefined) cancelAnimationFrame(secondFrame);
+      readyPromptPanels.delete(id);
+      window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId: id } }));
+    };
   }, [id, shouldRenderBottomPanel, hasPresentedPanel]);
   useEffect(() => {
     if (useNativePromptPanel) setNativePanelMounted(true);
@@ -4537,25 +4549,18 @@ export const GenerationCard = React.memo(function GenerationCard({
     if (showNativePromptPanel && mirrorRef.current) mirrorRef.current.scrollTop = promptScrollTop;
   }, [showNativePromptPanel, promptScrollTop]);
   // Dynamic height calculation based on hovered reference image aspect ratio
-  const textareaHeight = textareaRef.current?.offsetHeight || 50;
-  const targetPreviewHeight = previewDimensions
-    ? Math.min(280, Math.max(80, Math.round(448 / (previewDimensions.width / previewDimensions.height))))
-    : 200;
-  const expandedPromptHeight = (hoveredRefUrl || activePreviewUrl) ? Math.max(textareaHeight, targetPreviewHeight) : 'auto';
+  const previewLayout = getReferencePreviewLayout(localPrompt, previewDimensions);
+  const textareaHeight = previewLayout.promptHeight;
 
   const handleExitComplete = () => {
+    if (hoveredRefUrl) return;
     if (reboundTimerRef.current) {
       clearTimeout(reboundTimerRef.current);
       reboundTimerRef.current = null;
     }
 
-    const currentTextareaHeight = textareaRef.current?.offsetHeight || 50;
-    const currentPreviewHeight = previewDimensions
-      ? Math.min(280, Math.max(80, Math.round(448 / (previewDimensions.width / previewDimensions.height))))
-      : 200;
-
     // "当然，我说的是提示词区域本身高度不够的情况下，如果本来就够，没有被大图撑高，就不用回弹了"
-    const wasStretched = currentPreviewHeight > currentTextareaHeight;
+    const wasStretched = previewLayout.expands;
 
     if (!wasStretched) {
       setActivePreviewUrl(null);
@@ -4567,7 +4572,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     reboundTimerRef.current = setTimeout(() => {
       setIsRebounding(true);
       setActivePreviewUrl(null);
-      setTimeout(() => {
+      reboundCompletionTimerRef.current = setTimeout(() => {
         setIsRebounding(false);
       }, 250);
     }, 300);
@@ -4747,7 +4752,8 @@ export const GenerationCard = React.memo(function GenerationCard({
                       ? 'ring-1 ring-inset ring-gray-300 dark:ring-neutral-600 shadow-[0_1px_3px_rgba(0,0,0,0.1)] translate-y-0 hover:shadow-[0_8px_16px_rgba(59,130,246,0.25)] hover:ring-blue-400 dark:hover:ring-blue-400/80 hover:outline hover:outline-2 hover:outline-blue-400/50 cursor-pointer'
                       : 'ring-1 ring-inset ring-gray-200/90 dark:ring-[#404040]/90 shadow-[0_1px_2px_rgba(0,0,0,0.06),0_0_1px_rgba(0,0,0,0.08)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)] translate-y-0 hover:shadow-[0_3px_8px_rgba(0,0,0,0.08)] hover:ring-gray-300 dark:hover:ring-neutral-600'
           }`}
-          style={{ 
+          style={{
+            ...cardCornerStyle,
             width: w, 
             height: h,
             outlineWidth: pickerSelectionIndex && pickerSelectionIndex > 0 
@@ -4842,12 +4848,7 @@ export const GenerationCard = React.memo(function GenerationCard({
         {/* Empty State Placeholder (SVG matching user request) */}
         <div className={`absolute inset-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-800 transition-opacity duration-500 ${!imageUrl ? 'opacity-100' : 'opacity-0'} group-data-[scale-micro=true]/canvas:!opacity-0`}>
           <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-gray-300 dark:text-neutral-600">
-            {/* Star */}
-            <path d="M8.5 2C8.8 4.5 10.5 6.2 13 6.5C10.5 6.8 8.8 8.5 8.5 11C8.2 8.5 6.5 6.8 4 6.5C6.5 6.2 8.2 4.5 8.5 2Z" fill="currentColor"/>
-            {/* Big Mountain */}
-            <path d="M15.5 10L22 20H9L15.5 10Z" fill="currentColor"/>
-            {/* Small Mountain */}
-            <path d="M8.5 13L13 20H4L8.5 13Z" fill="currentColor"/>
+            {EMPTY_CARD_PATHS.map(path => <path key={path} d={path} fill="currentColor" />)}
           </svg>
         </div>
 
@@ -5397,8 +5398,12 @@ export const GenerationCard = React.memo(function GenerationCard({
           : 'shadow-[0_1px_3px_rgba(0,0,0,0.05),0_1px_2px_rgba(0,0,0,0.03)] dark:shadow-none'
       }`}
         style={{
-          marginLeft: (w - 480) / 2,
-          height: getBottomPanelHeight(localPrompt, refList.length),
+          ...cardCornerStyle,
+          width: CARD_PANEL_WIDTH,
+          marginLeft: (w - CARD_PANEL_WIDTH) / 2,
+          // Interactive content can expand for reference previews and errors.
+          // Only the absolute bitmap surfaces need a fixed loading height.
+          height: showNativePromptPanel ? 'auto' : getBottomPanelHeight(localPrompt, refList.length),
           minHeight: getBottomPanelHeight(localPrompt, refList.length),
           opacity: hasPresentedPanel || showNativePromptPanel ? 1 : 0,
           pointerEvents: hasPresentedPanel || showNativePromptPanel ? undefined : 'none',
@@ -5407,6 +5412,8 @@ export const GenerationCard = React.memo(function GenerationCard({
         <div className="absolute inset-0" style={{ visibility: showNativePromptPanel ? 'hidden' : 'visible' }}
           aria-hidden={showNativePromptPanel} inert={showNativePromptPanel}>
         <PromptPanelCanvas
+          suspended={useNativePromptPanel}
+          surfaceRevision={surfaceRevision}
           renderKey={panelRenderKey} onReady={setPanelBitmapReady}
           height={getBottomPanelHeight(localPrompt, refList.length)} references={refList}
           controls={panelControls} scale={scale} generating={state === 'generating'} canGenerate={Boolean(localPrompt.trim())}
@@ -5415,10 +5422,12 @@ export const GenerationCard = React.memo(function GenerationCard({
           onMention={index => insertMention({ ...refList[index], name: refList[index].name || `图 ${index + 1}` })}
           onRemove={removeReferenceImage} onAdd={() => setOpenMenu({ type: 'ref', ownerId: 'user' })}
         >
-          <div className="generation-prompt-area absolute" style={{ left: 16, right: 16, top: 24 + Math.ceil((refList.length + 1) / 8) * 56, height: getPromptAreaHeight(localPrompt) }}>
+          <div className="generation-prompt-area absolute" style={getPromptSurfaceLayout(localPrompt, refList.length)}>
             <PromptCanvas text={localPrompt || ''} height={getPromptAreaHeight(localPrompt)}
+              suspended={useNativePromptPanel}
+              cardId={id} surfaceRevision={surfaceRevision}
               renderKey={panelRenderKey} onReady={setPromptBitmapReady}
-              mentionNames={allMentionItems.map(item => item.name)} scale={scale}
+              mentionNames={allMentionItems.flatMap(item => [item.name, referenceDisplayName(item.name)])} scale={scale}
               editing={false} scrollTop={promptScrollTop}
               targetId={`prompt-input-${id}`} onEdit={activatePromptEditor} disabled={state === 'generating'} />
           </div>
@@ -5551,7 +5560,7 @@ export const GenerationCard = React.memo(function GenerationCard({
         </div>
 
         {/* Middle: Prompt Textarea */}
-        <div 
+        <motion.div
           ref={promptContainerRef}
           className="generation-prompt-area relative w-full mt-1 min-h-[50px] flex items-center"
           onClick={event => {
@@ -5559,14 +5568,11 @@ export const GenerationCard = React.memo(function GenerationCard({
               activatePromptEditor(localPrompt.length);
             }
           }}
+          initial={{ height: textareaHeight }}
+          animate={{ height: (hoveredRefUrl || activePreviewUrl) ? previewLayout.height : textareaHeight }}
+          transition={{ duration: (hoveredRefUrl || activePreviewUrl || isRebounding) ? 0.24 : 0, ease: [0.16, 1, 0.3, 1] }}
           style={{
-            height: activePreviewUrl
-              ? expandedPromptHeight
-              : isRebounding
-                ? textareaHeight
-                : getPromptAreaHeight(localPrompt),
             minHeight: getPromptAreaHeight(localPrompt),
-            transition: isRebounding ? 'height 0.24s cubic-bezier(0.16, 1, 0.3, 1)' : 'none',
           }}
         >
           {/* Highlight mirror backdrop */}
@@ -5652,11 +5658,13 @@ export const GenerationCard = React.memo(function GenerationCard({
                 <span>选择参考图引用</span>
                 <span className="text-[10px] font-normal text-gray-400">↑↓ 选择 · Enter 确定</span>
               </div>
-              <div className="overflow-y-auto max-h-52 divide-y divide-gray-50 dark:divide-neutral-800/40">
+              <div role="listbox" aria-label="参考图引用" className="overflow-y-auto max-h-52 divide-y divide-gray-50 dark:divide-neutral-800/40">
                 {filteredMentionCandidates.length > 0 ? (
                   filteredMentionCandidates.map((c, idx) => (
                     <button
                       key={c.id}
+                      role="option"
+                      aria-selected={idx === selectedMentionIndex}
                       type="button"
                       onMouseDown={(e) => {
                         e.preventDefault();
@@ -5674,7 +5682,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                       <div className="flex-1 min-w-0">
                         <div className="text-[13px] font-semibold truncate flex items-center gap-1">
                           <span className="text-blue-500 font-bold">@</span>
-                          <span className="truncate">{c.name}</span>
+                          <span className="truncate" title={c.name}>{referenceDisplayName(c.name)}</span>
                         </div>
                         {c.subtitle && (
                           <div className="text-[11px] text-gray-400 dark:text-neutral-500 truncate">
@@ -5693,7 +5701,7 @@ export const GenerationCard = React.memo(function GenerationCard({
             </div>
           )}
           
-          {/* Direct large image with frosted glass backdrop: opacity fade-in and fade-out (no scale, no rounded corners) */}
+          {/* Lightweight preview: fade image opacity while the prompt region animates height. */}
           <AnimatePresence onExitComplete={handleExitComplete}>
             {hoveredRefUrl && (
               <motion.div
@@ -5705,21 +5713,26 @@ export const GenerationCard = React.memo(function GenerationCard({
                 onClick={(e) => {
                   e.stopPropagation();
                   setHoveredRefUrl(null);
-                  setActivePreviewUrl(null);
                 }}
-                className="absolute inset-0 z-30 pointer-events-auto cursor-pointer flex items-center justify-center overflow-hidden shadow-md transform-gpu group/large-preview"
+                className="absolute inset-0 z-30 pointer-events-auto cursor-pointer flex items-center justify-center overflow-hidden transform-gpu group/large-preview bg-gray-100 dark:bg-neutral-800"
                 title="点击关闭大图预览"
               >
-                {/* Frosted glass mask without rounded corners */}
-                <div className="absolute inset-0 backdrop-blur-md bg-gray-100/90 dark:bg-neutral-800/90" />
-
                 {/* Direct large image without rounded corners */}
-                <img 
-                  src={hoveredRefUrl} 
+                {previewDisplaySrc && <img
+                  src={previewDisplaySrc}
+                  decoding="async"
+                  onLoad={event => {
+                    const image = event.currentTarget;
+                    if (!hoveredRefUrl || !image.naturalWidth || !image.naturalHeight) return;
+                    const dimensions = { width: image.naturalWidth, height: image.naturalHeight };
+                    if (refDimensionsCache.size >= 128) refDimensionsCache.delete(refDimensionsCache.keys().next().value!);
+                    refDimensionsCache.set(hoveredRefUrl, dimensions);
+                    setPreviewDimensions(dimensions);
+                  }}
                   alt="Reference Preview" 
                   className="relative z-10 w-full h-full object-contain pointer-events-none select-none"
                   referrerPolicy="no-referrer"
-                />
+                />}
 
                 {/* Close button at top right */}
                 <button
@@ -5727,7 +5740,6 @@ export const GenerationCard = React.memo(function GenerationCard({
                   onClick={(e) => {
                     e.stopPropagation();
                     setHoveredRefUrl(null);
-                    setActivePreviewUrl(null);
                   }}
                   className="absolute top-2 right-2 z-40 w-6 h-6 rounded-full bg-black/60 hover:bg-black/80 text-white flex items-center justify-center transition-colors shadow-sm cursor-pointer"
                   title="关闭预览"
@@ -5737,7 +5749,7 @@ export const GenerationCard = React.memo(function GenerationCard({
               </motion.div>
             )}
           </AnimatePresence>
-        </div>
+        </motion.div>
 
         {data.generationError && (
           <div role="alert" className="mt-2 text-[12px] leading-5 text-red-600 dark:text-red-400 break-words">
