@@ -558,6 +558,22 @@ export default function App() {
     }
     return DEFAULT_PROJECT.id;
   });
+
+  // Flag to differentiate initial workspace creation from regular project data reads
+  const isInitialWorkspaceLaunchRef = useRef<boolean>(
+    typeof window !== 'undefined' ? !localStorage.getItem('script_projects') : false
+  );
+
+  const createInitialCard = (): CardData => ({
+    id: `card_${Date.now()}_1`,
+    x: 360,
+    y: 120,
+    state: 'draft',
+    ratio: '3:4',
+    res: '2K',
+    prompt: '',
+    imageUrl: null
+  });
   const rawProject = projects.find(p => p.id === currentProjectId) || projects[0] || DEFAULT_PROJECT;
   const currentProject = useMemo<ScriptProject>(() => ({
     ...DEFAULT_PROJECT,
@@ -2612,17 +2628,8 @@ export default function App() {
       scriptText: ''
     };
 
-    // Create a pristine initial card for the new project
-    const initialNewCards: CardData[] = [{
-      id: `card_${Date.now()}_1`,
-      x: 360,
-      y: 120,
-      state: 'draft',
-      ratio: '3:4',
-      res: '2K',
-      prompt: '',
-      imageUrl: null
-    }];
+    // Create a pristine initial card strictly upon project creation
+    const initialNewCards: CardData[] = [createInitialCard()];
     await saveCards(initialNewCards, newId).catch(console.error);
 
     setProjects(prev => [newProj, ...prev]);
@@ -2881,19 +2888,15 @@ export default function App() {
             });
             setHistory({ past: [], present: processedFallback, future: [] });
             await saveCards(processedFallback, currentProjectId).catch(console.error);
-          } else {
-            const initialCards: CardData[] = [{
-              id: `card_${Date.now()}_1`,
-              x: 360,
-              y: 120,
-              state: 'draft',
-              ratio: '3:4',
-              res: '2K',
-              prompt: '',
-              imageUrl: null
-            }];
+          } else if (isInitialWorkspaceLaunchRef.current && currentProjectId === DEFAULT_PROJECT.id) {
+            // First-time workspace launch: creating the initial default project
+            isInitialWorkspaceLaunchRef.current = false;
+            const initialCards: CardData[] = [createInitialCard()];
             setHistory({ past: [], present: initialCards, future: [] });
             await saveCards(initialCards, currentProjectId).catch(console.error);
+          } else {
+            // Respect the empty state: do not create initial cards simply because no cards were read
+            setHistory({ past: [], present: [], future: [] });
           }
           loadedProjectIdRef.current = currentProjectId;
         }
