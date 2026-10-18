@@ -1,19 +1,129 @@
 import type { AgentRuntimeTrace } from './agent/debugTrace';
-import { createWorkspaceTransaction, readValue, transactionDone } from './storage/database';
-import { enqueueStorageWrite } from './storage/status';
-export { saveCards, loadCards, deleteCardsForProject, loadCardBackup, retryCardSaves, subscribeCardSaves } from './storage/cardRepository';
-export type { CardSaveStatus } from './storage/cardRepository';
-export { requestPersistentStorage as requestPersistence } from './storage/status';
+import { CardData } from './components/GenerationCard';
 
-export function saveAgentTraces(traces: AgentRuntimeTrace[]): Promise<void> {
-  return enqueueStorageWrite('traces', async () => {
-    const tx = await createWorkspaceTransaction('traces', 'readwrite');
-    const done = transactionDone(tx);
-    tx.objectStore('traces').put(traces.slice(-50), 'agent_traces');
-    await done;
+const DB_NAME = 'InfiniteCanvasDB';
+const STORE_NAME = 'workspace';
+const DB_VERSION = 10;
+
+function openDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof window === 'undefined' || !window.indexedDB) {
+      return reject(new Error('IndexedDB not supported'));
+    }
+
+    const tryOpen = (version?: number) => {
+      const request = version ? indexedDB.open(DB_NAME, version) : indexedDB.open(DB_NAME);
+
+      request.onerror = () => {
+        const err = request.error;
+        if (err && err.name === 'VersionError' && version) {
+          console.warn(`Version error opening ${DB_NAME} at version ${version}. Attempting fallback...`);
+          const fallbackReq = indexedDB.open(DB_NAME);
+          fallbackReq.onsuccess = () => {
+            const db = fallbackReq.result;
+            if (db.objectStoreNames.contains(STORE_NAME)) {
+              resolve(db);
+            } else {
+              db.close();
+              const deleteReq = indexedDB.deleteDatabase(DB_NAME);
+              deleteReq.onsuccess = () => tryOpen(DB_VERSION);
+              deleteReq.onerror = () => reject(err);
+            }
+          };
+          fallbackReq.onerror = () => reject(err);
+          return;
+        }
+        reject(err);
+      };
+
+      request.onsuccess = () => resolve(request.result);
+
+      request.onupgradeneeded = (e) => {
+        const db = (e.target as IDBOpenDBRequest).result;
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          db.createObjectStore(STORE_NAME);
+        }
+      };
+    };
+
+    tryOpen(DB_VERSION);
   });
 }
+
+export async function requestPersistence(): Promise<boolean> {
+  try {
+    if (navigator.storage && navigator.storage.persist) {
+      let isPersisted = await navigator.storage.persisted();
+      if (!isPersisted) {
+        isPersisted = await navigator.storage.persist();
+      }
+      console.log(`Storage persistence status: ${isPersisted ? 'Persisted' : 'Not Persisted'}`);
+      return isPersisted;
+    }
+  } catch (error) {
+    console.error('Failed to request persistence:', error);
+  }
+  return false;
+}
+
+export async function saveCards(cards: CardData[], projectId?: string): Promise<void> {
+  const db = await openDB();
+  const key = projectId ? `cards_${projectId}` : 'cards';
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    const request = store.put(cards, key);
+    
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function loadCards(projectId?: string): Promise<CardData[] | null> {
+  const db = await openDB();
+  const key = projectId ? `cards_${projectId}` : 'cards';
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const store = tx.objectStore(STORE_NAME);
+    const request = store.get(key);
+    
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function deleteCardsForProject(projectId: string): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    const request = store.delete(`cards_${projectId}`);
+    
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+export async function saveAgentTraces(traces: AgentRuntimeTrace[]): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    // Keep max 50 traces to avoid taking up too much space
+    const request = store.put(traces.slice(-50), 'agent_traces');
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
 export async function loadAgentTraces(): Promise<AgentRuntimeTrace[] | null> {
-  return await readValue<AgentRuntimeTrace[]>('traces', 'agent_traces')
-    ?? await readValue<AgentRuntimeTrace[]>('workspace', 'agent_traces') ?? null;
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const store = tx.objectStore(STORE_NAME);
+    const request = store.get('agent_traces');
+    
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error);
+  });
 }

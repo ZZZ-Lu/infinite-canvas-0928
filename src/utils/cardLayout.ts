@@ -61,15 +61,3 @@ export function getBottomPanelHeight(promptText: string | undefined | null, refe
 
   return 103 + refSectionHeight + promptHeight;
 }
-
-// Coordinates shared by the existing prompt surfaces and their cached backdrop.
-export function getPromptSurfaceLayout(prompt: string | undefined, referenceCount: number) {
-  return { left: 16, width: 446, top: 24 + Math.ceil((referenceCount + 1) / 8) * 56, height: getPromptAreaHeight(prompt) };
-}
-
-export function getReferencePreviewLayout(prompt: string | undefined, dimensions: { width: number; height: number } | null) {
-  const promptHeight = getPromptAreaHeight(prompt);
-  const previewHeight = dimensions && dimensions.width > 0 && dimensions.height > 0
-    ? Math.min(280, Math.max(80, Math.round(448 * dimensions.height / dimensions.width))) : 200;
-  return { promptHeight, previewHeight, height: Math.max(promptHeight, previewHeight), expands: previewHeight > promptHeight };
-}

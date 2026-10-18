@@ -62,7 +62,9 @@ export function transactionDone(tx: IDBTransaction): Promise<void> {
     tx.onerror = event => { cause = (event.target as IDBRequest)?.error || tx.error; };
     tx.onabort = () => {
       const error = cause || tx.error || new Error('IndexedDB 事务已中止');
-      if (error.name === 'UnknownError' || /IOError|closing|closed/i.test(error.message)) invalidateConnection(tx.db);
+      // Only tear down the active connection if the database is actually closing/closed,
+      // avoiding cascading failures across other concurrent stores (settings/projects/drafts).
+      if (/closing|closed/i.test(error.message)) invalidateConnection(tx.db);
       reject(error);
     };
   });

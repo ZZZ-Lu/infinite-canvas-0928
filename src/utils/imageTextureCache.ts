@@ -19,7 +19,6 @@ const originalLruQueue: string[] = [];
 
 // Map from URL -> Set of callbacks to trigger when loaded
 const pendingCallbacks = new Map<string, Set<() => void>>();
-const failures = new Map<string, { attempts: number; retryAt: number }>();
 
 /**
  * Get or asynchronously load an image for Canvas rendering.
@@ -31,15 +30,6 @@ export function getOrLoadCanvasImage(
   tier: 'full' | 'original' = 'full'
 ): HTMLImageElement | null {
   if (!url) return null;
-  const cacheKey = `${tier}:${url}`;
-  const failure = failures.get(cacheKey);
-  if (failure && Date.now() < failure.retryAt) {
-    if (onLoaded && failure.attempts < 3) {
-      if (!pendingCallbacks.has(cacheKey)) pendingCallbacks.set(cacheKey, new Set());
-      pendingCallbacks.get(cacheKey)!.add(onLoaded);
-    }
-    return null;
-  }
 
   const targetMap = tier === 'original' ? originalImageCache : fullImageCache;
   const existing = targetMap.get(url);
@@ -52,10 +42,10 @@ export function getOrLoadCanvasImage(
       return existing;
     }
     if (onLoaded) {
-      if (!pendingCallbacks.has(cacheKey)) {
-        pendingCallbacks.set(cacheKey, new Set());
+      if (!pendingCallbacks.has(url)) {
+        pendingCallbacks.set(url, new Set());
       }
-      pendingCallbacks.get(cacheKey)!.add(onLoaded);
+      pendingCallbacks.get(url)!.add(onLoaded);
     }
     return null;
   }
@@ -68,16 +58,14 @@ export function getOrLoadCanvasImage(
   img.referrerPolicy = 'no-referrer';
 
   if (onLoaded) {
-    if (!pendingCallbacks.has(cacheKey)) {
-      pendingCallbacks.set(cacheKey, new Set());
+    if (!pendingCallbacks.has(url)) {
+      pendingCallbacks.set(url, new Set());
     }
-    pendingCallbacks.get(cacheKey)!.add(onLoaded);
+    pendingCallbacks.get(url)!.add(onLoaded);
   }
 
   img.onload = () => {
-    failures.delete(cacheKey);
-    const callbacks = pendingCallbacks.get(cacheKey);
-    pendingCallbacks.delete(cacheKey);
+    const callbacks = pendingCallbacks.get(url);
     if (callbacks) {
       callbacks.forEach(cb => {
         try {
@@ -86,6 +74,7 @@ export function getOrLoadCanvasImage(
           console.error('[imageTextureCache] Callback execution error:', err);
         }
       });
+      pendingCallbacks.delete(url);
     }
   };
   img.onerror = () => {
@@ -95,16 +84,7 @@ export function getOrLoadCanvasImage(
       img.src = url;
     } else {
       console.warn(`[imageTextureCache] Hard load failure for ${tier} image: ${url}`);
-      if (targetMap.get(url) !== img) return;
-      targetMap.delete(url);
-      const attempts = (failures.get(cacheKey)?.attempts || 0) + 1;
-      const delay = 500 * 2 ** (attempts - 1);
-      failures.set(cacheKey, { attempts, retryAt: attempts < 3 ? Date.now() + delay : Infinity });
-      if (attempts < 3) {
-        setTimeout(() => getOrLoadCanvasImage(url, undefined, tier), delay);
-      } else {
-        pendingCallbacks.delete(cacheKey);
-      }
+      pendingCallbacks.delete(url);
     }
   };
 
@@ -139,9 +119,6 @@ function enforceOriginalLruLimit() {
     if (oldestUrl) {
       const img = originalImageCache.get(oldestUrl);
       if (img) {
-        img.onload = null;
-        img.onerror = null;
-        pendingCallbacks.delete(`original:${oldestUrl}`);
         img.src = ''; // Release browser image decoding buffer
       }
       originalImageCache.delete(oldestUrl);

@@ -3,13 +3,13 @@ import type { MotionValue } from 'motion/react';
 import { CANVAS_IDLE_MS, scheduleCanvasSurface } from '../utils/canvasPerformance';
 
 import { layoutPromptText } from '../utils/promptTextLayout';
-import { cacheSurfaceBitmap, getSurfaceBitmap, publishCardSurface } from '../utils/promptSurfaceCache';
+import { cacheSurfaceBitmap, getSurfaceBitmap } from '../utils/promptSurfaceCache';
 
 const PLACEHOLDER = '输入文字指令，例如：清冷克制的女主，穿白衬衫...';
 
 /** A persistent text surface. Its bitmap is independent of camera motion. */
 export const PromptCanvas = React.memo(function PromptCanvas({
-  text, height, mentionNames, scale, editing, scrollTop, onEdit, disabled, targetId, renderKey, onReady, cardId, surfaceRevision, suspended = false,
+  text, height, mentionNames, scale, editing, scrollTop, onEdit, disabled, targetId, renderKey, onReady,
 }: {
   text: string;
   height: number;
@@ -22,9 +22,6 @@ export const PromptCanvas = React.memo(function PromptCanvas({
   targetId: string;
   renderKey?: string;
   onReady?: (key: string) => void;
-  cardId?: string;
-  surfaceRevision?: string;
-  suspended?: boolean;
 }) {
   const readyRef = useRef(onReady);
   readyRef.current = onReady;
@@ -63,7 +60,6 @@ export const PromptCanvas = React.memo(function PromptCanvas({
   }, [scale]);
 
   useLayoutEffect(() => {
-    if (suspended) return;
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext('2d');
     if (!canvas || !ctx) return;
@@ -94,7 +90,6 @@ export const PromptCanvas = React.memo(function PromptCanvas({
     const bitmap = getSurfaceBitmap(bitmapKey);
     if (bitmap) {
       ctx.drawImage(bitmap, 0, 0, width, height);
-      publishCardSurface(cardId, 'text', surfaceRevision, bitmapKey);
       readyRef.current?.(renderKey || '');
       return;
     }
@@ -124,10 +119,9 @@ export const PromptCanvas = React.memo(function PromptCanvas({
       }
     });
     cacheSurfaceBitmap(bitmapKey, canvas);
-    publishCardSurface(cardId, 'text', surfaceRevision, bitmapKey);
     readyRef.current?.(renderKey || '');
-    }, { priority: 'prompt', label: `prompt-text:${targetId}` });
-  }, [text, height, width, resolution, mentionKey, scrollTop, themeEpoch, renderKey, cardId, surfaceRevision, suspended]);
+    });
+  }, [text, height, width, resolution, mentionKey, scrollTop, themeEpoch, renderKey]);
 
   return <canvas ref={canvasRef}
     data-agent-target={editing ? undefined : targetId}

@@ -3,8 +3,7 @@ import type { MotionValue } from 'motion/react';
 import { ArrowUp, Box, ChevronDown, Layers, Plus, Sparkles } from 'lucide-react';
 import { getOrLoadThumbImage } from '../utils/thumbnail';
 import { CANVAS_IDLE_MS, scheduleCanvasSurface } from '../utils/canvasPerformance';
-import { cacheSurfaceBitmap, getSurfaceBitmap, publishCardSurface } from '../utils/promptSurfaceCache';
-import { referenceDisplayName } from '../utils/referenceName';
+import { cacheSurfaceBitmap, getSurfaceBitmap } from '../utils/promptSurfaceCache';
 
 export interface PanelControl { key: string; label: string; targetId: string; onClick: () => void; }
 
@@ -12,7 +11,7 @@ export interface PanelControl { key: string; label: string; targetId: string; on
 // semantic controls provide layout/hit testing; only their cached bitmap is visible.
 export const PromptPanelCanvas = React.memo(function PromptPanelCanvas({
   height, references, controls, scale, generating, canGenerate, onGenerate,
-  onReference, onMention, onRemove, onAdd, cardId, children, renderKey, onReady, surfaceRevision, suspended = false,
+  onReference, onMention, onRemove, onAdd, cardId, children, renderKey, onReady,
 }: {
   height: number;
   references: { url: string; thumbnailUrl?: string; name?: string }[];
@@ -21,8 +20,6 @@ export const PromptPanelCanvas = React.memo(function PromptPanelCanvas({
   onMention: (index: number) => void; onRemove: (index: number) => void;
   onAdd: () => void; cardId: string; children: React.ReactNode;
   renderKey?: string; onReady?: (key: string) => void;
-  surfaceRevision?: string;
-  suspended?: boolean;
 }) {
   const readyRef = useRef(onReady);
   readyRef.current = onReady;
@@ -35,7 +32,6 @@ export const PromptPanelCanvas = React.memo(function PromptPanelCanvas({
   const controlKey = JSON.stringify(controls.map(c => [c.key, c.label]));
 
   useEffect(() => {
-    if (suspended) return;
     const observer = new MutationObserver(() => setEpoch(n => n + 1));
     observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
     const sizeObserver = new ResizeObserver(() => setEpoch(n => n + 1));
@@ -48,10 +44,9 @@ export const PromptPanelCanvas = React.memo(function PromptPanelCanvas({
       timer = setTimeout(() => setDpr(Math.min(3, Math.max(1, scale.get()) * (window.devicePixelRatio || 1))), CANVAS_IDLE_MS);
     });
     return () => { active = false; observer.disconnect(); sizeObserver.disconnect(); unsubscribe(); clearTimeout(timer); };
-  }, [scale, suspended]);
+  }, [scale]);
 
   useLayoutEffect(() => {
-    if (suspended) return;
     const canvas = canvasRef.current, root = rootRef.current;
     const ctx = canvas?.getContext('2d');
     if (!canvas || !ctx || !root) return;
@@ -59,7 +54,7 @@ export const PromptPanelCanvas = React.memo(function PromptPanelCanvas({
     let active = true;
     const redraw = () => {
       if (!active || cancelDraw) return;
-      cancelDraw = scheduleCanvasSurface(() => { cancelDraw = null; draw(); }, { priority: 'prompt', label: `prompt-panel:${cardId}` });
+      cancelDraw = scheduleCanvasSurface(() => { cancelDraw = null; draw(); });
     };
     const draw = () => {
       const origin = root.getBoundingClientRect();
@@ -74,7 +69,6 @@ export const PromptPanelCanvas = React.memo(function PromptPanelCanvas({
       const bitmap = hoveredReference === null && getSurfaceBitmap(bitmapKey);
       if (bitmap) {
         ctx.drawImage(bitmap, 0, 0, width, localHeight);
-        publishCardSurface(cardId, 'panel', surfaceRevision, bitmapKey);
         readyRef.current?.(renderKey || '');
         return;
       }
@@ -136,7 +130,7 @@ export const PromptPanelCanvas = React.memo(function PromptPanelCanvas({
         const label = root.querySelector(`[data-ref-label="${index}"]`); if (label) text(label);
         if (hoveredReference === index) {
           ctx.fillStyle = '#ef4444'; ctx.beginPath(); ctx.arc(x + 45, y + 3, 7, 0, Math.PI * 2); ctx.fill();
-          ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x + 43, y + 3); ctx.lineTo(x + 47, y + 3); ctx.stroke();
+          ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x + 43, y + 1); ctx.lineTo(x + 47, y + 5); ctx.moveTo(x + 47, y + 1); ctx.lineTo(x + 43, y + 5); ctx.stroke();
         }
       });
       const addX = 16 + references.length % 8 * 56, addY = 16 + Math.floor(references.length / 8) * 56;
@@ -158,12 +152,11 @@ export const PromptPanelCanvas = React.memo(function PromptPanelCanvas({
       root.querySelectorAll('[data-paint-text]').forEach(text);
       root.querySelectorAll<SVGSVGElement>('svg').forEach(icon);
       if (hoveredReference === null && imagesComplete) cacheSurfaceBitmap(bitmapKey, canvas);
-      if (hoveredReference === null) publishCardSurface(cardId, 'panel', surfaceRevision, bitmapKey);
       readyRef.current?.(renderKey || '');
     };
     redraw();
     return () => { active = false; cancelDraw?.(); };
-  }, [height, referenceKey, controlKey, dpr, epoch, hoveredReference, generating, canGenerate, renderKey, cardId, surfaceRevision, suspended]);
+  }, [height, referenceKey, controlKey, dpr, epoch, hoveredReference, generating, canGenerate, renderKey]);
 
   return <div ref={rootRef} className="absolute inset-0" style={{ fontFamily: 'inherit' }}>
     <canvas ref={canvasRef} aria-hidden="true" className="absolute inset-0 w-full h-full pointer-events-none" />
@@ -174,7 +167,7 @@ export const PromptPanelCanvas = React.memo(function PromptPanelCanvas({
           className="absolute inset-0 opacity-0" onClick={() => onReference(index)} />
         <button type="button" aria-label={`@${reference.name || `图 ${index + 1}`}`} title="点击在提示词中引用"
           className="absolute top-[3px] left-[3px] right-[3px] px-0.5 text-left opacity-0" onClick={() => onMention(index)}>
-          <span data-ref-label={index} className="text-[6.5px] font-bold text-[#3b82f6] dark:text-blue-400 block truncate leading-normal tracking-tight">@{referenceDisplayName(reference.name || `图 ${index + 1}`)}</span>
+          <span data-ref-label={index} className="text-[6.5px] font-bold text-[#3b82f6] dark:text-blue-400 block truncate leading-normal tracking-tight">@{reference.name || `图 ${index + 1}`}</span>
         </button>
         <button type="button" aria-label={`移除参考图：${reference.name || index + 1}`} title="移除参考图"
           className="absolute -top-1 -right-1 w-3.5 h-3.5 opacity-0" style={{ visibility: hoveredReference === index ? 'visible' : 'hidden' }} onClick={() => onRemove(index)} />

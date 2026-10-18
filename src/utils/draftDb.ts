@@ -1,22 +1,108 @@
-import { createWorkspaceTransaction, openWorkspaceDatabase, readEntries, transactionDone } from '../storage/database';
-import { enqueueStorageWrite } from '../storage/status';
-export const initDb = openWorkspaceDatabase;
+const DB_NAME = 'MiraDraftsDb';
+const STORE_NAME = 'drafts';
+const DB_VERSION = 10;
+
+export function initDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') {
+      reject(new Error('IndexedDB is not supported in this environment'));
+      return;
+    }
+
+    const tryOpen = (version?: number) => {
+      const request = version ? indexedDB.open(DB_NAME, version) : indexedDB.open(DB_NAME);
+
+      request.onerror = () => {
+        const err = request.error;
+        if (err && err.name === 'VersionError' && version) {
+          console.warn(`Version error opening ${DB_NAME} at version ${version}. Attempting fallback...`);
+          const fallbackReq = indexedDB.open(DB_NAME);
+          fallbackReq.onsuccess = () => {
+            const db = fallbackReq.result;
+            if (db.objectStoreNames.contains(STORE_NAME)) {
+              resolve(db);
+            } else {
+              db.close();
+              const deleteReq = indexedDB.deleteDatabase(DB_NAME);
+              deleteReq.onsuccess = () => tryOpen(DB_VERSION);
+              deleteReq.onerror = () => reject(err);
+            }
+          };
+          fallbackReq.onerror = () => reject(err);
+          return;
+        }
+        reject(err);
+      };
+
+      request.onsuccess = () => resolve(request.result);
+
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          db.createObjectStore(STORE_NAME);
+        }
+      };
+    };
+
+    tryOpen(DB_VERSION);
+  });
+}
+
 export async function getDrafts(): Promise<Record<string, string>> {
-  return Object.fromEntries(await readEntries<string>('drafts'));
+  try {
+    const db = await initDb();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, 'readonly');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.openCursor();
+      const result: Record<string, string> = {};
+
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (cursor) {
+          result[cursor.key as string] = cursor.value as string;
+          cursor.continue();
+        } else {
+          resolve(result);
+        }
+      };
+
+      request.onerror = () => reject(request.error);
+    });
+  } catch (err) {
+    console.error('Failed to get drafts from IndexedDB:', err);
+    return {};
+  }
 }
-export function saveDraft(targetId: string, text: string): Promise<void> {
-  return enqueueStorageWrite(`draft:${targetId}`, async () => {
-    const tx = await createWorkspaceTransaction('drafts', 'readwrite');
-    const done = transactionDone(tx);
-    tx.objectStore('drafts').put(text, targetId);
-    await done;
-  });
+
+export async function saveDraft(targetId: string, text: string): Promise<void> {
+  try {
+    const db = await initDb();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.put(text, targetId);
+
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  } catch (err) {
+    console.error(`Failed to save draft for ${targetId} to IndexedDB:`, err);
+  }
 }
-export function deleteDraft(targetId: string): Promise<void> {
-  return enqueueStorageWrite(`draft:${targetId}`, async () => {
-    const tx = await createWorkspaceTransaction('drafts', 'readwrite');
-    const done = transactionDone(tx);
-    tx.objectStore('drafts').delete(targetId);
-    await done;
-  });
+
+export async function deleteDraft(targetId: string): Promise<void> {
+  try {
+    const db = await initDb();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, 'readwrite');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.delete(targetId);
+
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  } catch (err) {
+    console.error(`Failed to delete draft for ${targetId} from IndexedDB:`, err);
+  }
 }

@@ -4,7 +4,7 @@
  * fully portable to PixiJS / WebGL / Canvas / Worker environments.
  */
 
-export const MAX_THUMBNAIL_EDGE = 480;
+export const MAX_THUMBNAIL_EDGE = 256;
 
 // In-memory string cache for thumbnail Data URLs (media/card id -> DataURL)
 export const thumbCache = new Map<string, string>();

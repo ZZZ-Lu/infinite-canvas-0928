@@ -4,11 +4,7 @@ import { createRecoveryPacer } from './canvasRecoveryPolicy';
 export const CANVAS_IDLE_MS = 300;
 
 // Mounting and drawing share this adaptive, render-only queue.
-type SurfaceOptions = { priority?: 'prompt'; label?: string };
-const surfaceJobs = new Map<symbol, { run: () => void; options: SurfaceOptions; queuedAt: number }>();
-const surfaceTimings: { label: string; waitMs: number; runMs: number }[] = [];
-// Bounded diagnostics, kept out of serializable project state.
-export function getCanvasSurfaceTimings() { return surfaceTimings.map(timing => ({ ...timing })); }
+const surfaceJobs = new Map<symbol, () => void>();
 const pacer = createRecoveryPacer();
 let surfaceFrame: number | null = null;
 let previousFrame: number | null = null;
@@ -48,20 +44,11 @@ function pumpSurfaces(frameTime: number) {
     previousFrame = frameTime;
     if (++framesSinceJob > pacer.idleFrames) {
       framesSinceJob = 0;
-      // Finish already-mounted prompt surfaces before admitting another card.
-      // Still execute just one job at the existing adaptive frame cadence.
-      let next = surfaceJobs.entries().next().value!;
-      for (const entry of surfaceJobs) {
-        if (entry[1].options.priority === 'prompt') { next = entry; break; }
-      }
-      const [key, job] = next;
+      const [key, job] = surfaceJobs.entries().next().value!;
       surfaceJobs.delete(key);
       const start = performance.now();
-      try { job.run(); } finally {
-        const runMs = performance.now() - start;
-        surfaceTimings.push({ label: job.options.label || 'surface', waitMs: start - job.queuedAt, runMs });
-        if (surfaceTimings.length > 100) surfaceTimings.shift();
-        pacer.observeJob(runMs);
+      try { job(); } finally {
+        pacer.observeJob(performance.now() - start);
         scheduleSurfaceFrame();
       }
       return;
@@ -70,9 +57,9 @@ function pumpSurfaces(frameTime: number) {
   scheduleSurfaceFrame();
 }
 
-export function scheduleCanvasSurface(job: () => void, options: SurfaceOptions = {}): () => void {
+export function scheduleCanvasSurface(job: () => void): () => void {
   const key = Symbol();
-  surfaceJobs.set(key, { run: job, options, queuedAt: performance.now() });
+  surfaceJobs.set(key, job);
   scheduleSurfaceFrame();
   return () => {
     surfaceJobs.delete(key);

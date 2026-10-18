@@ -1,4 +1,3 @@
-import { appStorage } from '../storage/appStorage';
 import type { AgentToolName } from './protocol';
 
 export type ToolCategory = '页面观察' | '页面交互' | '操作知识' | '系统控制';
@@ -35,7 +34,7 @@ export const DEFAULT_AGENT_TOOL_CONFIG: AgentToolConfig = Object.fromEntries(
 
 export const getAgentToolConfig = (): AgentToolConfig => {
   try {
-    const saved = appStorage.getItem('agent_tool_config');
+    const saved = localStorage.getItem('agent_tool_config');
     return { ...DEFAULT_AGENT_TOOL_CONFIG, ...(saved ? JSON.parse(saved) : {}) };
   } catch {
     return { ...DEFAULT_AGENT_TOOL_CONFIG };
@@ -43,5 +42,5 @@ export const getAgentToolConfig = (): AgentToolConfig => {
 };
 
 export const saveAgentToolConfig = (config: AgentToolConfig) => {
-  appStorage.setItem('agent_tool_config', JSON.stringify(config));
+  localStorage.setItem('agent_tool_config', JSON.stringify(config));
 };

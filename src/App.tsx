@@ -1,5 +1,3 @@
-import { appStorage, flushAppStorage } from './storage/appStorage';
-import { markStorageDirty } from './storage/status';
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
 import { AgentContextMenu } from './components/AgentContextMenu';
@@ -10,17 +8,16 @@ import { NanoLodCanvas } from './components/NanoLodCanvas';
 import { FpsCounter } from './components/FpsCounter';
 import { generateImageThumbnail, generateVideoThumbnail, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
 import { fastGetImageDimensions } from './utils/imageHeader';
-import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
+import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, LOD_THRESHOLDS, getLodTierByScale, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
 import { CANVAS_IDLE_MS, scheduleCanvasSurface } from './utils/canvasPerformance';
 import { readyPromptPanels } from './utils/promptSurfaceCache';
 import { createCardMountStore, ProgressiveGenerationCard } from './components/ProgressiveGenerationCard';
-import { canRetireDomForNano, type LodFrame } from './utils/lodHandoff';
 import { buildCardQuadTree, QuadTree, BoundingBox } from './utils/quadTree';
 import { getBottomPanelHeight } from './utils/cardLayout';
 import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
 import { cropBoundingBoxFromImage } from './utils/imageCropper';
 import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp } from 'lucide-react';
-import { loadCards, saveCards, subscribeCardSaves, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
+import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
 import { SettingsPage } from './components/SettingsPage';
 import { getDrafts, saveDraft, deleteDraft } from './utils/draftDb';
 import { McpKeyButton } from './components/McpKeyButton';
@@ -352,7 +349,7 @@ export default function App() {
   // Replace useState with useMotionValue for high-frequency transforms
   const initialTransform = useMemo(() => {
     if (typeof window !== 'undefined') {
-      const saved = appStorage.getItem('canvas_transform');
+      const saved = localStorage.getItem('canvas_transform');
       if (saved) {
         try { return JSON.parse(saved); } catch (e) { }
       }
@@ -372,6 +369,7 @@ export default function App() {
   const updateCurrentScale = (latestScale: number) => {
     const workspace = document.getElementById('canvas-workspace');
     if (workspace) {
+      workspace.style.setProperty('--current-scale', latestScale.toString());
       if (workspace.getAttribute('data-gesture') === 'true') {
         // A single boundary switch lets the already-active Nano canvas take over,
         // without reconciling/unmounting every editor in the middle of a wheel gesture.
@@ -380,8 +378,6 @@ export default function App() {
           if (useNanoPreview) workspace.setAttribute('data-gesture-low', 'true');
           else workspace.removeAttribute('data-gesture-low');
         }
-      } else {
-        workspace.style.setProperty('--current-scale', latestScale.toString());
       }
     }
   };
@@ -409,7 +405,7 @@ export default function App() {
       timeout = setTimeout(() => {
         const data = JSON.stringify({ x: tx.get(), y: ty.get(), scale: tScale.get() });
         // Legacy fallback only for now, actual project-specific save happens below
-        appStorage.setItem('canvas_transform', data);
+        localStorage.setItem('canvas_transform', data); 
       }, 300);
     };
     const unsubX = tx.on('change', saveTransform);
@@ -421,7 +417,7 @@ export default function App() {
   // Theme State
   const [isDarkMode, setIsDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
-      const saved = appStorage.getItem('theme_mode');
+      const saved = localStorage.getItem('theme_mode');
       if (saved) return saved === 'dark';
       return window.matchMedia('(prefers-color-scheme: dark)').matches;
     }
@@ -519,13 +515,13 @@ export default function App() {
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', isDarkMode);
-    appStorage.setItem('theme_mode', isDarkMode ? 'dark' : 'light');
+    localStorage.setItem('theme_mode', isDarkMode ? 'dark' : 'light');
   }, [isDarkMode]);
 
   // Projects & Script Bible State
   const [projects, setProjects] = useState<ScriptProject[]>(() => {
     if (typeof window !== 'undefined') {
-      const saved = appStorage.getItem('script_projects');
+      const saved = localStorage.getItem('script_projects');
       if (saved) {
         try {
           const parsed = JSON.parse(saved);
@@ -555,26 +551,10 @@ export default function App() {
 
   const [currentProjectId, setCurrentProjectId] = useState<string>(() => {
     if (typeof window !== 'undefined') {
-      const savedId = appStorage.getItem('current_project_id');
+      const savedId = localStorage.getItem('current_project_id');
       if (savedId && savedId !== 'proj_blackstone_night') return savedId;
     }
     return DEFAULT_PROJECT.id;
-  });
-
-  // Flag to differentiate initial workspace creation from regular project data reads
-  const isInitialWorkspaceLaunchRef = useRef<boolean>(
-    typeof window !== 'undefined' ? !appStorage.getItem('script_projects') : false
-  );
-
-  const createInitialCard = (): CardData => ({
-    id: `card_${Date.now()}_1`,
-    x: 360,
-    y: 120,
-    state: 'draft',
-    ratio: '3:4',
-    res: '2K',
-    prompt: '',
-    imageUrl: null
   });
   const rawProject = projects.find(p => p.id === currentProjectId) || projects[0] || DEFAULT_PROJECT;
   const currentProject = useMemo<ScriptProject>(() => ({
@@ -696,13 +676,13 @@ export default function App() {
     setRequestedTocItemId(null);
   }, []);
 
-  // Sync projects to appStorage
+  // Sync projects to localStorage
   useEffect(() => {
-    appStorage.setItem('script_projects', JSON.stringify(projects));
+    localStorage.setItem('script_projects', JSON.stringify(projects));
   }, [projects]);
 
   useEffect(() => {
-    appStorage.setItem('current_project_id', currentProjectId);
+    localStorage.setItem('current_project_id', currentProjectId);
   }, [currentProjectId]);
 
   const handleRenameProject = (projectId: string, newName: string) => {
@@ -915,6 +895,8 @@ export default function App() {
       if (drafts) {
         setCardDrafts(drafts);
       }
+    }).catch(err => {
+      console.warn('Could not load drafts from IndexedDB:', err);
     });
   }, []);
 
@@ -1056,13 +1038,6 @@ export default function App() {
 
   // State for Cards & History
   const [isLoading, setIsLoading] = useState(true);
-  const [storageError, setStorageError] = useState<string | null>(null);
-  const loadedCardsSnapshotRef = useRef<CardData[] | null>(null);
-  const observedSaveCardsRef = useRef<CardData[]>([]);
-  useEffect(() => subscribeCardSaves(status => {
-    if (status.state === 'error') setStorageError('项目保存失败，请暂勿刷新或关闭页面：' + status.error);
-    else if (status.projectId === currentProjectId) setStorageError(previous => previous?.startsWith('项目保存失败') ? null : previous);
-  }), [currentProjectId]);
   const [history, setHistory] = useState<{ past: CardData[][], present: CardData[], future: CardData[][] }>({
     past: [],
     present: [],
@@ -1297,7 +1272,7 @@ export default function App() {
       // Clear the current active card draft and persist delete to IndexedDB on close
       const currentTarget = agentQuickInput?.targetId || 'global';
       setCardDrafts(prev => ({ ...prev, [currentTarget]: '' }));
-      void deleteDraft(currentTarget).catch(console.error);
+      deleteDraft(currentTarget);
 
       setAgentQuickInput(null);
     } else {
@@ -1835,9 +1810,9 @@ export default function App() {
 
       const nodeModels = assetExtractionService.getNodeModels();
       const modelToUse = nodeModels.subjectLandmarksModel || 'deepseek-v4-flash';
-      const deepseekKey = appStorage.getItem('deepseek_api_key') || '';
-      const qwenKey = appStorage.getItem('qwen_api_key') || appStorage.getItem('glm_api_key') || '';
-      const arkKey = appStorage.getItem('ark_api_key') || appStorage.getItem('volcengine_api_key') || '';
+      const deepseekKey = localStorage.getItem('deepseek_api_key') || '';
+      const qwenKey = localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || '';
+      const arkKey = localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || '';
       const isArk = modelToUse.includes('doubao') || modelToUse.includes('seed-2-1') || modelToUse.includes('seed-2.1') || modelToUse.includes('ark') || modelToUse.includes('volces');
       const isDashscope = modelToUse.includes('qwen') || modelToUse.includes('GLM') || modelToUse.includes('ZHIPU');
       const apiKeyToSend = isArk ? (arkKey || deepseekKey || qwenKey) : isDashscope ? (qwenKey || deepseekKey) : (deepseekKey || qwenKey);
@@ -2344,8 +2319,6 @@ export default function App() {
         res: '2K',
         prompt: `${sourceLabel} ${isVideo ? 'video' : 'image'}: ${file.name || 'unnamed'}`,
         imageUrl: fileUrl, // Visible on the canvas instantly!
-        fileData: file, // Persist original bytes before asynchronous proxy generation.
-        trueOriginalFileData: file,
         isVideo: isVideo,
         customWidth: customWidth,
         customHeight: customHeight,
@@ -2552,7 +2525,7 @@ export default function App() {
   // Load canvas transform per project
   useEffect(() => {
     if (currentProjectId) {
-      const saved = appStorage.getItem(`canvas_transform_${currentProjectId}`);
+      const saved = localStorage.getItem(`canvas_transform_${currentProjectId}`);
       let x = 0, y = 0, scale = 1;
       let hasSaved = false;
       
@@ -2564,7 +2537,7 @@ export default function App() {
         } catch (e) {}
       } else if (currentProjectId === DEFAULT_PROJECT.id) {
         // Fallback to legacy global key for the default project
-        const legacy = appStorage.getItem('canvas_transform');
+        const legacy = localStorage.getItem('canvas_transform');
         if (legacy) {
           try {
             const parsed = JSON.parse(legacy);
@@ -2595,7 +2568,7 @@ export default function App() {
       timeout = setTimeout(() => {
         if (currentProjectId) {
             const data = JSON.stringify({ x: tx.get(), y: ty.get(), scale: tScale.get() });
-            appStorage.setItem(`canvas_transform_${currentProjectId}`, data);
+            localStorage.setItem(`canvas_transform_${currentProjectId}`, data);
         }
       }, 300);
     };
@@ -2606,67 +2579,59 @@ export default function App() {
   }, [tx, ty, tScale, currentProjectId]);
   // -------------------------------------
 
-  const projectTransitionRef = useRef(false);
-  const persistCurrentProject = async () => {
-    if (loadedProjectIdRef.current === currentProjectId && cardsRef.current !== loadedCardsSnapshotRef.current) {
-      await saveCards(cardsRef.current, currentProjectId);
+  const handleSelectProject = (projectId: string) => {
+    if (projectId === currentProjectId) return;
+    // Save current cards first before switching
+    if (loadedProjectIdRef.current === currentProjectId && !isLoading) {
+      saveCards(cardsRef.current, currentProjectId).catch(console.error);
     }
-    await flushAppStorage();
-  };
-  const handleSelectProject = async (projectId: string) => {
-    if (projectId === currentProjectId || projectTransitionRef.current || isLoading) return;
-    projectTransitionRef.current = true;
+    loadedProjectIdRef.current = null;
     setIsLoading(true);
-    try {
-      await persistCurrentProject();
-      loadedProjectIdRef.current = null;
-      setCurrentProjectId(projectId);
-    } catch (error) {
-      setStorageError('当前项目未保存成功，已停止切换。请重试保存。');
-      setIsLoading(false);
-    } finally { projectTransitionRef.current = false; }
+    setCurrentProjectId(projectId);
   };
 
   const handleCreateProject = async (name: string) => {
-    if (projectTransitionRef.current || isLoading) return;
-    projectTransitionRef.current = true;
+    // Save current project's cards first
+    if (loadedProjectIdRef.current === currentProjectId && !isLoading) {
+      await saveCards(cardsRef.current, currentProjectId).catch(console.error);
+    }
+    loadedProjectIdRef.current = null;
     setIsLoading(true);
-    try {
-      await persistCurrentProject();
-      const newId = 'proj_' + crypto.randomUUID();
-      const newProj: ScriptProject = {
-        ...DEFAULT_PROJECT, id: newId, name, logline: '', createdAt: Date.now(), updatedAt: Date.now(),
-        characters: [], locations: [], props: [], scenes: [], scriptText: ''
-      };
-      await saveCards([createInitialCard()], newId);
-      const nextProjects = [newProj, ...projects];
-      appStorage.setItem('script_projects', JSON.stringify(nextProjects));
-      await flushAppStorage();
-      loadedProjectIdRef.current = null;
-      setProjects(nextProjects);
-      setCurrentProjectId(newId);
-    } catch (error) {
-      setStorageError('新项目未能完成保存，已保留原项目。请重试保存。');
-      setIsLoading(false);
-    } finally { projectTransitionRef.current = false; }
+
+    const newId = `proj_${Date.now()}`;
+    const newProj: ScriptProject = {
+      ...DEFAULT_PROJECT,
+      id: newId,
+      name,
+      logline: '',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      characters: [],
+      locations: [],
+      props: [],
+      scriptText: ''
+    };
+
+    // Create a pristine initial card for the new project
+    const initialNewCards: CardData[] = [{
+      id: `card_${Date.now()}_1`,
+      x: 360,
+      y: 120,
+      state: 'draft',
+      ratio: '3:4',
+      res: '2K',
+      prompt: '',
+      imageUrl: null
+    }];
+    await saveCards(initialNewCards, newId).catch(console.error);
+
+    setProjects(prev => [newProj, ...prev]);
+    setCurrentProjectId(newId);
   };
 
   const handleDeleteProject = async (projectId: string) => {
     if (projects.length <= 1) return;
-    if (currentProjectId === projectId) {
-      loadedProjectIdRef.current = null;
-      setIsLoading(true);
-    }
-    try {
-      await deleteCardsForProject(projectId);
-    } catch (error) {
-      setStorageError('项目删除失败，原项目已保留。');
-      if (currentProjectId === projectId) {
-        loadedProjectIdRef.current = projectId;
-        setIsLoading(false);
-      }
-      return;
-    }
+    await deleteCardsForProject(projectId).catch(console.error);
     setProjects(prev => {
       const remaining = prev.filter(p => p.id !== projectId);
       if (currentProjectId === projectId) {
@@ -2683,7 +2648,7 @@ export default function App() {
     let mounted = true;
     const fetchProjectCards = async () => {
       setIsLoading(true);
-      loadedProjectIdRef.current = null;
+      await requestPersistence();
       
       // Artificial delay to allow the Gaussian blur mask to fade in smoothly
       // and hide the jump cut, especially on smaller projects.
@@ -2693,12 +2658,9 @@ export default function App() {
         const saved = await loadCards(currentProjectId);
         if (!mounted) return;
         
-        if (saved !== null) {
+        if (saved && saved.length > 0) {
           const processedSaved = saved.map(card => {
             const updates: any = {};
-            if (card.state === 'generating' && !card.mcpTaskId && card.fileName && card.fileData instanceof Blob) {
-              updates.state = 'completed'; // A local import interrupted before proxy generation is still usable.
-            }
             if (card.generationError) {
               const start = card.generationError.indexOf('{');
               const end = card.generationError.indexOf('}', start + 1);
@@ -2758,7 +2720,7 @@ export default function App() {
             }
             const savedPos = (() => {
               try {
-                const pos = appStorage.getItem(`mira_vid_pos_${card.id}`);
+                const pos = localStorage.getItem(`mira_vid_pos_${card.id}`);
                 if (pos) {
                   const val = parseFloat(pos);
                   if (!isNaN(val) && val > 0) return val;
@@ -2772,7 +2734,6 @@ export default function App() {
               ...updates
             };
           });
-          loadedCardsSnapshotRef.current = processedSaved;
           setHistory({ past: [], present: processedSaved, future: [] });
           loadedProjectIdRef.current = currentProjectId;
 
@@ -2835,7 +2796,6 @@ export default function App() {
           let fallbackCards: CardData[] | null = null;
           if (currentProjectId === DEFAULT_PROJECT.id) {
             fallbackCards = await loadCards(); // legacy un-scoped key
-            if (!mounted) return;
           }
           if (fallbackCards && fallbackCards.length > 0) {
             const processedFallback = fallbackCards.map(card => {
@@ -2889,7 +2849,7 @@ export default function App() {
               }
               const savedPos = (() => {
                 try {
-                  const pos = appStorage.getItem(`mira_vid_pos_${card.id}`);
+                  const pos = localStorage.getItem(`mira_vid_pos_${card.id}`);
                   if (pos) {
                     const val = parseFloat(pos);
                     if (!isNaN(val) && val > 0) return val;
@@ -2919,28 +2879,26 @@ export default function App() {
                 ...updates
               };
             });
-            loadedCardsSnapshotRef.current = processedFallback;
             setHistory({ past: [], present: processedFallback, future: [] });
             await saveCards(processedFallback, currentProjectId).catch(console.error);
-          } else if (isInitialWorkspaceLaunchRef.current && currentProjectId === DEFAULT_PROJECT.id) {
-            // First-time workspace launch: creating the initial default project
-            isInitialWorkspaceLaunchRef.current = false;
-            const initialCards: CardData[] = [createInitialCard()];
-            loadedCardsSnapshotRef.current = initialCards;
+          } else {
+            const initialCards: CardData[] = [{
+              id: `card_${Date.now()}_1`,
+              x: 360,
+              y: 120,
+              state: 'draft',
+              ratio: '3:4',
+              res: '2K',
+              prompt: '',
+              imageUrl: null
+            }];
             setHistory({ past: [], present: initialCards, future: [] });
             await saveCards(initialCards, currentProjectId).catch(console.error);
-          } else {
-            // Respect the empty state: do not create initial cards simply because no cards were read
-            const emptyCards: CardData[] = [];
-            loadedCardsSnapshotRef.current = emptyCards;
-            setHistory({ past: [], present: emptyCards, future: [] });
           }
-          if (!mounted) return;
           loadedProjectIdRef.current = currentProjectId;
         }
       } catch (e) {
         console.error('Failed to load project cards from DB:', e);
-        if (mounted) setStorageError('项目读取失败，已停止自动保存，请勿覆盖现有数据。');
       } finally {
         if (mounted) {
           setIsLoading(false);
@@ -2952,53 +2910,55 @@ export default function App() {
     return () => { mounted = false; };
   }, [currentProjectId]);
 
-  const saveDeadlineRef = useRef<{ projectId: string; startedAt: number } | null>(null);
-  // A save owns both its project and snapshot; cleanup cancels the only scheduler.
+  // Save cards to IndexedDB for current project ONLY when cards belong to current project (debounced & idle-scheduled)
+  const saveCardsTimerRef = useRef<NodeJS.Timeout | null>(null);
   useEffect(() => {
-    const previous = observedSaveCardsRef.current;
-    observedSaveCardsRef.current = cards;
-    if (isLoading || loadedProjectIdRef.current !== currentProjectId || cards === loadedCardsSnapshotRef.current) return;
-    // Once edited, undoing to the initially loaded array is still a real change.
-    loadedCardsSnapshotRef.current = null;
-    markStorageDirty(`cards_${currentProjectId}`);
-    if (saveDeadlineRef.current?.projectId !== currentProjectId) {
-      saveDeadlineRef.current = { projectId: currentProjectId, startedAt: Date.now() };
+    if (!isLoading && currentProjectId && loadedProjectIdRef.current === currentProjectId) {
+      if (saveCardsTimerRef.current) {
+        clearTimeout(saveCardsTimerRef.current);
+      }
+      saveCardsTimerRef.current = setTimeout(() => {
+        const doSave = () => {
+          if (isUserPointerDownRef.current || (window as any).isDraggingCard || isDraggingCanvasRef.current) {
+            // Postpone save if user is actively interacting with the canvas/cards
+            saveCardsTimerRef.current = setTimeout(doSave, 1500);
+            return;
+          }
+          saveCards(cardsRef.current, currentProjectId).catch(console.error);
+        };
+
+        if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
+          (window as any).requestIdleCallback(doSave, { timeout: 3000 });
+        } else {
+          doSave();
+        }
+      }, 1500);
+
+      return () => {
+        if (saveCardsTimerRef.current) {
+          clearTimeout(saveCardsTimerRef.current);
+        }
+      };
     }
-    const previousById = new Map<string, CardData>(previous.map(card => [card.id, card] as [string, CardData]));
-    const hasNewMedia = cards.some(card => {
-      const old = previousById.get(card.id);
-      return (card.fileData && card.fileData !== old?.fileData) || (card.imageUrl && card.imageUrl !== old?.imageUrl);
-    });
-    const snapshot = cards;
-    const projectId = currentProjectId;
-    const timer = setTimeout(() => {
-      if (loadedProjectIdRef.current !== projectId) return;
-      saveDeadlineRef.current = null;
-      saveCards(snapshot, projectId).catch(console.error);
-    }, hasNewMedia ? 0 : Math.min(500, Math.max(0, 2000 - (Date.now() - saveDeadlineRef.current.startedAt))));
-    return () => clearTimeout(timer);
   }, [cards, isLoading, currentProjectId]);
 
-  // Best effort only; normal saves do not depend on page teardown.
+  // Synchronous flush on page reload or close to prevent in-flight video playback state from being lost
   useEffect(() => {
-    const flush = () => {
-      if (loadedProjectIdRef.current === currentProjectId && cardsRef.current !== loadedCardsSnapshotRef.current) {
-        saveCards(cardsRef.current, currentProjectId).catch(console.error);
+    const handleBeforeUnload = () => {
+      if (currentProjectId && loadedProjectIdRef.current === currentProjectId && cardsRef.current.length > 0) {
+        saveCards(cardsRef.current, currentProjectId).catch(() => {});
       }
     };
-    const onVisibility = () => { if (document.visibilityState === 'hidden') flush(); };
-    window.addEventListener('beforeunload', flush);
-    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('beforeunload', handleBeforeUnload);
     return () => {
-      window.removeEventListener('beforeunload', flush);
-      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
     };
   }, [currentProjectId]);
 
   const handleUpdateCard = useCallback((id: string, updates: Partial<CardData>, isSignificant = false) => {
     if (typeof updates.currentTime === 'number' && updates.currentTime > 0) {
       try {
-        appStorage.setItem(`mira_vid_pos_${id}`, updates.currentTime.toFixed(2));
+        localStorage.setItem(`mira_vid_pos_${id}`, updates.currentTime.toFixed(2));
       } catch {}
     }
     const isOnlyPrompt = Object.keys(updates).length === 1 && 'prompt' in updates;
@@ -3668,18 +3628,21 @@ export default function App() {
     };
   }, [tx, ty, tScale, updateCircularCulling]);
 
-  // Micro-LOD state tracking (scale < dynamic threshold)
-  const [isMicroLod, setIsMicroLod] = useState(() => tScale.get() < getNanoLodThreshold());
-  // Nano-LOD state tracking (scale < dynamic threshold)
-  const [isNanoLod, setIsNanoLod] = useState(() => tScale.get() < getNanoLodThreshold());
+  // Micro-LOD state tracking (0.40 <= scale < 0.70)
+  const [isMicroLod, setIsMicroLod] = useState(() => {
+    const s = tScale.get();
+    return s >= LOD_THRESHOLDS.NANO && s < LOD_THRESHOLDS.MICRO;
+  });
+  // Nano-LOD state tracking (scale < 0.40)
+  const [isNanoLod, setIsNanoLod] = useState(() => tScale.get() < LOD_THRESHOLDS.NANO);
   // Extended Nano-LOD state to act as a backend backdrop during DOM card fade-in
-  const [isNanoCanvasActive, setIsNanoCanvasActive] = useState(() => tScale.get() < getNanoLodThreshold());
+  const [isNanoCanvasActive, setIsNanoCanvasActive] = useState(() => tScale.get() < LOD_THRESHOLDS.NANO);
   // Extended DOM card state to act as a frontend backdrop while Canvas prepares to render
-  const [isDomCardsActive, setIsDomCardsActive] = useState(() => tScale.get() >= getNanoLodThreshold());
+  const [isDomCardsActive, setIsDomCardsActive] = useState(() => tScale.get() >= LOD_THRESHOLDS.NANO);
 
   // Track LOD switch from Low -> Standard to animate text labels fade-in
   const [isLodFading, setIsLodFading] = useState(false);
-  const wasMicroLodRef = useRef(tScale.get() < getNanoLodThreshold());
+  const wasMicroLodRef = useRef(tScale.get() < LOD_THRESHOLDS.MICRO);
   const lodFadeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const triggerLodFadeIn = useCallback(() => {
@@ -3703,11 +3666,11 @@ export default function App() {
     if (ws) ws.removeAttribute('data-lod-fade');
   }, []);
 
-  const handleNanoCanvasReady = useCallback((frame: LodFrame) => {
-    if (isNanoLod && canRetireDomForNano(frame, { scale: tScale.get(), tx: tx.get(), ty: ty.get() })) {
+  const handleNanoCanvasReady = useCallback(() => {
+    if (isNanoLod) {
       setIsDomCardsActive(false);
     }
-  }, [isNanoLod, tScale, tx, ty]);
+  }, [isNanoLod]);
 
   useEffect(() => {
     if (isNanoLod) {
@@ -3727,18 +3690,19 @@ export default function App() {
       if (isZoomingRef.current || isDraggingCanvasRef.current) {
         return;
       }
-      const threshold = getNanoLodThreshold();
-      const isMicro = s < threshold;
-      const isNano = s < threshold;
+      const tier = getLodTierByScale(s);
+      const isMicro = tier === 'micro';
+      const isNano = tier === 'nano';
+      const isSubStandard = s < LOD_THRESHOLDS.MICRO;
       
-      if (wasMicroLodRef.current && !isMicro) {
+      if (wasMicroLodRef.current && !isSubStandard) {
         // Switched from Micro/Nano to Standard LOD: trigger smooth fade-in
         triggerLodFadeIn();
-      } else if (!wasMicroLodRef.current && isMicro) {
+      } else if (!wasMicroLodRef.current && isSubStandard) {
         // Switched from Standard to Micro/Nano LOD: immediately cancel fade and hide tags
         cancelLodFade();
       }
-      wasMicroLodRef.current = isMicro;
+      wasMicroLodRef.current = isSubStandard;
 
       setIsMicroLod(isMicro);
       setIsNanoLod(isNano);
@@ -5117,7 +5081,7 @@ export default function App() {
       }
 
       try {
-        const savedApiKey = appStorage.getItem('deepseek_api_key') || appStorage.getItem('qwen_api_key') || '';
+        const savedApiKey = localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key') || '';
         const activeMcp = getMcpConfig();
 
         // 🛡️ Resolve reference image items into valid Base64 / proxy URLs for WorkRally MCP
@@ -5515,19 +5479,19 @@ export default function App() {
       const isArkModel = agentModel.includes('doubao') || agentModel.includes('seed-2-1') || agentModel.includes('seed-2.1') || agentModel.includes('ark') || agentModel.includes('volces');
       const isDashscopeModel = agentModel.startsWith('qwen') || agentModel.includes('glm') || agentModel.includes('ZHIPU') || agentModel.includes('zhipu');
       const savedKey = isArkModel
-        ? (appStorage.getItem('ark_api_key') || appStorage.getItem('volcengine_api_key') || appStorage.getItem('deepseek_api_key') || appStorage.getItem('qwen_api_key'))
+        ? (localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key'))
         : isDashscopeModel
-        ? (appStorage.getItem('qwen_api_key') || appStorage.getItem('glm_api_key') || appStorage.getItem('deepseek_api_key'))
-        : appStorage.getItem('deepseek_api_key');
+        ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key'))
+        : localStorage.getItem('deepseek_api_key');
 
       const jsonAdapterModel = nodeModels.jsonAdapterModel || 'deepseek-v4-flash';
       const isArkAdapter = jsonAdapterModel.includes('doubao') || jsonAdapterModel.includes('seed-2-1') || jsonAdapterModel.includes('seed-2.1') || jsonAdapterModel.includes('ark') || jsonAdapterModel.includes('volces');
       const isDashscopeAdapter = jsonAdapterModel.startsWith('qwen') || jsonAdapterModel.includes('glm') || jsonAdapterModel.includes('ZHIPU') || jsonAdapterModel.includes('zhipu');
       const jsonAdapterKey = isArkAdapter
-        ? (appStorage.getItem('ark_api_key') || appStorage.getItem('volcengine_api_key') || appStorage.getItem('deepseek_api_key') || appStorage.getItem('qwen_api_key'))
+        ? (localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key'))
         : isDashscopeAdapter
-        ? (appStorage.getItem('qwen_api_key') || appStorage.getItem('glm_api_key') || appStorage.getItem('deepseek_api_key'))
-        : appStorage.getItem('deepseek_api_key');
+        ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key'))
+        : localStorage.getItem('deepseek_api_key');
 
       const toolConfig = getAgentToolConfig();
       const enabledTools = AGENT_TOOL_REGISTRY.filter((tool) => toolConfig[tool.id]).map((tool) => tool.id);
@@ -5739,10 +5703,10 @@ export default function App() {
               const isArkModel = agentModel.includes('doubao') || agentModel.includes('seed-2-1') || agentModel.includes('seed-2.1') || agentModel.includes('ark') || agentModel.includes('volces');
               const isDashscopeModel = agentModel.startsWith('qwen') || agentModel.includes('glm') || agentModel.includes('ZHIPU') || agentModel.includes('zhipu');
               const savedKey = isArkModel
-                ? (appStorage.getItem('ark_api_key') || appStorage.getItem('volcengine_api_key') || appStorage.getItem('deepseek_api_key') || appStorage.getItem('qwen_api_key') || '')
+                ? (localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key') || '')
                 : isDashscopeModel
-                ? (appStorage.getItem('qwen_api_key') || appStorage.getItem('glm_api_key') || appStorage.getItem('deepseek_api_key') || '')
-                : (appStorage.getItem('deepseek_api_key') || '');
+                ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key') || '')
+                : (localStorage.getItem('deepseek_api_key') || '');
 
               const lastUserMessage = task.negotiationLog?.[task.negotiationLog.length - 1]?.content || task.goal;
               const res = await fetch('/api/agent/update-state-node', {
@@ -5929,7 +5893,7 @@ export default function App() {
         });
         updateAgentRuntimeTrace(task);
         // Auto inspect if enabled
-        if (appStorage.getItem('auto_inspect_on_launch') !== 'false') {
+        if (localStorage.getItem('auto_inspect_on_launch') !== 'false') {
           try {
             const initObservation = await inspectPage({ scope: 'overview' });
             observedTargetsByTaskRef.current.set(task.id, new Set(initObservation.components.map(component => component.id)));
@@ -6192,17 +6156,19 @@ export default function App() {
     
     // Restore accurate LOD states now that the user has stopped zooming or dragging
     const currentScale = tScale.get();
-    const threshold = getNanoLodThreshold();
-    const isMicro = currentScale < threshold;
-    if (wasMicroLodRef.current && !isMicro) {
+    const tier = getLodTierByScale(currentScale);
+    const isMicro = tier === 'micro';
+    const isNano = tier === 'nano';
+    const isSubStandard = currentScale < LOD_THRESHOLDS.MICRO;
+    if (wasMicroLodRef.current && !isSubStandard) {
       triggerLodFadeIn();
-    } else if (!wasMicroLodRef.current && isMicro) {
+    } else if (!wasMicroLodRef.current && isSubStandard) {
       cancelLodFade();
     }
-    wasMicroLodRef.current = isMicro;
+    wasMicroLodRef.current = isSubStandard;
 
     setIsMicroLod(isMicro);
-    setIsNanoLod(isMicro);
+    setIsNanoLod(isNano);
     setMountEpoch(n => (n + 1) % 1000000);
     
     if (workspace) {
@@ -7069,15 +7035,24 @@ export default function App() {
     isQueueProcessingRef.current = false;
   }, []);
 
+  // Exclusive high-LOD focus card ID: single selection OR active canvas picker target
+  const highLodFocusCardId = useMemo(() => {
+    if (pickerSession) return pickerSession.targetCardId;
+    if (selectedCardIds.length === 1) return selectedCardIds[0];
+    return null;
+  }, [pickerSession, selectedCardIds]);
+
   const runCenterOutMountQueue = useCallback(() => {
     if (!isDomCardsActive || isZoomAnimationActiveRef.current) {
       if (!isDomCardsActive) {
         setRenderedCardIds(prev => {
-          const selectedSet = new Set(selectedCardIdsRef.current);
-          if (prev.size === selectedSet.size && Array.from(prev).every(id => selectedSet.has(id))) {
+          const currentTarget = pickerSessionRef.current?.targetCardId || 
+            (selectedCardIdsRef.current.length === 1 ? selectedCardIdsRef.current[0] : null);
+          const allowed = currentTarget ? new Set([currentTarget]) : new Set<string>();
+          if (prev.size === allowed.size && Array.from(prev).every(id => allowed.has(id))) {
             return prev;
           }
-          return selectedSet;
+          return allowed;
         });
       }
       return;
@@ -7188,7 +7163,7 @@ export default function App() {
                 });
               }
               resolve();
-            }, { label: `mount:${batchToMount[0].id}` });
+            });
             abortToken.cancel = () => { cancel(); resolve(); };
           });
         }
@@ -7490,8 +7465,8 @@ export default function App() {
         style={{ transformOrigin: '0 0', x: tx, y: ty, scale: tScale }}
       >
 
-        {/* Canvas Items: All cards follow the same LOD lifecycle, including selected cards. */}
-        {!isOverviewMode && isDomCardsActive && visibleCards.map(card => {
+        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.40), unmount all except the single focused high-LOD card */}
+        {!isOverviewMode && (isDomCardsActive ? visibleCards : (highLodFocusCardId ? visibleCards.filter(card => card.id === highLodFocusCardId) : [])).map(card => {
           const hasImage = Boolean(card.imageUrl || card.originalImageUrl || card.thumbnailUrl);
           const isPickerSelectable = Boolean(pickerSession && card.id !== pickerSession.targetCardId && hasImage);
           const pickerIndex = pickerSession 
@@ -7515,6 +7490,7 @@ export default function App() {
           return (
             <ProgressiveGenerationCard
               mountStore={cardMountStore}
+              isHighLodTarget={highLodFocusCardId === card.id}
               key={card.id}
               data={card}
               scale={tScale}
@@ -7699,14 +7675,14 @@ export default function App() {
                 onChange: (text: string) => {
                   const target = agentQuickInput.targetId || 'global';
                   setCardDrafts(prev => ({ ...prev, [target]: text }));
-                  void saveDraft(target, text).catch(console.error); // Persist draft to IndexedDB
+                  saveDraft(target, text); // Persist draft to IndexedDB
                 },
                 onSubmit: async (prompt: string) => {
                   if (agentQuickInput.onAskResolve) {
                     const askResolver = agentQuickInput.onAskResolve;
                     const currentKey = agentQuickInput.targetId || 'global';
                     setCardDrafts(prev => ({ ...prev, [currentKey]: '' }));
-                    void deleteDraft(currentKey).catch(console.error);
+                    deleteDraft(currentKey);
                     setAgentQuickInput(null);
                     if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
                     isAgentRunningRef.current = true;
@@ -8108,12 +8084,6 @@ export default function App() {
         </button>
       </div>
 
-      {storageError && (
-        <div role="alert" className="fixed top-20 left-1/2 -translate-x-1/2 z-[9999] max-w-xl rounded-xl bg-red-950 text-white px-4 py-3 shadow-lg pointer-events-auto">
-          {storageError}
-          <button className="ml-4 underline" onClick={() => setStorageError(null)}>关闭提示</button>
-        </div>
-      )}
       {/* Toast: Overview Mode Navigation Hint */}
       <AnimatePresence>
         {isOverviewMode && (

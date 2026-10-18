@@ -1,4 +1,3 @@
-import { appStorage, flushAppStorage } from '../storage/appStorage';
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   Braces,
@@ -207,7 +206,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('debug');
   const [centerTab, setCenterTab] = useState<CenterTab>('input');
   const [resultTab, setResultTab] = useState<ResultTab>('json');
-  const [nodePrompts, setNodePrompts] = useState<NodePromptConfig>(() => ({ ...DEFAULT_NODE_PROMPTS, ...JSON.parse(appStorage.getItem('node_prompts_config') || '{}') }));
+  const [nodePrompts, setNodePrompts] = useState<NodePromptConfig>(() => ({ ...DEFAULT_NODE_PROMPTS }));
 
   const [hasUnsavedPrompts, setHasUnsavedPrompts] = useState(false);
   const [isSavingPrompt, setIsSavingPrompt] = useState(false);
@@ -215,8 +214,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
   const saveCustomPrompts = async () => {
     setIsSavingPrompt(true);
     try {
-      appStorage.setItem('node_prompts_config', JSON.stringify(nodePrompts));
-      await flushAppStorage();
       const res = await fetch('/api/save-prompts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -270,9 +267,9 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
   }));
   const [completeInputEdits, setCompleteInputEdits] = useState<Partial<Record<NodeKey, string>>>({});
   const [nodeModels, setNodeModels] = useState<NodeModelConfig>(() => assetExtractionService.getNodeModels());
-  const [deepseekKey, setDeepseekKey] = useState(() => appStorage.getItem('deepseek_api_key') || '');
-  const [qwenKey, setQwenKey] = useState(() => appStorage.getItem('qwen_api_key') || appStorage.getItem('glm_api_key') || '');
-  const [arkKey, setArkKey] = useState(() => appStorage.getItem('ark_api_key') || appStorage.getItem('volcengine_api_key') || '');
+  const [deepseekKey, setDeepseekKey] = useState(() => localStorage.getItem('deepseek_api_key') || '');
+  const [qwenKey, setQwenKey] = useState(() => localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || '');
+  const [arkKey, setArkKey] = useState(() => localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || '');
   const [showKeys, setShowKeys] = useState(false);
   const [showModels, setShowModels] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<{ state: 'testing' | 'success' | 'error'; message: string } | null>(null);
@@ -284,12 +281,12 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
   const [applied, setApplied] = useState(false);
   const [showLandmarkHUD, setShowLandmarkHUD] = useState(() => {
     if (typeof window === 'undefined') return true;
-    return appStorage.getItem('show_landmark_spatial_annotations') !== 'false';
+    return localStorage.getItem('show_landmark_spatial_annotations') !== 'false';
   });
 
   const handleToggleLandmarkHUD = (enabled: boolean) => {
     setShowLandmarkHUD(enabled);
-    appStorage.setItem('show_landmark_spatial_annotations', enabled ? 'true' : 'false');
+    localStorage.setItem('show_landmark_spatial_annotations', enabled ? 'true' : 'false');
     window.dispatchEvent(new CustomEvent('landmark-hud-setting-changed', { detail: { enabled } }));
   };
 
@@ -344,10 +341,10 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
 
   useEffect(() => {
     try {
-      const lastResultStr = appStorage.getItem(`last_${selectedNode}_result`);
-      const logsStr = appStorage.getItem(`${selectedNode}_logs`);
-      const rawInputStr = appStorage.getItem(`last_${selectedNode}_raw_input`);
-      const requestStr = appStorage.getItem(`last_${selectedNode}_request`);
+      const lastResultStr = localStorage.getItem(`last_${selectedNode}_result`);
+      const logsStr = localStorage.getItem(`${selectedNode}_logs`);
+      const rawInputStr = localStorage.getItem(`last_${selectedNode}_raw_input`);
+      const requestStr = localStorage.getItem(`last_${selectedNode}_request`);
       
       let data = null;
       if (lastResultStr) {
@@ -424,11 +421,11 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
   };
 
   const saveCredentials = () => {
-    appStorage.setItem('deepseek_api_key', deepseekKey);
-    appStorage.setItem('qwen_api_key', qwenKey);
-    appStorage.setItem('glm_api_key', qwenKey);
-    appStorage.setItem('ark_api_key', arkKey);
-    appStorage.setItem('volcengine_api_key', arkKey);
+    localStorage.setItem('deepseek_api_key', deepseekKey);
+    localStorage.setItem('qwen_api_key', qwenKey);
+    localStorage.setItem('glm_api_key', qwenKey);
+    localStorage.setItem('ark_api_key', arkKey);
+    localStorage.setItem('volcengine_api_key', arkKey);
     setShowKeys(false);
   };
 
@@ -602,14 +599,14 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
       const newLogs = [`[${activeDefinition.shortName}] 请求完成`, `[${activeDefinition.shortName}] 输出已解析`];
 
       try {
-        appStorage.setItem(`last_${selectedNode}_result`, JSON.stringify(data, null, 2));
+        localStorage.setItem(`last_${selectedNode}_result`, JSON.stringify(data, null, 2));
         const timestamp = new Date().toLocaleTimeString();
         const logLine = `[${timestamp}] 手动执行 (${Date.now() - startedAt}ms) => ${JSON.stringify(data)}`;
         let existingLogs = [];
-        try { existingLogs = JSON.parse(appStorage.getItem(`${selectedNode}_logs`) || '[]'); } catch {}
+        try { existingLogs = JSON.parse(localStorage.getItem(`${selectedNode}_logs`) || '[]'); } catch {}
         existingLogs.unshift(logLine);
         if (existingLogs.length > 50) existingLogs = existingLogs.slice(0, 50);
-        appStorage.setItem(`${selectedNode}_logs`, JSON.stringify(existingLogs));
+        localStorage.setItem(`${selectedNode}_logs`, JSON.stringify(existingLogs));
         newLogs.push(...existingLogs); // Show history in UI
       } catch (e) {}
 

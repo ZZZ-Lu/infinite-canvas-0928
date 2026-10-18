@@ -1,7 +1,5 @@
 import React, { useEffect, useRef } from 'react';
 import { readyPromptPanels } from '../utils/promptSurfaceCache';
-import { cardOutline, strokeCardOutline, drawEmptyCardIcon, isStandardCardLod } from '../utils/cardLodAppearance';
-import type { LodFrame } from '../utils/lodHandoff';
 import { MotionValue } from 'motion/react';
 import { CardData, getCardSize } from './GenerationCard';
 import {
@@ -9,8 +7,8 @@ import {
   getOrCreateMediaThumbnail,
   thumbCache,
 } from '../utils/thumbnail';
-import { calculateObjectCover, fullImageCache } from '../utils/imageTextureCache';
-import { getNanoLodThreshold, getCardWorldBounds } from '../utils/viewportCulling';
+import { calculateObjectCover, fullImageCache, getOrLoadCanvasImage } from '../utils/imageTextureCache';
+import { getNanoLodThreshold, getLodTierByScale, type LodTier } from '../utils/viewportCulling';
 import { getBottomPanelHeight, getPromptAreaHeight, calculatePromptLines } from '../utils/cardLayout';
 import { buildCardQuadTree, QuadTree, BoundingBox } from '../utils/quadTree';
 
@@ -39,7 +37,7 @@ export interface NanoLodCanvasProps {
   isOverviewMode?: boolean;
   dotModeThreshold?: number;
   isActive: boolean;
-  onReady?: (frame: LodFrame) => void;
+  onReady?: () => void;
   onThumbnailGenerated?: (id: string, thumbnailUrl: string) => void;
 }
 
@@ -66,7 +64,9 @@ function drawCardBottomPanel(
   borderNormal: string,
   selectedLineWidth: number,
   normalLineWidth: number,
-  alpha: number = 1.0
+  alpha: number = 1.0,
+  lodTier: LodTier = 'nano',
+  onScheduleDraw?: () => void
 ) {
   if (alpha <= 0.001) return;
   const panelW = 480;
@@ -88,53 +88,218 @@ function drawCardBottomPanel(
     ctx.globalAlpha = (ctx.globalAlpha || 1.0) * alpha;
   }
 
-  // Background fill (sharp right-angle corners for low LOD style)
+  // Background fill: 0px for Nano, 12px for Micro & Standard (never 20px)
+  const panelRadius = lodTier === 'nano' ? 0 : 12;
   ctx.fillStyle = dark ? '#262626' : '#f3f4f6';
   ctx.beginPath();
-  ctx.rect(panelX, panelY, panelW, panelH);
+  if (panelRadius > 0) {
+    ctx.roundRect(panelX, panelY, panelW, panelH, panelRadius);
+  } else {
+    ctx.rect(panelX, panelY, panelW, panelH);
+  }
   ctx.fill();
 
   // Border (matching card and panel perimeter bounds)
   ctx.strokeStyle = isSelected ? borderSelected : borderNormal;
   const currentLw = isSelected ? selectedLineWidth : normalLineWidth;
   ctx.lineWidth = currentLw;
-  ctx.strokeRect(panelX, panelY, panelW, panelH);
+  ctx.stroke();
 
-  // Internal skeleton color blocks
-  ctx.fillStyle = dark ? '#383838' : '#e2e8f0';
   let curY = panelY + 17; // 1px border + 16px padding
 
-  // 1) Reference images skeleton (sharp right-angle blocks, 17px padding matching 1px border + 16px padding)
-  for (let r = 0; r < refRows; r++) {
-    const itemsInRow = Math.min(refCount + 1 - r * 8, 8);
-    for (let i = 0; i < itemsInRow; i++) {
-      const rx = panelX + 17 + i * 56;
-      const ry = curY + r * 56;
+  if (lodTier === 'nano') {
+    // === NANO LOD MODE (Fast blocky rectangles for < 40% zoom) ===
+    ctx.fillStyle = dark ? '#383838' : '#e2e8f0';
+
+    // 1) Reference images skeleton (sharp right-angle blocks)
+    for (let r = 0; r < refRows; r++) {
+      const itemsInRow = Math.min(refCount + 1 - r * 8, 8);
+      for (let i = 0; i < itemsInRow; i++) {
+        const rx = panelX + 17 + i * 56;
+        const ry = curY + r * 56;
+        ctx.beginPath();
+        ctx.rect(rx, ry, 48, 48);
+        ctx.fill();
+      }
+    }
+    curY += (refRows * 56 - 8) + 16;
+
+    // 2) Prompt text skeleton lines (sharp right-angle lines)
+    const textTopOffset = curY + (promptAreaHeight - displayLineCount * 18) / 2;
+    for (let i = 0; i < displayLineCount; i++) {
+      const lw = (i === displayLineCount - 1 && displayLineCount > 1) ? (panelW - 34) * 0.58 : (panelW - 34) * 0.88;
       ctx.beginPath();
-      ctx.rect(rx, ry, 48, 48);
+      ctx.rect(panelX + 17, textTopOffset + i * 22, lw, 14);
       ctx.fill();
     }
-  }
-  curY += (refRows * 56 - 8) + 16; // ref items height + gap-3 (12px) + mt-1 (4px)
 
-  // 2) Prompt text skeleton lines (sharp right-angle lines, 17px padding matching 1px border + 16px padding)
-  const textTopOffset = curY + (promptAreaHeight - displayLineCount * 18) / 2;
-  for (let i = 0; i < displayLineCount; i++) {
-    const lw = (i === displayLineCount - 1 && displayLineCount > 1) ? (panelW - 34) * 0.58 : (panelW - 34) * 0.88;
+    // 3) Controls bottom bar & generate button (sharp right-angle)
+    const actionBarY = panelY + panelH - 17 - 32;
     ctx.beginPath();
-    ctx.rect(panelX + 17, textTopOffset + i * 22, lw, 14);
+    ctx.rect(panelX + 17, actionBarY + 2, 140, 28);
     ctx.fill();
+
+    ctx.beginPath();
+    ctx.rect(panelX + panelW - 49, actionBarY, 32, 32);
+    ctx.fill();
+  } else {
+    // === MICRO LOD MODE (Rich rounded squircle UI with thumbnails & text for >= 40% zoom) ===
+    // 1) Reference images & add button
+    for (let r = 0; r < refRows; r++) {
+      const totalInRow = Math.min(refCount + 1 - r * 8, 8);
+      for (let i = 0; i < totalInRow; i++) {
+        const globalIdx = r * 8 + i;
+        const rx = panelX + 17 + i * 56;
+        const ry = curY + r * 56;
+
+        if (globalIdx < refCount) {
+          // Reference image slot
+          ctx.fillStyle = dark ? 'rgba(38,38,38,0.6)' : '#f9fafb';
+          ctx.strokeStyle = dark ? 'rgba(64,64,64,0.6)' : '#e5e7eb';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(rx + 0.5, ry + 0.5, 47, 47, 8);
+          ctx.fill();
+          ctx.stroke();
+
+          const refItem = card.referenceImages?.[globalIdx];
+          if (refItem && onScheduleDraw) {
+            const thumbUrl = refItem.thumbnailUrl || refItem.microLodThumbnailUrl || refItem.url;
+            const refImg = getOrLoadThumbImage(thumbUrl, onScheduleDraw);
+            if (refImg && refImg.complete && refImg.naturalWidth > 0) {
+              ctx.save();
+              ctx.beginPath();
+              ctx.roundRect(rx + 1, ry + 1, 46, 46, 7);
+              ctx.clip();
+              const fit = Math.min(46 / refImg.naturalWidth, 46 / refImg.naturalHeight);
+              const rw = refImg.naturalWidth * fit;
+              const rh = refImg.naturalHeight * fit;
+              ctx.drawImage(refImg, rx + 1 + (46 - rw) / 2, ry + 1 + (46 - rh) / 2, rw, rh);
+              ctx.restore();
+            }
+          }
+        } else {
+          // Plus button (Add reference)
+          ctx.save();
+          ctx.strokeStyle = dark ? '#404040' : '#d1d5db';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          ctx.roundRect(rx + 1, ry + 1, 46, 46, 8);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          // Draw small plus icon in center
+          ctx.strokeStyle = dark ? '#666666' : '#9ca3af';
+          ctx.lineWidth = 2;
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(rx + 24, ry + 17);
+          ctx.lineTo(rx + 24, ry + 31);
+          ctx.moveTo(rx + 17, ry + 24);
+          ctx.lineTo(rx + 31, ry + 24);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+    }
+    curY += (refRows * 56 - 8) + 16;
+
+    // 2) Prompt text rendering with typography
+    const trimmedPrompt = (card.prompt || '').trim();
+    ctx.save();
+    ctx.font = '13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+    if (trimmedPrompt) {
+      ctx.fillStyle = dark ? '#e5e5e5' : '#1f2937';
+      const maxW = panelW - 34;
+      const paragraphs = trimmedPrompt.split('\n');
+      let lineY = curY + 16;
+      let lineCount = 0;
+      for (const p of paragraphs) {
+        if (lineCount >= displayLineCount) break;
+        let line = '';
+        for (let c = 0; c < p.length; c++) {
+          const test = line + p[c];
+          if (ctx.measureText(test).width > maxW && line !== '') {
+            ctx.fillText(line, panelX + 17, lineY);
+            line = p[c];
+            lineY += 20;
+            lineCount++;
+            if (lineCount >= displayLineCount) break;
+          } else {
+            line = test;
+          }
+        }
+        if (line && lineCount < displayLineCount) {
+          ctx.fillText(line, panelX + 17, lineY);
+          lineY += 20;
+          lineCount++;
+        }
+      }
+    } else {
+      ctx.fillStyle = dark ? '#737373' : '#9ca3af';
+      ctx.fillText('描述你想要生成的画面...', panelX + 17, curY + 16);
+    }
+    ctx.restore();
+
+    // 3) Controls bottom bar & generate button
+    const actionBarY = panelY + panelH - 17 - 32;
+
+    // Footer divider line
+    ctx.strokeStyle = dark ? '#333333' : '#e5e7eb';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(panelX + 17, actionBarY - 8);
+    ctx.lineTo(panelX + panelW - 17, actionBarY - 8);
+    ctx.stroke();
+
+    // Control pills
+    ctx.save();
+    ctx.font = '11px system-ui, -apple-system, sans-serif';
+    const ratioStr = card.ratio || '16:9';
+    const resStr = card.res || (card.isVideo ? '720p' : '2K');
+
+    // Ratio pill
+    const ratioW = ctx.measureText(ratioStr).width + 16;
+    ctx.beginPath();
+    ctx.roundRect(panelX + 17, actionBarY + 2, ratioW, 26, 6);
+    ctx.fillStyle = dark ? '#333333' : '#e5e7eb';
+    ctx.fill();
+    ctx.fillStyle = dark ? '#d4d4d4' : '#4b5563';
+    ctx.fillText(ratioStr, panelX + 25, actionBarY + 18);
+
+    // Res pill
+    const resW = ctx.measureText(resStr).width + 16;
+    ctx.beginPath();
+    ctx.roundRect(panelX + 22 + ratioW, actionBarY + 2, resW, 26, 6);
+    ctx.fillStyle = dark ? '#333333' : '#e5e7eb';
+    ctx.fill();
+    ctx.fillStyle = dark ? '#d4d4d4' : '#4b5563';
+    ctx.fillText(resStr, panelX + 30 + ratioW, actionBarY + 18);
+    ctx.restore();
+
+    // Generate Button
+    ctx.save();
+    ctx.beginPath();
+    ctx.roundRect(panelX + panelW - 49, actionBarY, 32, 32, 8);
+    ctx.fillStyle = dark ? '#3b82f6' : '#2563eb';
+    ctx.fill();
+    // Up arrow icon
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    const gx = panelX + panelW - 33;
+    const gy = actionBarY + 16;
+    ctx.beginPath();
+    ctx.moveTo(gx, gy + 5);
+    ctx.lineTo(gx, gy - 5);
+    ctx.moveTo(gx - 4, gy - 1);
+    ctx.lineTo(gx, gy - 5);
+    ctx.lineTo(gx + 4, gy - 1);
+    ctx.stroke();
+    ctx.restore();
   }
-
-  // 3) Controls bottom bar & generate button (sharp right-angle, 17px padding matching 1px border + 16px padding)
-  const actionBarY = panelY + panelH - 17 - 32;
-  ctx.beginPath();
-  ctx.rect(panelX + 17, actionBarY + 2, 140, 28);
-  ctx.fill();
-
-  ctx.beginPath();
-  ctx.rect(panelX + panelW - 49, actionBarY, 32, 32);
-  ctx.fill();
 
   ctx.restore();
 }
@@ -159,7 +324,6 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   onThumbnailGenerated,
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const squircleSupported = useRef(CSS.supports('corner-shape', 'squircle')).current;
   const rafIdRef = useRef<number | null>(null);
   const cardPanelFadeMapRef = useRef<Map<string, number>>(new Map());
   const pendingThumbGenRef = useRef<Set<string>>(new Set());
@@ -320,6 +484,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
       // Thumbnail cover if available in cache
       const thumbUrl =
+        card.closeupThumbnailUrl ||
         card.thumbnailUrl ||
         thumbCache.get(card.id) ||
         (card.imageUrl ? thumbCache.get(card.imageUrl) : undefined) ||
@@ -431,6 +596,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     // Apply camera world transform
     ctx.translate(currentTx, currentTy);
     ctx.scale(currentScale, currentScale);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
 
     // PERFORMANCE HIGHWAY: In Overview Mode, draw the single baked snapshot texture in O(1) time
     if (isOverviewModeRef.current && !dragging) {
@@ -451,7 +618,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       }
       ctx.restore();
       if (onReadyRef.current) {
-        onReadyRef.current({ scale: currentScale, tx: currentTx, ty: currentTy });
+        onReadyRef.current();
       }
       return;
     }
@@ -488,6 +655,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     const pickerSelectedLineWidth = 4 / currentScale;
 
     const threshold = getNanoLodThreshold();
+    const currentLodTier: LodTier = isOverviewModeRef.current ? 'nano' : getLodTierByScale(currentScale);
+    const currentCardRadius = currentLodTier === 'nano' ? 0 : 12;
 
     // First pass: Draw unselected cards
     // Second pass: Draw selected cards on top to avoid border occlusion
@@ -521,15 +690,12 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         }
       }
 
-      // Include the bottom prompt panel, not just the image body. The spatial
-      // index and this final draw check must agree during the DOM handoff.
-      const bounds = getCardWorldBounds(card);
-      const dx = cx - card.x, dy = cy - card.y;
+      // Instant AABB culling with dragging offset
       if (
-        bounds.maxX + dx < vpLeft ||
-        bounds.minX + dx > vpRight ||
-        bounds.maxY + dy < vpTop ||
-        bounds.minY + dy > vpBottom
+        cx + dim.width < vpLeft ||
+        cx > vpRight ||
+        cy + dim.height < vpTop ||
+        cy > vpBottom
       ) {
         continue;
       }
@@ -570,19 +736,20 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         }
       }
 
+      const highLodFocusCardId = pickerSession?.targetCardId || (selectedIds.length === 1 ? selectedIds[0] : null);
       const isSelected = selectedIds.includes(card.id);
-      // At standard scale, hand off only to DOM cards that are mounted and painted.
+      const isHighLodTarget = card.id === highLodFocusCardId;
+      // In scale >= threshold or for the high-LOD target card, check if Standard/Native LOD is already mounted and painted in DOM underneath
       const renderedSet = renderedIdsRef.current;
       const paintedSet = typeof window !== 'undefined' ? (window as any).__paintedCardIds : null;
       const isPainted = Boolean(paintedSet?.has(card.id));
       const panelReady = Boolean(card.fileName || card.isAsset) || readyPromptPanels.has(card.id);
-      const isCardReadyInDom = currentScale >= threshold && Boolean(renderedSet?.has(card.id) && isPainted && panelReady);
+      const isCardReadyInDom = (currentScale >= threshold || isHighLodTarget) && Boolean(renderedSet && (renderedSet.has(card.id) || isHighLodTarget) && isPainted && panelReady);
 
       // Instant seamless handoff: if card is rendered and painted in DOM, DOM handles rendering directly!
       if (isCardReadyInDom) {
         return;
       }
-
 
       // If we are in High LOD (scale >= threshold), and the card is currently being dragged in DOM,
       // skip rendering it on the canvas completely so that we don't leave any "ghost" behind.
@@ -631,14 +798,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         card.trueOriginalFileData
       );
       const isGenerating = card.state === 'generating';
-      const standard = isStandardCardLod(currentScale);
-      if (standard) {
-        ctx.save();
-        ctx.translate(cardX, cardY);
-        ctx.clip(cardOutline(dim.width, dim.height, true, squircleSupported));
-        ctx.translate(-cardX, -cardY);
-      }
-      // 1. Solid Base Fill (sharp straight rectangle for maximum throughput)
+
+      // 1. Base Fill (sharp rect in Nano LOD, 12px rounded in Micro & Standard LOD)
       if (isGenerating) {
         ctx.fillStyle = colorGenerating;
       } else if (hasMedia) {
@@ -646,27 +807,58 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       } else {
         ctx.fillStyle = colorDraft;
       }
-      ctx.fillRect(cardX, cardY, dim.width, dim.height);
+      ctx.beginPath();
+      if (currentCardRadius > 0) {
+        ctx.roundRect(cardX, cardY, dim.width, dim.height, currentCardRadius);
+      } else {
+        ctx.rect(cardX, cardY, dim.width, dim.height);
+      }
+      ctx.fill();
 
-      // 2. Draw Ultra-Low-Resolution Thumbnail or cached Image (with Object-Cover preservation)
+      // 2. Multi-tier progressive image selection strictly matched to scale LOD:
+      // - Standard LOD (>= 70%) & Micro LOD (40% - 70%): full-resolution proxy image matching LOD clarity
+      // - Nano LOD (< 40% or overview): lightweight thumbnail for minimal GPU memory
       let hasDrawnThumbnail = false;
-      const thumbUrl =
-        card.thumbnailUrl ||
-        thumbCache.get(card.id) ||
-        (card.imageUrl ? thumbCache.get(card.imageUrl) : undefined) ||
-        card.imageUrl ||
-        card.originalImageUrl;
-
       let drawSourceImg: HTMLImageElement | null = null;
-      const full = standard && card.imageUrl ? fullImageCache.get(card.imageUrl) : undefined;
-      if (full?.complete && full.naturalWidth > 0) {
-        drawSourceImg = full;
-      } else if (thumbUrl) {
-        drawSourceImg = getOrLoadThumbImage(thumbUrl, scheduleDraw);
-      } else if (card.imageUrl && fullImageCache.has(card.imageUrl)) {
-        const cached = fullImageCache.get(card.imageUrl);
-        if (cached && cached.complete && cached.naturalWidth > 0) {
-          drawSourceImg = cached;
+      const fullProxyUrl = card.imageUrl || card.originalImageUrl || card.trueOriginalImageUrl;
+
+      if (currentLodTier === 'standard' || currentLodTier === 'micro') {
+        // Standard & Micro LOD: Always prioritize full-resolution proxy image for crisp DOM-parity clarity
+        if (currentScale > 2.0 && card.originalImageUrl) {
+          const orig = getOrLoadCanvasImage(card.originalImageUrl, scheduleDraw, 'original');
+          if (orig && orig.complete && orig.naturalWidth > 0) {
+            drawSourceImg = orig;
+          }
+        }
+        if (!drawSourceImg && fullProxyUrl) {
+          drawSourceImg = getOrLoadCanvasImage(fullProxyUrl, scheduleDraw, 'full');
+        }
+        // Fallback if full-res is still loading or unavailable (e.g. video cards)
+        if (!drawSourceImg || !drawSourceImg.complete || drawSourceImg.naturalWidth === 0) {
+          const fallbackUrl =
+            card.closeupThumbnailUrl ||
+            card.fullDetailThumbnailUrl ||
+            card.thumbnailUrl ||
+            thumbCache.get(card.id) ||
+            (fullProxyUrl ? thumbCache.get(fullProxyUrl) : undefined);
+          if (fallbackUrl) {
+            const fallbackImg = getOrLoadThumbImage(fallbackUrl, scheduleDraw);
+            if (fallbackImg && fallbackImg.complete && fallbackImg.naturalWidth > 0) {
+              drawSourceImg = fallbackImg;
+            }
+          }
+        }
+      } else {
+        // Nano scale (< 40% or overview mode): Ultra-compact 256px thumbnail for max performance
+        const nanoThumbUrl =
+          card.closeupThumbnailUrl ||
+          card.thumbnailUrl ||
+          card.microLodThumbnailUrl ||
+          thumbCache.get(card.id) ||
+          (fullProxyUrl ? thumbCache.get(fullProxyUrl) : undefined) ||
+          fullProxyUrl;
+        if (nanoThumbUrl) {
+          drawSourceImg = getOrLoadThumbImage(nanoThumbUrl, scheduleDraw);
         }
       }
 
@@ -677,11 +869,25 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
           dim.width,
           dim.height
         );
-        ctx.drawImage(drawSourceImg, sx, sy, sw, sh, cardX, cardY, dim.width, dim.height);
-        // Add dark filter for videos in Nano LOD to match Micro LOD's bg-black/25
-        if (card.isVideo) {
-          ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
-          ctx.fillRect(cardX, cardY, dim.width, dim.height);
+        if (currentCardRadius > 0) {
+          ctx.save();
+          ctx.beginPath();
+          ctx.roundRect(cardX, cardY, dim.width, dim.height, currentCardRadius);
+          ctx.clip();
+          ctx.drawImage(drawSourceImg, sx, sy, sw, sh, cardX, cardY, dim.width, dim.height);
+          // Add dark filter for videos in Micro/Standard LOD matching DOM's bg-black/25
+          if (card.isVideo) {
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+            ctx.fillRect(cardX, cardY, dim.width, dim.height);
+          }
+          ctx.restore();
+        } else {
+          ctx.drawImage(drawSourceImg, sx, sy, sw, sh, cardX, cardY, dim.width, dim.height);
+          // Add dark filter for videos in Nano LOD to match Micro LOD's bg-black/25
+          if (card.isVideo) {
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+            ctx.fillRect(cardX, cardY, dim.width, dim.height);
+          }
         }
         hasDrawnThumbnail = true;
       } else if (hasMedia && !isGenerating) {
@@ -706,9 +912,6 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         }
       }
 
-      if (standard) ctx.restore();
-      const strokeOutline = (x = cardX, y = cardY, width = dim.width, height = dim.height) =>
-        strokeCardOutline(ctx, x, y, width, height, standard, squircleSupported);
       const focusItem = agentFocusMapRef.current?.[card.id];
       const targetIds = agentTargetCardIdsRef.current;
       const isAgentTargetInSet = Boolean(
@@ -723,11 +926,25 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         agentReferenceCardIdsRef.current && agentReferenceCardIdsRef.current.includes(card.id)
       );
 
-      // 3. Border (sharp straight rectangle stroke)
+      // Helper to stroke card bounds (sharp rect in Nano LOD, 12px rounded in Micro & Standard LOD)
+      const strokeCardBounds = (strokeStyle: string | CanvasGradient, lineWidth: number, dashed = false) => {
+        ctx.save();
+        ctx.strokeStyle = strokeStyle;
+        ctx.lineWidth = lineWidth;
+        if (dashed) ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        if (currentCardRadius > 0) {
+          ctx.roundRect(cardX, cardY, dim.width, dim.height, currentCardRadius);
+        } else {
+          ctx.rect(cardX, cardY, dim.width, dim.height);
+        }
+        ctx.stroke();
+        ctx.restore();
+      };
+
+      // 3. Border
       if (isPickerSelected) {
-        ctx.strokeStyle = borderPickerSelected;
-        ctx.lineWidth = pickerSelectedLineWidth;
-        strokeOutline();
+        strokeCardBounds(borderPickerSelected, pickerSelectedLineWidth);
       } else if (isAgentPrimary) {
         if (isSelected) {
           // Dual co-presence: half user blue (#3b82f6) + half agent purple (#a45cf8) diagonal gradient stroke
@@ -736,37 +953,25 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
           grad.addColorStop(0.44, '#3b82f6');
           grad.addColorStop(0.56, '#a45cf8');
           grad.addColorStop(1, '#a45cf8');
-          ctx.strokeStyle = grad;
-          ctx.lineWidth = selectedLineWidth;
-          strokeOutline(cardX - 0.5, cardY - 0.5, dim.width + 1, dim.height + 1);
+          strokeCardBounds(grad, selectedLineWidth);
         } else {
-          ctx.strokeStyle = borderAgentTarget;
-          ctx.lineWidth = selectedLineWidth * 1.25;
-          strokeOutline();
+          strokeCardBounds(borderAgentTarget, selectedLineWidth * 1.25);
         }
       } else if (isAgentRef) {
-        ctx.strokeStyle = borderAgentTarget;
-        ctx.lineWidth = normalLineWidth * 1.5;
-        ctx.setLineDash([4, 4]);
-        strokeOutline();
-        ctx.setLineDash([]);
+        strokeCardBounds(borderAgentTarget, normalLineWidth * 1.5, true);
       } else if (isPickerTarget) {
-        ctx.strokeStyle = borderPickerTarget;
-        ctx.lineWidth = selectedLineWidth;
-        strokeOutline();
+        strokeCardBounds(borderPickerTarget, selectedLineWidth);
       } else if (isSelected) {
-        ctx.strokeStyle = borderSelected;
-        ctx.lineWidth = selectedLineWidth;
-        strokeOutline();
+        strokeCardBounds(borderSelected, selectedLineWidth);
       } else {
-        ctx.strokeStyle = borderNormal;
-        ctx.lineWidth = normalLineWidth;
-        strokeOutline();
+        strokeCardBounds(borderNormal, normalLineWidth);
       }
 
       // 3b. Bottom Panel Skeleton Color Block for Generation Cards in 2D Canvas Mode
       const isGenerationCard = !card.fileName && !card.isAsset;
       if (isGenerationCard) {
+        // Only skip canvas skeleton bottom panel for the exclusive high-LOD target (whose native panel is rendered in DOM)
+        if (!isHighLodTarget) {
           drawCardBottomPanel(
             ctx,
             card,
@@ -780,8 +985,11 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
             borderNormal,
             selectedLineWidth,
             normalLineWidth,
-            1.0
+            1.0,
+            currentLodTier,
+            scheduleDraw
           );
+        }
       }
 
       // 4. Center indicator / video play badge
@@ -815,9 +1023,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         // Fallback indicator when thumbnail is still generating/loading
         const cx = cardX + dim.width / 2;
         const cy = cardY + dim.height / 2;
-        if (standard) {
-          drawEmptyCardIcon(ctx, cx, cy, dark);
-        } else if (hasMedia) {
+        if (hasMedia) {
           const r = Math.max(2.5 / currentScale, 2);
           ctx.fillStyle = iconMediaColor;
           ctx.beginPath();
@@ -887,7 +1093,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     ctx.restore();
     
     if (onReadyRef.current) {
-      onReadyRef.current({ scale: currentScale, tx: currentTx, ty: currentTy });
+      onReadyRef.current();
     }
   };
 
@@ -927,11 +1133,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   useEffect(() => {
     if (!isActive) return;
     window.addEventListener('card-painted', scheduleDraw);
-    window.addEventListener('card-surface-ready', scheduleDraw);
-    return () => {
-      window.removeEventListener('card-painted', scheduleDraw);
-      window.removeEventListener('card-surface-ready', scheduleDraw);
-    };
+    return () => window.removeEventListener('card-painted', scheduleDraw);
   }, [isActive]);
 
   useEffect(() => {
@@ -968,8 +1170,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     };
   }, [scale, tx, ty, isActive]);
 
-  // Keep the same canvas through LOD switches. Activation schedules its next
-  // draw; DOM retirement is acknowledged only by that completed frame.
+  if (!isActive) return null;
 
   return (
     <canvas
