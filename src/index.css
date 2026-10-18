@@ -10,6 +10,16 @@
   corner-shape: squircle;
 }
 
+/* Match the corner cutout of a 12px circular arc while retaining the
+   exponent-4 squircle at rest. Gesture rules below retain native 12px arcs.
+   Unsupported browsers keep the existing 12px circular fallback. */
+@supports (corner-shape: squircle) {
+  .generation-card-body,
+  .generation-card-bottom-panel {
+    border-radius: 22px;
+  }
+}
+
 /* Clean custom scrollbar with no track background and no stepper triangles/buttons */
 ::-webkit-scrollbar {
   width: 5px;
@@ -134,7 +144,7 @@
   will-change: transform !important;
   transform: translateZ(0) !important;
   transition: none !important;
-  corner-shape: unset !important;
+  corner-shape: round !important;
   box-shadow: none !important;
   border-radius: 12px !important;
 }
@@ -154,7 +164,7 @@
 #canvas-workspace[data-panning="true"] .asset-card,
 #canvas-workspace[data-gesture="true"] .asset-card,
 .drag-degraded.generation-card-body {
-  corner-shape: unset !important;
+  corner-shape: round !important;
   box-shadow: none !important;
   border-radius: 12px !important;
 }

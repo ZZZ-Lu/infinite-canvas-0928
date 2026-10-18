@@ -1,57 +1,36 @@
-const fs=require('node:fs'),vm=require('node:vm'),ts=require('typescript'),assert=require('node:assert/strict');
-const compile=s=>ts.transpileModule(s,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText;
-const app=fs.readFileSync('src/App.tsx','utf8');
-const start=app.indexOf('  // A save owns both');
-const effect=app.slice(start,app.indexOf('  // Best effort only',start));
-function schedule(snapshot,loaded=snapshot){
- const jobs=new Map(),writes=[];let cleanup;const owner={current:'A'};
- const ctx={useEffect:fn=>cleanup=fn(),isLoading:false,currentProjectId:'A',loadedProjectIdRef:owner,loadedCardsSnapshotRef:{current:loaded},observedSaveCardsRef:{current:[]},cards:snapshot,setTimeout:fn=>{jobs.set(1,fn);return 1},clearTimeout:id=>jobs.delete(id),saveCards:(cards,project)=>{writes.push({cards,project});return Promise.resolve()},console};
- vm.runInNewContext(compile(effect),ctx);return {jobs,writes,owner,cleanup};
-}
-const empty=[];assert.equal(schedule(empty).jobs.size,0,'loaded empty state must not auto-write');
-const job=schedule([{id:'A'}],[]),late=[...job.jobs.values()][0];job.owner.current='B';job.cleanup();late();assert.equal(job.writes.length,0,'late callback must reject changed owner');
-assert.equal(job.jobs.size,0,'cleanup cancels scheduler');
-const stable=schedule([{id:'A'}],[]);[...stable.jobs.values()][0]();assert.equal(stable.writes[0].project,'A');assert.equal(stable.writes[0].cards[0].id,'A');
-
-let clock=0;const timers=[],images=[];
-class Image {constructor(){images.push(this);this.complete=false;this.naturalWidth=0;}}
-const texture={exports:{},Image,Date:{now:()=>clock},setTimeout:(fn,ms)=>timers.push({fn,ms}),console:{warn(){},error:console.error}};
-vm.runInNewContext(compile(fs.readFileSync('src/utils/imageTextureCache.ts','utf8')),texture);
-const api=texture.exports;let painted=0;
-api.getOrLoadCanvasImage('blob:test',()=>painted++);images[0].onerror();assert.equal(api.fullImageCache.has('blob:test'),false);
-for(let n=0;n<20;n++) api.getOrLoadCanvasImage('blob:test');assert.equal(images.length,1,'backoff must block render-loop retries');
-clock=500;timers.shift().fn();assert.equal(images.length,2);images[1].complete=true;images[1].naturalWidth=1200;images[1].onload();assert.equal(painted,1,'successful retry redraws original consumer');
-api.getOrLoadCanvasImage('blob:bad');images.at(-1).onerror();clock+=500;timers.shift().fn();images.at(-1).onerror();clock+=1000;timers.shift().fn();images.at(-1).onerror();assert.equal(timers.length,0,'retry budget stops permanent failures');
-
+const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),ts=require('typescript'),assert=require('node:assert/strict');
+const {IDBFactory,IDBObjectStore}=require('fake-indexeddb'),{webcrypto}=require('node:crypto');
+const compile=s=>ts.transpileModule(s,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
+function runtime(factory){const modules=new Map();function load(name){const file=path.resolve(name.endsWith('.ts')?name:name+'.ts');if(modules.has(file))return modules.get(file).exports;const module={exports:{}};modules.set(file,module);vm.runInNewContext(compile(fs.readFileSync(file,'utf8')),{module,exports:module.exports,require:ref=>ref.startsWith('.')?load(path.resolve(path.dirname(file),ref)):require(ref),indexedDB:factory,navigator:{},Blob,crypto:webcrypto,console,Date});return module.exports;}return load('src/db.ts');}
+const app=fs.readFileSync('src/App.tsx','utf8'),start=app.indexOf('  // A save owns both'),end=app.indexOf('  // Best effort only',start);assert.ok(start>=0&&end>start,'scheduler extraction must match current App');
+function schedule(snapshot,loaded=snapshot){const jobs=new Map(),writes=[];let cleanup;const owner={current:'A'};const ctx={Blob,console,Date,useRef:()=>({current:null}),useEffect:fn=>{cleanup=fn()},isLoading:false,loadedProjectIdRef:owner,loadedCardsSnapshotRef:{current:loaded},cards:snapshot,setTimeout:fn=>{jobs.set(1,fn);return 1},clearTimeout:id=>jobs.delete(id),saveCards:(cards,project)=>{writes.push({cards,project});return Promise.resolve()}};vm.runInNewContext(compile(`function install(currentProjectId){${app.slice(start,end)}}install('A');`),ctx);return{jobs,writes,owner,cleanup};}
+const empty=[];assert.equal(schedule(empty).jobs.size,0);const j=schedule([{id:'A'}],null),late=[...j.jobs.values()][0];j.owner.current='B';j.cleanup();late();assert.equal(j.writes.length,0,'cancelled A callback cannot write B state');const stable=schedule([{id:'A'}],null);[...stable.jobs.values()][0]();assert.equal(stable.writes[0].cards[0].id,'A');assert.equal(stable.writes[0].project,'A');
+const undo=[];assert.equal(schedule(undo,null).jobs.size,1,'undo to empty after an edit is a real save');
+async function open(f,version,stores=['workspace']){return new Promise((resolve,reject)=>{const r=f.open('InfiniteCanvasDB',version);r.onupgradeneeded=()=>stores.forEach(s=>r.result.createObjectStore(s));r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)})}
+async function rawPut(db,key,value){await new Promise((resolve,reject)=>{const t=db.transaction('workspace','readwrite');t.objectStore('workspace').put(value,key);t.oncomplete=resolve;t.onabort=()=>reject(t.error)})}
 (async()=>{
- const data=new Map([['cards_A',[{id:'old'}]]]),transactions=[],events=[];
- const db={close(){},transaction(){
-  const staged=new Map();const tx={error:null,abort(){this.error=new Error('aborted');this.onabort();},objectStore(){return {get(key){const request={result:data.get(key)};queueMicrotask(()=>request.onsuccess?.());return request;},put(value,key){staged.set(key,value);return {};}}},commit(){for(const [k,v] of staged)data.set(k,v);this.oncomplete();}};
-  transactions.push(tx);return tx;
- }};
- const indexedDB={open(){const request={result:db};queueMicrotask(()=>request.onsuccess());return request;}};
- const context={exports:{},indexedDB,console,Date};vm.runInNewContext(compile(fs.readFileSync('src/db.ts','utf8')),context);
- const store=context.exports;store.subscribeCardSaves(e=>events.push(e));
- const tick=()=>new Promise(resolve=>setImmediate(resolve));
- let done=false;const save=store.saveCards([{id:'new'}],'A').then(()=>done=true);await tick();assert.equal(done,false,'request processing is not transaction commit');assert.equal(data.get('cards_A')[0].id,'old');transactions[0].commit();await save;assert.equal(data.get('cards_A')[0].id,'new');assert.equal(data.get('cards_A_backup')[0].id,'old');
- const bad=store.saveCards([],'A');const rejection=assert.rejects(bad,/aborted/);await tick();transactions[1].abort();await rejection;assert.equal(data.get('cards_A')[0].id,'new','abort preserves previous record');assert.equal(events.at(-1).state,'error');
- const one=store.saveCards([{id:'one'}],'A'),two=store.saveCards([{id:'two'}],'A');await tick();assert.equal(transactions.length,3,'second write waits for first');transactions[2].commit();await one;await tick();assert.equal(transactions.length,4);transactions[3].commit();await two;assert.equal(data.get('cards_A')[0].id,'two');assert.equal(data.get('cards_A_backup')[0].id,'one');
- const original=[{id:'undo-original'}], edited=[{id:'edited'}];
- let pending=store.saveCards(original,'A');await tick();transactions.at(-1).commit();await pending;
- const count=transactions.length;await store.saveCards(original,'A');assert.equal(transactions.length,count,'identical committed snapshot is not written twice');
- pending=store.saveCards(edited,'A');await tick();transactions.at(-1).commit();await pending;
- pending=store.saveCards(original,'A');await tick();transactions.at(-1).commit();await pending;assert.equal(data.get('cards_A')[0].id,'undo-original','undo must persist an older snapshot again');
- pending=store.saveCards([],'A');await tick();transactions.at(-1).commit();await pending;assert.equal(data.get('cards_A').length,0);assert.equal(data.get('cards_A_backup')[0].id,'undo-original','intentional clearing retains recovery copy');
- 
- const validBlob = new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' });
- const corruptBlob = { size: 100, type: 'image/jpeg', arrayBuffer: () => Promise.reject(new Error('Corrupt blob source')) };
- const nestedCard = { id: 'nested', fileData: validBlob, baselineConfig: { referenceImageFileData: validBlob, referenceImages: [{ url: 'u', fileData: corruptBlob }] } };
- let nestSave = store.saveCards([nestedCard], 'A');
- await tick();
- transactions.at(-1).commit();
- await nestSave;
- assert.equal(data.get('cards_A')[0].id, 'nested');
- assert.equal(data.get('cards_A')[0].fileData.__isBlob, true);
- assert.equal(data.get('cards_A')[0].baselineConfig.referenceImageFileData.__isBlob, true);
- console.log('PASS: project ownership, cancellation, empty-load protection, bounded image retries, transaction completion/abort, atomic backup, write ordering, and recursive blob serialization');
-})().catch(e=>{console.error(e);process.exitCode=1;});
+ const f=new IDBFactory(),a=runtime(f),b=runtime(f);await a.saveCards([{id:'one',x:0,prompt:'first',fileData:new Blob(['pixels'])}],'P');
+ const first=await a.loadCards('P');assert.equal(await first[0].fileData.text(),'pixels');assert.equal((await f.databases())[0].version,1);
+ const aCopy=await a.loadCards('P'),bCopy=await b.loadCards('P');await a.saveCards([...aCopy,{id:'new-A',x:0}],'P');await b.saveCards(bCopy.map(c=>({...c,x:42})),'P');let current=await a.loadCards('P');assert.equal(current.length,2,'stale B cannot remove A addition');assert.equal(current[0].x,42);
+ const freshA=await a.loadCards('P'),freshB=await b.loadCards('P');await a.saveCards(freshA.map(c=>c.id==='one'?{...c,prompt:'new A'}:c),'P');await b.saveCards(freshB.map(c=>c.id==='one'?{...c,x:43}:c),'P');current=await a.loadCards('P');assert.equal(current[0].prompt,'new A');assert.equal(current[0].x,43,'different fields merge');
+ await b.saveCards(freshB.map(c=>c.id==='one'?{...c,x:44}:c),'P');assert.equal((await a.loadCards('P'))[0].prompt,'new A','later stale renders keep merged remote fields');
+ const originalPut=IDBObjectStore.prototype.put;
+ IDBObjectStore.prototype.put=function(value,key){const r=originalPut.call(this,value,key);if(key==='cards_P'&&value[0]?.prompt==='abort-me'){const tx=this.transaction;r.addEventListener('success',()=>tx.abort());}return r};
+ await assert.rejects(a.saveCards(current.map(c=>c.id==='one'?{...c,prompt:'abort-me'}:c),'P'));IDBObjectStore.prototype.put=originalPut;assert.equal((await a.loadCards('P'))[0].prompt,'new A','abort preserves old data');assert.equal(a.hasPendingStorage(),true,'failure warns on exit');await a.saveCards(current,'P');assert.equal(a.hasPendingStorage(),false);
+ const captured=[{id:'capture',prompt:'at call'}];const saving=a.saveCards(captured,'capture');captured[0].prompt='mutated later';await saving;assert.equal((await a.loadCards('capture'))[0].prompt,'at call','metadata captured before awaits');
+ await a.saveCards([],'P');assert.equal((await a.loadCards('P')).length,0);assert.ok((await a.loadCardBackup('P')).length>0,'empty save keeps nonempty backup');
+ await a.saveCards([{id:'queue',x:1}],'queue');await Promise.all([a.saveCards([{id:'queue',x:2}],'queue'),a.saveCards([{id:'queue',x:3}],'queue')]);assert.equal((await a.loadCards('queue'))[0].x,3);
+ await assert.rejects(a.saveCards([{id:'bad',imageUrl:'blob:old-page'}],'bad'),/持久化/);await a.saveCards([{id:'valid',imageUrl:'blob:page',fileData:new Blob(['raw pixels'])}],'bad');assert.equal(await (await a.loadCards('bad'))[0].fileData.text(),'raw pixels');
+ const denied=runtime(f);await assert.rejects(denied.saveCards([{id:'stale'}],'queue'),/尚未读取/,'unloaded page cannot blind-overwrite an existing project');
+ const loaded=await a.loadCards('queue');await b.deleteCardsForProject('queue');await assert.rejects(a.saveCards(loaded,'queue'),/删除/);assert.ok((await a.loadCardBackup('queue')).length);
+ const badDB=new IDBFactory(),handle=await open(badDB,11,['assets','projects']);let tx=handle.transaction('projects','readwrite');tx.objectStore('projects').put({id:'keep'},'keep');await new Promise(r=>tx.oncomplete=r);handle.close();await assert.rejects(runtime(badDB).loadCards('P'),/不兼容/);const preserved=await open(badDB,11);assert.ok(preserved.objectStoreNames.contains('projects'));assert.equal(preserved.version,11);preserved.close();
+ const older=new IDBFactory(),old=await open(older,3);await rawPut(old,'cards_old',[{id:'old'}]);assert.equal((await runtime(older).loadCards('old'))[0].id,'old','no upgrade means an open older connection does not block reading');assert.equal((await older.databases())[0].version,3);old.close();
+ const missing=new IDBFactory(),missingApi=runtime(missing);await missingApi.saveCards([{id:'known',x:0}],'known');await missingApi.saveCards([{id:'known',x:1}],'known');const m=await open(missing,1);await new Promise(r=>{const t=m.transaction('workspace','readwrite');t.objectStore('workspace').delete('cards_known');t.oncomplete=r});m.close();await assert.rejects(missingApi.loadCards('known'),/记录缺失/);await assert.rejects(missingApi.saveCards([],'known'),/数据缺失/);await missingApi.restoreCardBackup('known');assert.equal((await missingApi.loadCards('known'))[0].x,0,'backup can recover a missing primary record');assert.equal(missingApi.hasPendingStorage(),false);
+ // Verify the actual import initializer owns binary bytes before proxies finish.
+ const sourceStart=app.indexOf('      const initialCard: CardData = {'),sourceEnd=app.indexOf('\n      };',sourceStart)+9;
+ const init={exports:{},newId:'import',dropCanvasX:0,dropCanvasY:0,dim:{width:100,height:100},offset:0,ratio:'1:1',sourceLabel:'test',isVideo:false,file:new Blob(['original']),fileUrl:'blob:temporary',customWidth:undefined,customHeight:undefined,width:100,height:100};vm.runInNewContext(compile(app.slice(sourceStart,sourceEnd)+'\nexports.card=initialCard'),init);assert.equal(init.exports.card.fileData,init.file);assert.equal(init.exports.card.trueOriginalFileData,init.file);
+ // Image cache failure retry regression retained from the previous test.
+ let now=0;const timers=[],images=[];class Image{constructor(){images.push(this);this.complete=false;this.naturalWidth=0}}
+ const texture={exports:{},Image,Date:{now:()=>now},setTimeout:(fn,ms)=>timers.push({fn,ms}),console:{warn(){},error:console.error}};vm.runInNewContext(compile(fs.readFileSync('src/utils/imageTextureCache.ts','utf8')),texture);let painted=0;texture.exports.getOrLoadCanvasImage('blob:test',()=>painted++);images[0].onerror();assert.equal(texture.exports.fullImageCache.has('blob:test'),false);for(let n=0;n<20;n++)texture.exports.getOrLoadCanvasImage('blob:test');assert.equal(images.length,1);now=500;timers.shift().fn();images[1].complete=true;images[1].naturalWidth=1200;images[1].onload();assert.equal(painted,1);texture.exports.getOrLoadCanvasImage('blob:bad');images.at(-1).onerror();now+=500;timers.shift().fn();images.at(-1).onerror();now+=1000;timers.shift().fn();images.at(-1).onerror();assert.equal(timers.length,0,'permanent failures stop after bounded retries');
+ console.log('PASS: cancellation/ownership, empty/undo, commit abort, cross-page additions/field edits, capture/queues, Blob durability, backup/delete, unsupported-version preservation, no forced upgrade, missing-data guards, initial import bytes, image retries');
+})().catch(error=>{console.error(error);process.exitCode=1});

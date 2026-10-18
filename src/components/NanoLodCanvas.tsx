@@ -815,53 +815,25 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       }
       ctx.fill();
 
-      // 2. Multi-tier progressive image selection strictly matched to scale LOD:
-      // - Standard LOD (>= 70%) & Micro LOD (40% - 70%): full-resolution proxy image matching LOD clarity
-      // - Nano LOD (< 40% or overview): lightweight thumbnail for minimal GPU memory
+      // Placeholder media uses one lower card LOD; geometry keeps the current LOD.
+      // Micro placeholders use Nano's 256px image; Standard and close-up
+      // placeholders use the 1200px proxy, never the original texture tier.
+      // The 64px/128px reference variants are not card LOD image tiers.
       let hasDrawnThumbnail = false;
       let drawSourceImg: HTMLImageElement | null = null;
-      const fullProxyUrl = card.imageUrl || card.originalImageUrl || card.trueOriginalImageUrl;
-
-      if (currentLodTier === 'standard' || currentLodTier === 'micro') {
-        // Standard & Micro LOD: Always prioritize full-resolution proxy image for crisp DOM-parity clarity
-        if (currentScale > 2.0 && card.originalImageUrl) {
-          const orig = getOrLoadCanvasImage(card.originalImageUrl, scheduleDraw, 'original');
-          if (orig && orig.complete && orig.naturalWidth > 0) {
-            drawSourceImg = orig;
-          }
-        }
-        if (!drawSourceImg && fullProxyUrl) {
-          drawSourceImg = getOrLoadCanvasImage(fullProxyUrl, scheduleDraw, 'full');
-        }
-        // Fallback if full-res is still loading or unavailable (e.g. video cards)
-        if (!drawSourceImg || !drawSourceImg.complete || drawSourceImg.naturalWidth === 0) {
-          const fallbackUrl =
-            card.closeupThumbnailUrl ||
-            card.fullDetailThumbnailUrl ||
-            card.thumbnailUrl ||
-            thumbCache.get(card.id) ||
-            (fullProxyUrl ? thumbCache.get(fullProxyUrl) : undefined);
-          if (fallbackUrl) {
-            const fallbackImg = getOrLoadThumbImage(fallbackUrl, scheduleDraw);
-            if (fallbackImg && fallbackImg.complete && fallbackImg.naturalWidth > 0) {
-              drawSourceImg = fallbackImg;
-            }
-          }
-        }
-      } else {
-        // Nano scale (< 40% or overview mode): Ultra-compact 256px thumbnail for max performance
-        const nanoThumbUrl =
-          card.closeupThumbnailUrl ||
-          card.thumbnailUrl ||
-          card.microLodThumbnailUrl ||
-          thumbCache.get(card.id) ||
-          (fullProxyUrl ? thumbCache.get(fullProxyUrl) : undefined) ||
-          fullProxyUrl;
-        if (nanoThumbUrl) {
-          drawSourceImg = getOrLoadThumbImage(nanoThumbUrl, scheduleDraw);
-        }
+      const fullProxyUrl = card.imageUrl;
+      const cachedThumbnail = thumbCache.get(card.id) || (fullProxyUrl ? thumbCache.get(fullProxyUrl) : undefined);
+      if (currentLodTier === 'standard' && fullProxyUrl) {
+        drawSourceImg = getOrLoadCanvasImage(fullProxyUrl, scheduleDraw, 'full');
       }
-
+      const nanoThumbnailUrl = card.closeupThumbnailUrl || card.thumbnailUrl || cachedThumbnail;
+      if (!drawSourceImg && nanoThumbnailUrl) {
+        drawSourceImg = getOrLoadThumbImage(nanoThumbnailUrl, scheduleDraw);
+      } else if (!drawSourceImg && fullProxyUrl) {
+        // Legacy cards without thumbnails may reuse a loaded proxy, never fetch it
+        // merely to supply a Micro/Nano placeholder.
+        drawSourceImg = fullImageCache.get(fullProxyUrl) || null;
+      }
       if (drawSourceImg && drawSourceImg.complete && drawSourceImg.naturalWidth > 0) {
         const { sx, sy, sw, sh } = calculateObjectCover(
           drawSourceImg.naturalWidth,

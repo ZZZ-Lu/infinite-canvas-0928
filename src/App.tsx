@@ -17,7 +17,7 @@ import { getBottomPanelHeight } from './utils/cardLayout';
 import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
 import { cropBoundingBoxFromImage } from './utils/imageCropper';
 import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp } from 'lucide-react';
-import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
+import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces, subscribeCardSaves, hasPendingStorage, retryFailedCardSaves, restoreCardBackup } from './db';
 import { SettingsPage } from './components/SettingsPage';
 import { getDrafts, saveDraft, deleteDraft } from './utils/draftDb';
 import { McpKeyButton } from './components/McpKeyButton';
@@ -519,16 +519,15 @@ export default function App() {
   }, [isDarkMode]);
 
   // Projects & Script Bible State
+  const directoryErrorRef = useRef<string | null>(null);
   const [projects, setProjects] = useState<ScriptProject[]>(() => {
     if (typeof window !== 'undefined') {
       const saved = localStorage.getItem('script_projects');
       if (saved) {
         try {
           const parsed = JSON.parse(saved);
-          // Filter out legacy sample project if present
-          const filtered = Array.isArray(parsed) 
-            ? parsed.filter((p: ScriptProject) => p && p.id !== 'proj_blackstone_night' && p.name !== '黑石之夜')
-            : [];
+          if (!Array.isArray(parsed) || !parsed.length || parsed.some(p => !p || typeof p.id !== 'string')) throw new Error('项目目录格式无效，已保留原始内容并停止覆盖。');
+          const filtered = parsed;
           if (filtered.length > 0) {
             return filtered.map((p: Partial<ScriptProject>) => ({
               ...DEFAULT_PROJECT,
@@ -543,6 +542,7 @@ export default function App() {
           }
         } catch (e) {
           console.error('Failed to parse saved projects', e);
+          directoryErrorRef.current = '项目目录读取失败，已停止自动保存。';
         }
       }
     }
@@ -552,10 +552,12 @@ export default function App() {
   const [currentProjectId, setCurrentProjectId] = useState<string>(() => {
     if (typeof window !== 'undefined') {
       const savedId = localStorage.getItem('current_project_id');
-      if (savedId && savedId !== 'proj_blackstone_night') return savedId;
+      if (savedId && projects.some(project => project.id === savedId)) return savedId;
     }
-    return DEFAULT_PROJECT.id;
+    return projects[0]?.id || DEFAULT_PROJECT.id;
   });
+  const initialWorkspaceRef = useRef(!localStorage.getItem('script_projects'));
+  const initialSaveRef = useRef<Promise<void> | null>(null);
   const rawProject = projects.find(p => p.id === currentProjectId) || projects[0] || DEFAULT_PROJECT;
   const currentProject = useMemo<ScriptProject>(() => ({
     ...DEFAULT_PROJECT,
@@ -678,7 +680,10 @@ export default function App() {
 
   // Sync projects to localStorage
   useEffect(() => {
-    localStorage.setItem('script_projects', JSON.stringify(projects));
+    if (!initialWorkspaceRef.current && !directoryErrorRef.current) {
+      try { localStorage.setItem('script_projects', JSON.stringify(projects)); }
+      catch (error) { setStorageError('项目目录保存失败：' + String(error)); }
+    }
   }, [projects]);
 
   useEffect(() => {
@@ -1038,6 +1043,17 @@ export default function App() {
 
   // State for Cards & History
   const [isLoading, setIsLoading] = useState(true);
+  const [storageError, setStorageError] = useState<string | null>(directoryErrorRef.current);
+  const [storageReload, setStorageReload] = useState(0);
+  const loadedCardsSnapshotRef = useRef<CardData[] | null>(null);
+  const savedCardsSnapshotRef = useRef<CardData[] | null>(null);
+  useEffect(() => subscribeCardSaves(event => {
+    if (event.state === 'error') setStorageError('项目保存失败，请勿关闭页面：' + event.error);
+    else if (event.projectId === currentProjectId) {
+      savedCardsSnapshotRef.current = event.cards || null;
+      setStorageError(previous => previous?.startsWith('项目读取失败') || previous?.startsWith('项目目录') ? previous : null);
+    }
+  }), [currentProjectId]);
   const [history, setHistory] = useState<{ past: CardData[][], present: CardData[], future: CardData[][] }>({
     past: [],
     present: [],
@@ -2319,6 +2335,8 @@ export default function App() {
         res: '2K',
         prompt: `${sourceLabel} ${isVideo ? 'video' : 'image'}: ${file.name || 'unnamed'}`,
         imageUrl: fileUrl, // Visible on the canvas instantly!
+        fileData: file,
+        trueOriginalFileData: file,
         isVideo: isVideo,
         customWidth: customWidth,
         customHeight: customHeight,
@@ -2579,59 +2597,40 @@ export default function App() {
   }, [tx, ty, tScale, currentProjectId]);
   // -------------------------------------
 
-  const handleSelectProject = (projectId: string) => {
-    if (projectId === currentProjectId) return;
-    // Save current cards first before switching
-    if (loadedProjectIdRef.current === currentProjectId && !isLoading) {
-      saveCards(cardsRef.current, currentProjectId).catch(console.error);
-    }
-    loadedProjectIdRef.current = null;
+  const projectTransitionRef = useRef(false);
+  const handleSelectProject = async (projectId: string) => {
+    if (projectId === currentProjectId || projectTransitionRef.current || isLoading) return;
+    projectTransitionRef.current = true;
     setIsLoading(true);
-    setCurrentProjectId(projectId);
+    try {
+      if (loadedProjectIdRef.current === currentProjectId && cardsRef.current !== loadedCardsSnapshotRef.current) await saveCards(cardsRef.current, currentProjectId);
+      loadedProjectIdRef.current = null;
+      setCurrentProjectId(projectId);
+    } catch (error) { setStorageError('当前项目未保存成功，已停止切换。'); setIsLoading(false); }
+    finally { projectTransitionRef.current = false; }
   };
 
   const handleCreateProject = async (name: string) => {
-    // Save current project's cards first
-    if (loadedProjectIdRef.current === currentProjectId && !isLoading) {
-      await saveCards(cardsRef.current, currentProjectId).catch(console.error);
-    }
-    loadedProjectIdRef.current = null;
+    if (projectTransitionRef.current || isLoading) return;
+    projectTransitionRef.current = true;
     setIsLoading(true);
-
-    const newId = `proj_${Date.now()}`;
-    const newProj: ScriptProject = {
-      ...DEFAULT_PROJECT,
-      id: newId,
-      name,
-      logline: '',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      characters: [],
-      locations: [],
-      props: [],
-      scriptText: ''
-    };
-
-    // Create a pristine initial card for the new project
-    const initialNewCards: CardData[] = [{
-      id: `card_${Date.now()}_1`,
-      x: 360,
-      y: 120,
-      state: 'draft',
-      ratio: '3:4',
-      res: '2K',
-      prompt: '',
-      imageUrl: null
-    }];
-    await saveCards(initialNewCards, newId).catch(console.error);
-
-    setProjects(prev => [newProj, ...prev]);
-    setCurrentProjectId(newId);
+    try {
+      if (loadedProjectIdRef.current === currentProjectId && cardsRef.current !== loadedCardsSnapshotRef.current) await saveCards(cardsRef.current, currentProjectId);
+      const newId = 'proj_' + crypto.randomUUID();
+      const newProj: ScriptProject = { ...DEFAULT_PROJECT, id: newId, name, logline: '', createdAt: Date.now(), updatedAt: Date.now(), characters: [], locations: [], props: [], scenes: [], scriptText: '' };
+      await saveCards([{ id: 'card_' + crypto.randomUUID(), x: 360, y: 120, state: 'draft', ratio: '3:4', res: '2K', prompt: '', imageUrl: null }], newId);
+      const next = [newProj, ...projects];
+      localStorage.setItem('script_projects', JSON.stringify(next));
+      loadedProjectIdRef.current = null;
+      setProjects(next);
+      setCurrentProjectId(newId);
+    } catch (error) { setStorageError('新项目保存失败，已保留当前项目。'); setIsLoading(false); }
+    finally { projectTransitionRef.current = false; }
   };
 
   const handleDeleteProject = async (projectId: string) => {
     if (projects.length <= 1) return;
-    await deleteCardsForProject(projectId).catch(console.error);
+    try { await deleteCardsForProject(projectId); } catch { setStorageError('项目删除失败，已保留原项目。'); return; }
     setProjects(prev => {
       const remaining = prev.filter(p => p.id !== projectId);
       if (currentProjectId === projectId) {
@@ -2648,19 +2647,25 @@ export default function App() {
     let mounted = true;
     const fetchProjectCards = async () => {
       setIsLoading(true);
-      await requestPersistence();
+      setStorageError(null);
+      loadedProjectIdRef.current = null;
+      void requestPersistence();
       
       // Artificial delay to allow the Gaussian blur mask to fade in smoothly
       // and hide the jump cut, especially on smaller projects.
       await sleep(250);
+      if (!mounted) return;
 
       try {
+        if (directoryErrorRef.current) throw new Error(directoryErrorRef.current);
         const saved = await loadCards(currentProjectId);
         if (!mounted) return;
         
-        if (saved && saved.length > 0) {
+        if (saved !== null) {
+          if (initialWorkspaceRef.current) { localStorage.setItem('script_projects', JSON.stringify(projects)); initialWorkspaceRef.current = false; }
           const processedSaved = saved.map(card => {
             const updates: any = {};
+            if (card.state === 'generating' && !card.mcpTaskId && card.fileName && card.fileData instanceof Blob) updates.state = 'completed';
             if (card.generationError) {
               const start = card.generationError.indexOf('{');
               const end = card.generationError.indexOf('}', start + 1);
@@ -2734,6 +2739,8 @@ export default function App() {
               ...updates
             };
           });
+          loadedCardsSnapshotRef.current = processedSaved;
+          savedCardsSnapshotRef.current = processedSaved;
           setHistory({ past: [], present: processedSaved, future: [] });
           loadedProjectIdRef.current = currentProjectId;
 
@@ -2879,26 +2886,32 @@ export default function App() {
                 ...updates
               };
             });
+            await saveCards(processedFallback, currentProjectId);
+            loadedCardsSnapshotRef.current = processedFallback;
+            savedCardsSnapshotRef.current = processedFallback;
             setHistory({ past: [], present: processedFallback, future: [] });
-            await saveCards(processedFallback, currentProjectId).catch(console.error);
-          } else {
-            const initialCards: CardData[] = [{
-              id: `card_${Date.now()}_1`,
-              x: 360,
-              y: 120,
-              state: 'draft',
-              ratio: '3:4',
-              res: '2K',
-              prompt: '',
-              imageUrl: null
-            }];
+          } else if (initialWorkspaceRef.current && currentProjectId === DEFAULT_PROJECT.id) {
+            if (!initialSaveRef.current) {
+              const initialCards: CardData[] = [{ id: 'card_' + crypto.randomUUID(), x: 360, y: 120, state: 'draft', ratio: '3:4', res: '2K', prompt: '', imageUrl: null }];
+              initialSaveRef.current = saveCards(initialCards, currentProjectId).catch(error => { initialSaveRef.current = null; throw error; });
+            }
+            await initialSaveRef.current;
+            const initialCards = await loadCards(currentProjectId);
+            if (!mounted) return;
+            if (!initialCards) throw new Error('初始项目保存后读取失败');
+            localStorage.setItem('script_projects', JSON.stringify(projects));
+            initialWorkspaceRef.current = false;
+            loadedCardsSnapshotRef.current = initialCards;
+            savedCardsSnapshotRef.current = initialCards;
             setHistory({ past: [], present: initialCards, future: [] });
-            await saveCards(initialCards, currentProjectId).catch(console.error);
+          } else {
+            throw new Error('已有项目的卡片数据缺失，已停止自动初始化和覆盖。');
           }
           loadedProjectIdRef.current = currentProjectId;
         }
       } catch (e) {
         console.error('Failed to load project cards from DB:', e);
+        if (mounted) setStorageError('项目读取失败，已停止自动保存：' + (e instanceof Error ? e.message : String(e)));
       } finally {
         if (mounted) {
           setIsLoading(false);
@@ -2908,52 +2921,40 @@ export default function App() {
     };
     fetchProjectCards();
     return () => { mounted = false; };
-  }, [currentProjectId]);
+  }, [currentProjectId, storageReload]);
 
-  // Save cards to IndexedDB for current project ONLY when cards belong to current project (debounced & idle-scheduled)
-  const saveCardsTimerRef = useRef<NodeJS.Timeout | null>(null);
+  // A save owns both its project and snapshot; cleanup cancels every scheduler.
+  const saveDeadlineRef = useRef<{ project: string; at: number } | null>(null);
   useEffect(() => {
-    if (!isLoading && currentProjectId && loadedProjectIdRef.current === currentProjectId) {
-      if (saveCardsTimerRef.current) {
-        clearTimeout(saveCardsTimerRef.current);
-      }
-      saveCardsTimerRef.current = setTimeout(() => {
-        const doSave = () => {
-          if (isUserPointerDownRef.current || (window as any).isDraggingCard || isDraggingCanvasRef.current) {
-            // Postpone save if user is actively interacting with the canvas/cards
-            saveCardsTimerRef.current = setTimeout(doSave, 1500);
-            return;
-          }
-          saveCards(cardsRef.current, currentProjectId).catch(console.error);
-        };
-
-        if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
-          (window as any).requestIdleCallback(doSave, { timeout: 3000 });
-        } else {
-          doSave();
-        }
-      }, 1500);
-
-      return () => {
-        if (saveCardsTimerRef.current) {
-          clearTimeout(saveCardsTimerRef.current);
-        }
-      };
-    }
+    if (isLoading || loadedProjectIdRef.current !== currentProjectId || cards === loadedCardsSnapshotRef.current) return;
+    loadedCardsSnapshotRef.current = null;
+    const snapshot = cards, projectId = currentProjectId;
+    if (saveDeadlineRef.current?.project !== projectId) saveDeadlineRef.current = { project: projectId, at: Date.now() };
+    const deadline = saveDeadlineRef.current.at;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      if (cancelled || loadedProjectIdRef.current !== projectId) return;
+      saveDeadlineRef.current = null;
+      saveCards(snapshot, projectId).catch(console.error);
+    }, cards.some(card => card.state === 'generating' && card.fileData instanceof Blob) ? 0 : Math.min(500, Math.max(0, 2000 - (Date.now() - deadline))));
+    return () => { cancelled = true; clearTimeout(timer); };
   }, [cards, isLoading, currentProjectId]);
 
-  // Synchronous flush on page reload or close to prevent in-flight video playback state from being lost
+  // Best effort only; commit during normal editing rather than relying on unload.
   useEffect(() => {
-    const handleBeforeUnload = () => {
-      if (currentProjectId && loadedProjectIdRef.current === currentProjectId && cardsRef.current.length > 0) {
-        saveCards(cardsRef.current, currentProjectId).catch(() => {});
-      }
+    const flush = () => {
+      if (loadedProjectIdRef.current === currentProjectId && cardsRef.current !== savedCardsSnapshotRef.current) saveCards(cardsRef.current, currentProjectId).catch(console.error);
     };
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => {
-      window.removeEventListener('beforeunload', handleBeforeUnload);
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      const edited = loadedProjectIdRef.current === currentProjectId && cardsRef.current !== savedCardsSnapshotRef.current;
+      flush();
+      if (edited || hasPendingStorage() || storageError) { event.preventDefault(); event.returnValue = ''; }
     };
-  }, [currentProjectId]);
+    const visibility = () => { if (document.visibilityState === 'hidden') flush(); };
+    window.addEventListener('beforeunload', beforeUnload);
+    document.addEventListener('visibilitychange', visibility);
+    return () => { window.removeEventListener('beforeunload', beforeUnload); document.removeEventListener('visibilitychange', visibility); };
+  }, [currentProjectId, storageError]);
 
   const handleUpdateCard = useCallback((id: string, updates: Partial<CardData>, isSignificant = false) => {
     if (typeof updates.currentTime === 'number' && updates.currentTime > 0) {
@@ -8084,6 +8085,20 @@ export default function App() {
         </button>
       </div>
 
+      {storageError && loadedProjectIdRef.current !== currentProjectId && <div className="fixed inset-0 z-[9998] bg-black/30" />}
+      {storageError && <div role="alert" className="fixed top-20 left-1/2 -translate-x-1/2 z-[9999] max-w-xl rounded-xl bg-red-950 text-white px-4 py-3 shadow-lg">
+        {storageError}
+        <button className="ml-3 underline" onClick={() => {
+          if (loadedProjectIdRef.current !== currentProjectId) setStorageReload(value => value + 1);
+          else if (storageError.startsWith('项目目录保存失败')) {
+            try { localStorage.setItem('script_projects', JSON.stringify(projects)); setStorageError(null); }
+            catch (error) { setStorageError('项目目录保存失败：' + String(error)); }
+          } else void retryFailedCardSaves().catch(error => setStorageError('项目保存失败，请勿关闭页面：' + String(error)));
+        }}>{loadedProjectIdRef.current !== currentProjectId ? '重新读取' : '重试保存'}</button>
+        {loadedProjectIdRef.current !== currentProjectId && <button className="ml-3 underline" onClick={() => {
+          void restoreCardBackup(currentProjectId).then(() => setStorageReload(value => value + 1)).catch(error => setStorageError('备份恢复失败：' + String(error)));
+        }}>恢复上次保存</button>}
+      </div>}
       {/* Toast: Overview Mode Navigation Hint */}
       <AnimatePresence>
         {isOverviewMode && (
