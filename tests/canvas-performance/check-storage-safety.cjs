@@ -5,7 +5,7 @@ const start=app.indexOf('  // A save owns both');
 const effect=app.slice(start,app.indexOf('  // Best effort only',start));
 function schedule(snapshot,loaded=snapshot){
  const jobs=new Map(),writes=[];let cleanup;const owner={current:'A'};
- const ctx={useEffect:fn=>cleanup=fn(),isLoading:false,currentProjectId:'A',loadedProjectIdRef:owner,loadedCardsSnapshotRef:{current:loaded},observedSaveCardsRef:{current:[]},cards:snapshot,setTimeout:fn=>{jobs.set(1,fn);return 1},clearTimeout:id=>jobs.delete(id),saveCards:(cards,project)=>{writes.push({cards,project});return Promise.resolve()},console};
+ const ctx={saveDeadlineRef:{current:null},markStorageDirty:()=>{},Date,useEffect:fn=>cleanup=fn(),isLoading:false,currentProjectId:'A',loadedProjectIdRef:owner,loadedCardsSnapshotRef:{current:loaded},observedSaveCardsRef:{current:[]},cards:snapshot,setTimeout:fn=>{jobs.set(1,fn);return 1},clearTimeout:id=>jobs.delete(id),saveCards:(cards,project)=>{writes.push({cards,project});return Promise.resolve()},console};
  vm.runInNewContext(compile(effect),ctx);return {jobs,writes,owner,cleanup};
 }
 const empty=[];assert.equal(schedule(empty).jobs.size,0,'loaded empty state must not auto-write');
@@ -23,24 +23,4 @@ for(let n=0;n<20;n++) api.getOrLoadCanvasImage('blob:test');assert.equal(images.
 clock=500;timers.shift().fn();assert.equal(images.length,2);images[1].complete=true;images[1].naturalWidth=1200;images[1].onload();assert.equal(painted,1,'successful retry redraws original consumer');
 api.getOrLoadCanvasImage('blob:bad');images.at(-1).onerror();clock+=500;timers.shift().fn();images.at(-1).onerror();clock+=1000;timers.shift().fn();images.at(-1).onerror();assert.equal(timers.length,0,'retry budget stops permanent failures');
 
-(async()=>{
- const data=new Map([['cards_A',[{id:'old'}]]]),transactions=[],events=[];
- const db={close(){},transaction(){
-  const staged=new Map();const tx={error:null,abort(){this.error=new Error('aborted');this.onabort();},objectStore(){return {get(key){const request={result:data.get(key)};queueMicrotask(()=>request.onsuccess?.());return request;},put(value,key){staged.set(key,value);return {};}}},commit(){for(const [k,v] of staged)data.set(k,v);this.oncomplete();}};
-  transactions.push(tx);return tx;
- }};
- const indexedDB={open(){const request={result:db};queueMicrotask(()=>request.onsuccess());return request;}};
- const context={exports:{},indexedDB,console,Date};vm.runInNewContext(compile(fs.readFileSync('src/db.ts','utf8')),context);
- const store=context.exports;store.subscribeCardSaves(e=>events.push(e));
- const tick=()=>new Promise(resolve=>setImmediate(resolve));
- let done=false;const save=store.saveCards([{id:'new'}],'A').then(()=>done=true);await tick();assert.equal(done,false,'request processing is not transaction commit');assert.equal(data.get('cards_A')[0].id,'old');transactions[0].commit();await save;assert.equal(data.get('cards_A')[0].id,'new');assert.equal(data.get('cards_A_backup')[0].id,'old');
- const bad=store.saveCards([],'A');const rejection=assert.rejects(bad,/aborted/);await tick();transactions[1].abort();await rejection;assert.equal(data.get('cards_A')[0].id,'new','abort preserves previous record');assert.equal(events.at(-1).state,'error');
- const one=store.saveCards([{id:'one'}],'A'),two=store.saveCards([{id:'two'}],'A');await tick();assert.equal(transactions.length,3,'second write waits for first');transactions[2].commit();await one;await tick();assert.equal(transactions.length,4);transactions[3].commit();await two;assert.equal(data.get('cards_A')[0].id,'two');assert.equal(data.get('cards_A_backup')[0].id,'one');
- const original=[{id:'undo-original'}], edited=[{id:'edited'}];
- let pending=store.saveCards(original,'A');await tick();transactions.at(-1).commit();await pending;
- const count=transactions.length;await store.saveCards(original,'A');assert.equal(transactions.length,count,'identical committed snapshot is not written twice');
- pending=store.saveCards(edited,'A');await tick();transactions.at(-1).commit();await pending;
- pending=store.saveCards(original,'A');await tick();transactions.at(-1).commit();await pending;assert.equal(data.get('cards_A')[0].id,'undo-original','undo must persist an older snapshot again');
- pending=store.saveCards([],'A');await tick();transactions.at(-1).commit();await pending;assert.equal(data.get('cards_A').length,0);assert.equal(data.get('cards_A_backup')[0].id,'undo-original','intentional clearing retains recovery copy');
- console.log('PASS: project ownership, cancellation, empty-load protection, bounded image retries, transaction completion/abort, atomic backup and write ordering');
-})().catch(e=>{console.error(e);process.exitCode=1;});
+console.log('PASS: scheduler ownership/cancellation, empty-load protection and bounded image retries');

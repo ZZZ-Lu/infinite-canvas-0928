@@ -1,3 +1,5 @@
+import { appStorage, flushAppStorage } from './storage/appStorage';
+import { markStorageDirty } from './storage/status';
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
 import { AgentContextMenu } from './components/AgentContextMenu';
@@ -350,7 +352,7 @@ export default function App() {
   // Replace useState with useMotionValue for high-frequency transforms
   const initialTransform = useMemo(() => {
     if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem('canvas_transform');
+      const saved = appStorage.getItem('canvas_transform');
       if (saved) {
         try { return JSON.parse(saved); } catch (e) { }
       }
@@ -407,7 +409,7 @@ export default function App() {
       timeout = setTimeout(() => {
         const data = JSON.stringify({ x: tx.get(), y: ty.get(), scale: tScale.get() });
         // Legacy fallback only for now, actual project-specific save happens below
-        localStorage.setItem('canvas_transform', data); 
+        appStorage.setItem('canvas_transform', data);
       }, 300);
     };
     const unsubX = tx.on('change', saveTransform);
@@ -419,7 +421,7 @@ export default function App() {
   // Theme State
   const [isDarkMode, setIsDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem('theme_mode');
+      const saved = appStorage.getItem('theme_mode');
       if (saved) return saved === 'dark';
       return window.matchMedia('(prefers-color-scheme: dark)').matches;
     }
@@ -517,13 +519,13 @@ export default function App() {
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', isDarkMode);
-    localStorage.setItem('theme_mode', isDarkMode ? 'dark' : 'light');
+    appStorage.setItem('theme_mode', isDarkMode ? 'dark' : 'light');
   }, [isDarkMode]);
 
   // Projects & Script Bible State
   const [projects, setProjects] = useState<ScriptProject[]>(() => {
     if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem('script_projects');
+      const saved = appStorage.getItem('script_projects');
       if (saved) {
         try {
           const parsed = JSON.parse(saved);
@@ -553,7 +555,7 @@ export default function App() {
 
   const [currentProjectId, setCurrentProjectId] = useState<string>(() => {
     if (typeof window !== 'undefined') {
-      const savedId = localStorage.getItem('current_project_id');
+      const savedId = appStorage.getItem('current_project_id');
       if (savedId && savedId !== 'proj_blackstone_night') return savedId;
     }
     return DEFAULT_PROJECT.id;
@@ -561,7 +563,7 @@ export default function App() {
 
   // Flag to differentiate initial workspace creation from regular project data reads
   const isInitialWorkspaceLaunchRef = useRef<boolean>(
-    typeof window !== 'undefined' ? !localStorage.getItem('script_projects') : false
+    typeof window !== 'undefined' ? !appStorage.getItem('script_projects') : false
   );
 
   const createInitialCard = (): CardData => ({
@@ -694,13 +696,13 @@ export default function App() {
     setRequestedTocItemId(null);
   }, []);
 
-  // Sync projects to localStorage
+  // Sync projects to appStorage
   useEffect(() => {
-    localStorage.setItem('script_projects', JSON.stringify(projects));
+    appStorage.setItem('script_projects', JSON.stringify(projects));
   }, [projects]);
 
   useEffect(() => {
-    localStorage.setItem('current_project_id', currentProjectId);
+    appStorage.setItem('current_project_id', currentProjectId);
   }, [currentProjectId]);
 
   const handleRenameProject = (projectId: string, newName: string) => {
@@ -1059,7 +1061,8 @@ export default function App() {
   const observedSaveCardsRef = useRef<CardData[]>([]);
   useEffect(() => subscribeCardSaves(status => {
     if (status.state === 'error') setStorageError('项目保存失败，请暂勿刷新或关闭页面：' + status.error);
-  }), []);
+    else if (status.projectId === currentProjectId) setStorageError(previous => previous?.startsWith('项目保存失败') ? null : previous);
+  }), [currentProjectId]);
   const [history, setHistory] = useState<{ past: CardData[][], present: CardData[], future: CardData[][] }>({
     past: [],
     present: [],
@@ -1294,7 +1297,7 @@ export default function App() {
       // Clear the current active card draft and persist delete to IndexedDB on close
       const currentTarget = agentQuickInput?.targetId || 'global';
       setCardDrafts(prev => ({ ...prev, [currentTarget]: '' }));
-      deleteDraft(currentTarget);
+      void deleteDraft(currentTarget).catch(console.error);
 
       setAgentQuickInput(null);
     } else {
@@ -1832,9 +1835,9 @@ export default function App() {
 
       const nodeModels = assetExtractionService.getNodeModels();
       const modelToUse = nodeModels.subjectLandmarksModel || 'deepseek-v4-flash';
-      const deepseekKey = localStorage.getItem('deepseek_api_key') || '';
-      const qwenKey = localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || '';
-      const arkKey = localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || '';
+      const deepseekKey = appStorage.getItem('deepseek_api_key') || '';
+      const qwenKey = appStorage.getItem('qwen_api_key') || appStorage.getItem('glm_api_key') || '';
+      const arkKey = appStorage.getItem('ark_api_key') || appStorage.getItem('volcengine_api_key') || '';
       const isArk = modelToUse.includes('doubao') || modelToUse.includes('seed-2-1') || modelToUse.includes('seed-2.1') || modelToUse.includes('ark') || modelToUse.includes('volces');
       const isDashscope = modelToUse.includes('qwen') || modelToUse.includes('GLM') || modelToUse.includes('ZHIPU');
       const apiKeyToSend = isArk ? (arkKey || deepseekKey || qwenKey) : isDashscope ? (qwenKey || deepseekKey) : (deepseekKey || qwenKey);
@@ -2341,6 +2344,8 @@ export default function App() {
         res: '2K',
         prompt: `${sourceLabel} ${isVideo ? 'video' : 'image'}: ${file.name || 'unnamed'}`,
         imageUrl: fileUrl, // Visible on the canvas instantly!
+        fileData: file, // Persist original bytes before asynchronous proxy generation.
+        trueOriginalFileData: file,
         isVideo: isVideo,
         customWidth: customWidth,
         customHeight: customHeight,
@@ -2547,7 +2552,7 @@ export default function App() {
   // Load canvas transform per project
   useEffect(() => {
     if (currentProjectId) {
-      const saved = localStorage.getItem(`canvas_transform_${currentProjectId}`);
+      const saved = appStorage.getItem(`canvas_transform_${currentProjectId}`);
       let x = 0, y = 0, scale = 1;
       let hasSaved = false;
       
@@ -2559,7 +2564,7 @@ export default function App() {
         } catch (e) {}
       } else if (currentProjectId === DEFAULT_PROJECT.id) {
         // Fallback to legacy global key for the default project
-        const legacy = localStorage.getItem('canvas_transform');
+        const legacy = appStorage.getItem('canvas_transform');
         if (legacy) {
           try {
             const parsed = JSON.parse(legacy);
@@ -2590,7 +2595,7 @@ export default function App() {
       timeout = setTimeout(() => {
         if (currentProjectId) {
             const data = JSON.stringify({ x: tx.get(), y: ty.get(), scale: tScale.get() });
-            localStorage.setItem(`canvas_transform_${currentProjectId}`, data);
+            appStorage.setItem(`canvas_transform_${currentProjectId}`, data);
         }
       }, 300);
     };
@@ -2601,45 +2606,49 @@ export default function App() {
   }, [tx, ty, tScale, currentProjectId]);
   // -------------------------------------
 
-  const handleSelectProject = (projectId: string) => {
-    if (projectId === currentProjectId) return;
-    // Save current cards first before switching
-    if (loadedProjectIdRef.current === currentProjectId && !isLoading && cardsRef.current !== loadedCardsSnapshotRef.current) {
-      saveCards(cardsRef.current, currentProjectId).catch(console.error);
+  const projectTransitionRef = useRef(false);
+  const persistCurrentProject = async () => {
+    if (loadedProjectIdRef.current === currentProjectId && cardsRef.current !== loadedCardsSnapshotRef.current) {
+      await saveCards(cardsRef.current, currentProjectId);
     }
-    loadedProjectIdRef.current = null;
+    await flushAppStorage();
+  };
+  const handleSelectProject = async (projectId: string) => {
+    if (projectId === currentProjectId || projectTransitionRef.current || isLoading) return;
+    projectTransitionRef.current = true;
     setIsLoading(true);
-    setCurrentProjectId(projectId);
+    try {
+      await persistCurrentProject();
+      loadedProjectIdRef.current = null;
+      setCurrentProjectId(projectId);
+    } catch (error) {
+      setStorageError('当前项目未保存成功，已停止切换。请重试保存。');
+      setIsLoading(false);
+    } finally { projectTransitionRef.current = false; }
   };
 
   const handleCreateProject = async (name: string) => {
-    // Save current project's cards first
-    if (loadedProjectIdRef.current === currentProjectId && !isLoading && cardsRef.current !== loadedCardsSnapshotRef.current) {
-      await saveCards(cardsRef.current, currentProjectId).catch(console.error);
-    }
-    loadedProjectIdRef.current = null;
+    if (projectTransitionRef.current || isLoading) return;
+    projectTransitionRef.current = true;
     setIsLoading(true);
-
-    const newId = `proj_${Date.now()}`;
-    const newProj: ScriptProject = {
-      ...DEFAULT_PROJECT,
-      id: newId,
-      name,
-      logline: '',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      characters: [],
-      locations: [],
-      props: [],
-      scriptText: ''
-    };
-
-    // Create a pristine initial card strictly upon project creation
-    const initialNewCards: CardData[] = [createInitialCard()];
-    await saveCards(initialNewCards, newId).catch(console.error);
-
-    setProjects(prev => [newProj, ...prev]);
-    setCurrentProjectId(newId);
+    try {
+      await persistCurrentProject();
+      const newId = 'proj_' + crypto.randomUUID();
+      const newProj: ScriptProject = {
+        ...DEFAULT_PROJECT, id: newId, name, logline: '', createdAt: Date.now(), updatedAt: Date.now(),
+        characters: [], locations: [], props: [], scenes: [], scriptText: ''
+      };
+      await saveCards([createInitialCard()], newId);
+      const nextProjects = [newProj, ...projects];
+      appStorage.setItem('script_projects', JSON.stringify(nextProjects));
+      await flushAppStorage();
+      loadedProjectIdRef.current = null;
+      setProjects(nextProjects);
+      setCurrentProjectId(newId);
+    } catch (error) {
+      setStorageError('新项目未能完成保存，已保留原项目。请重试保存。');
+      setIsLoading(false);
+    } finally { projectTransitionRef.current = false; }
   };
 
   const handleDeleteProject = async (projectId: string) => {
@@ -2675,7 +2684,6 @@ export default function App() {
     const fetchProjectCards = async () => {
       setIsLoading(true);
       loadedProjectIdRef.current = null;
-      await requestPersistence();
       
       // Artificial delay to allow the Gaussian blur mask to fade in smoothly
       // and hide the jump cut, especially on smaller projects.
@@ -2688,6 +2696,9 @@ export default function App() {
         if (saved !== null) {
           const processedSaved = saved.map(card => {
             const updates: any = {};
+            if (card.state === 'generating' && !card.mcpTaskId && card.fileName && card.fileData instanceof Blob) {
+              updates.state = 'completed'; // A local import interrupted before proxy generation is still usable.
+            }
             if (card.generationError) {
               const start = card.generationError.indexOf('{');
               const end = card.generationError.indexOf('}', start + 1);
@@ -2747,7 +2758,7 @@ export default function App() {
             }
             const savedPos = (() => {
               try {
-                const pos = localStorage.getItem(`mira_vid_pos_${card.id}`);
+                const pos = appStorage.getItem(`mira_vid_pos_${card.id}`);
                 if (pos) {
                   const val = parseFloat(pos);
                   if (!isNaN(val) && val > 0) return val;
@@ -2878,7 +2889,7 @@ export default function App() {
               }
               const savedPos = (() => {
                 try {
-                  const pos = localStorage.getItem(`mira_vid_pos_${card.id}`);
+                  const pos = appStorage.getItem(`mira_vid_pos_${card.id}`);
                   if (pos) {
                     const val = parseFloat(pos);
                     if (!isNaN(val) && val > 0) return val;
@@ -2941,6 +2952,7 @@ export default function App() {
     return () => { mounted = false; };
   }, [currentProjectId]);
 
+  const saveDeadlineRef = useRef<{ projectId: string; startedAt: number } | null>(null);
   // A save owns both its project and snapshot; cleanup cancels the only scheduler.
   useEffect(() => {
     const previous = observedSaveCardsRef.current;
@@ -2948,6 +2960,10 @@ export default function App() {
     if (isLoading || loadedProjectIdRef.current !== currentProjectId || cards === loadedCardsSnapshotRef.current) return;
     // Once edited, undoing to the initially loaded array is still a real change.
     loadedCardsSnapshotRef.current = null;
+    markStorageDirty(`cards_${currentProjectId}`);
+    if (saveDeadlineRef.current?.projectId !== currentProjectId) {
+      saveDeadlineRef.current = { projectId: currentProjectId, startedAt: Date.now() };
+    }
     const previousById = new Map<string, CardData>(previous.map(card => [card.id, card] as [string, CardData]));
     const hasNewMedia = cards.some(card => {
       const old = previousById.get(card.id);
@@ -2957,8 +2973,9 @@ export default function App() {
     const projectId = currentProjectId;
     const timer = setTimeout(() => {
       if (loadedProjectIdRef.current !== projectId) return;
+      saveDeadlineRef.current = null;
       saveCards(snapshot, projectId).catch(console.error);
-    }, hasNewMedia ? 0 : 500);
+    }, hasNewMedia ? 0 : Math.min(500, Math.max(0, 2000 - (Date.now() - saveDeadlineRef.current.startedAt))));
     return () => clearTimeout(timer);
   }, [cards, isLoading, currentProjectId]);
 
@@ -2981,7 +2998,7 @@ export default function App() {
   const handleUpdateCard = useCallback((id: string, updates: Partial<CardData>, isSignificant = false) => {
     if (typeof updates.currentTime === 'number' && updates.currentTime > 0) {
       try {
-        localStorage.setItem(`mira_vid_pos_${id}`, updates.currentTime.toFixed(2));
+        appStorage.setItem(`mira_vid_pos_${id}`, updates.currentTime.toFixed(2));
       } catch {}
     }
     const isOnlyPrompt = Object.keys(updates).length === 1 && 'prompt' in updates;
@@ -5100,7 +5117,7 @@ export default function App() {
       }
 
       try {
-        const savedApiKey = localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key') || '';
+        const savedApiKey = appStorage.getItem('deepseek_api_key') || appStorage.getItem('qwen_api_key') || '';
         const activeMcp = getMcpConfig();
 
         // 🛡️ Resolve reference image items into valid Base64 / proxy URLs for WorkRally MCP
@@ -5498,19 +5515,19 @@ export default function App() {
       const isArkModel = agentModel.includes('doubao') || agentModel.includes('seed-2-1') || agentModel.includes('seed-2.1') || agentModel.includes('ark') || agentModel.includes('volces');
       const isDashscopeModel = agentModel.startsWith('qwen') || agentModel.includes('glm') || agentModel.includes('ZHIPU') || agentModel.includes('zhipu');
       const savedKey = isArkModel
-        ? (localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key'))
+        ? (appStorage.getItem('ark_api_key') || appStorage.getItem('volcengine_api_key') || appStorage.getItem('deepseek_api_key') || appStorage.getItem('qwen_api_key'))
         : isDashscopeModel
-        ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key'))
-        : localStorage.getItem('deepseek_api_key');
+        ? (appStorage.getItem('qwen_api_key') || appStorage.getItem('glm_api_key') || appStorage.getItem('deepseek_api_key'))
+        : appStorage.getItem('deepseek_api_key');
 
       const jsonAdapterModel = nodeModels.jsonAdapterModel || 'deepseek-v4-flash';
       const isArkAdapter = jsonAdapterModel.includes('doubao') || jsonAdapterModel.includes('seed-2-1') || jsonAdapterModel.includes('seed-2.1') || jsonAdapterModel.includes('ark') || jsonAdapterModel.includes('volces');
       const isDashscopeAdapter = jsonAdapterModel.startsWith('qwen') || jsonAdapterModel.includes('glm') || jsonAdapterModel.includes('ZHIPU') || jsonAdapterModel.includes('zhipu');
       const jsonAdapterKey = isArkAdapter
-        ? (localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key'))
+        ? (appStorage.getItem('ark_api_key') || appStorage.getItem('volcengine_api_key') || appStorage.getItem('deepseek_api_key') || appStorage.getItem('qwen_api_key'))
         : isDashscopeAdapter
-        ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key'))
-        : localStorage.getItem('deepseek_api_key');
+        ? (appStorage.getItem('qwen_api_key') || appStorage.getItem('glm_api_key') || appStorage.getItem('deepseek_api_key'))
+        : appStorage.getItem('deepseek_api_key');
 
       const toolConfig = getAgentToolConfig();
       const enabledTools = AGENT_TOOL_REGISTRY.filter((tool) => toolConfig[tool.id]).map((tool) => tool.id);
@@ -5722,10 +5739,10 @@ export default function App() {
               const isArkModel = agentModel.includes('doubao') || agentModel.includes('seed-2-1') || agentModel.includes('seed-2.1') || agentModel.includes('ark') || agentModel.includes('volces');
               const isDashscopeModel = agentModel.startsWith('qwen') || agentModel.includes('glm') || agentModel.includes('ZHIPU') || agentModel.includes('zhipu');
               const savedKey = isArkModel
-                ? (localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key') || '')
+                ? (appStorage.getItem('ark_api_key') || appStorage.getItem('volcengine_api_key') || appStorage.getItem('deepseek_api_key') || appStorage.getItem('qwen_api_key') || '')
                 : isDashscopeModel
-                ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key') || '')
-                : (localStorage.getItem('deepseek_api_key') || '');
+                ? (appStorage.getItem('qwen_api_key') || appStorage.getItem('glm_api_key') || appStorage.getItem('deepseek_api_key') || '')
+                : (appStorage.getItem('deepseek_api_key') || '');
 
               const lastUserMessage = task.negotiationLog?.[task.negotiationLog.length - 1]?.content || task.goal;
               const res = await fetch('/api/agent/update-state-node', {
@@ -5912,7 +5929,7 @@ export default function App() {
         });
         updateAgentRuntimeTrace(task);
         // Auto inspect if enabled
-        if (localStorage.getItem('auto_inspect_on_launch') !== 'false') {
+        if (appStorage.getItem('auto_inspect_on_launch') !== 'false') {
           try {
             const initObservation = await inspectPage({ scope: 'overview' });
             observedTargetsByTaskRef.current.set(task.id, new Set(initObservation.components.map(component => component.id)));
@@ -7682,14 +7699,14 @@ export default function App() {
                 onChange: (text: string) => {
                   const target = agentQuickInput.targetId || 'global';
                   setCardDrafts(prev => ({ ...prev, [target]: text }));
-                  saveDraft(target, text); // Persist draft to IndexedDB
+                  void saveDraft(target, text).catch(console.error); // Persist draft to IndexedDB
                 },
                 onSubmit: async (prompt: string) => {
                   if (agentQuickInput.onAskResolve) {
                     const askResolver = agentQuickInput.onAskResolve;
                     const currentKey = agentQuickInput.targetId || 'global';
                     setCardDrafts(prev => ({ ...prev, [currentKey]: '' }));
-                    deleteDraft(currentKey);
+                    void deleteDraft(currentKey).catch(console.error);
                     setAgentQuickInput(null);
                     if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
                     isAgentRunningRef.current = true;

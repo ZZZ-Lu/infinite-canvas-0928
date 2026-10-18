@@ -1,3 +1,4 @@
+import { appStorage } from '../storage/appStorage';
 import React, { useMemo, useState } from 'react';
 import { Check, ChevronDown, ChevronRight, Copy, MousePointer2, Power, RotateCcw, ShieldCheck, TerminalSquare } from 'lucide-react';
 import { AGENT_TOOL_REGISTRY, DEFAULT_AGENT_TOOL_CONFIG, getAgentToolConfig, saveAgentToolConfig, type AgentToolConfig, type ToolCategory } from '../agent/toolRegistry';
@@ -9,7 +10,7 @@ export function ToolManagementPanel() {
   const [config, setConfig] = useState<AgentToolConfig>(getAgentToolConfig);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
-  const [autoInspect, setAutoInspect] = useState(() => localStorage.getItem("auto_inspect_on_launch") !== "false");
+  const [autoInspect, setAutoInspect] = useState(() => appStorage.getItem("auto_inspect_on_launch") !== "false");
 
   const handleCopy = (text: string, key: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
@@ -20,7 +21,7 @@ export function ToolManagementPanel() {
 
   const handleAutoInspectChange = (checked: boolean) => {
     setAutoInspect(checked);
-    localStorage.setItem("auto_inspect_on_launch", checked ? "true" : "false");
+    appStorage.setItem("auto_inspect_on_launch", checked ? "true" : "false");
   };
   const grouped = useMemo(() => categories.map((category) => ({ category, tools: AGENT_TOOL_REGISTRY.filter((tool) => tool.category === category) })), []);
   const setEnabled = (id: keyof AgentToolConfig, enabled: boolean) => {

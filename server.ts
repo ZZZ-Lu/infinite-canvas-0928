@@ -1942,7 +1942,9 @@ ${effectiveRequirement}
         middlewareMode: true,
         hmr: false,
         ws: false,
-        watch: null,
+        // Keep module invalidation active so a manual refresh serves edited source.
+        // HMR stays disabled to avoid interrupting canvas interactions.
+        watch: { ignored: ['**/.data/**', '**/dist/**'] },
       },
       appType: "spa",
     });

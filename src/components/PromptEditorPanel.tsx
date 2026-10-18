@@ -1,3 +1,4 @@
+import { appStorage, flushAppStorage } from '../storage/appStorage';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Save, LoaderCircle, Check, Copy, RotateCcw, Cpu, TerminalSquare, AlertCircle, Zap, Eye } from 'lucide-react';
 
@@ -56,17 +57,17 @@ export const PromptEditorPanel = () => {
   const [activeTab, setActiveTab] = useState<PromptTabType>('main');
 
   const [prompts, setPrompts] = useState<Record<PromptTabType, string>>(() => ({
-    main: localStorage.getItem('mira_custom_system_prompt') || '',
-    state: localStorage.getItem('mira_custom_state_prompt') || '',
-    jsonAdapter: localStorage.getItem('mira_custom_json_adapter_prompt') || '',
-    landmarks: localStorage.getItem('mira_custom_landmarks_prompt') || '',
+    main: appStorage.getItem('mira_custom_system_prompt') || '',
+    state: appStorage.getItem('mira_custom_state_prompt') || '',
+    jsonAdapter: appStorage.getItem('mira_custom_json_adapter_prompt') || '',
+    landmarks: appStorage.getItem('mira_custom_landmarks_prompt') || '',
   }));
 
   const [dirties, setDirties] = useState<Record<PromptTabType, boolean>>(() => ({
-    main: localStorage.getItem('mira_prompt_dirty_main') === 'true',
-    state: localStorage.getItem('mira_prompt_dirty_state') === 'true',
-    jsonAdapter: localStorage.getItem('mira_prompt_dirty_json_adapter') === 'true',
-    landmarks: localStorage.getItem('mira_prompt_dirty_landmarks') === 'true',
+    main: appStorage.getItem('mira_prompt_dirty_main') === 'true',
+    state: appStorage.getItem('mira_prompt_dirty_state') === 'true',
+    jsonAdapter: appStorage.getItem('mira_prompt_dirty_json_adapter') === 'true',
+    landmarks: appStorage.getItem('mira_prompt_dirty_landmarks') === 'true',
   }));
 
   const [loading, setLoading] = useState(true);
@@ -83,6 +84,10 @@ export const PromptEditorPanel = () => {
   const currentTabConfig = TABS.find(t => t.id === activeTab) || TABS[0];
 
   const fetchPrompt = useCallback(async (type: PromptTabType, force = false) => {
+    const cached = TABS.find(tab => tab.id === type);
+    if (!force && cached && appStorage.getItem(cached.storageKey) !== null) {
+      setLoading(false); return;
+    }
     setLoading(true);
     setError(null);
     try {
@@ -97,9 +102,9 @@ export const PromptEditorPanel = () => {
           const cfg = TABS.find(t => t.id === type);
           if (cfg) {
             setPrompts(prev => ({ ...prev, [type]: data.prompt }));
-            localStorage.setItem(cfg.storageKey, data.prompt);
+            appStorage.setItem(cfg.storageKey, data.prompt);
             setDirties(prev => ({ ...prev, [type]: false }));
-            localStorage.setItem(cfg.dirtyKey, 'false');
+            appStorage.setItem(cfg.dirtyKey, 'false');
           }
         }
       }
@@ -122,9 +127,9 @@ export const PromptEditorPanel = () => {
     setError(null);
     const cfg = currentTabConfig;
     setPrompts(prev => ({ ...prev, [activeTab]: value }));
-    localStorage.setItem(cfg.storageKey, value);
+    appStorage.setItem(cfg.storageKey, value);
     setDirties(prev => ({ ...prev, [activeTab]: true }));
-    localStorage.setItem(cfg.dirtyKey, 'true');
+    appStorage.setItem(cfg.dirtyKey, 'true');
   };
 
   const savePrompt = async () => {
@@ -135,6 +140,8 @@ export const PromptEditorPanel = () => {
     setSaving(true);
     setError(null);
     try {
+      appStorage.setItem(cfg.storageKey, textToSave);
+      await flushAppStorage();
       const res = await fetch('/api/agent/prompt', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -146,7 +153,7 @@ export const PromptEditorPanel = () => {
       }
 
       setDirties(prev => ({ ...prev, [targetTab]: false }));
-      localStorage.setItem(cfg.dirtyKey, 'false');
+      appStorage.setItem(cfg.dirtyKey, 'false');
 
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
@@ -161,8 +168,8 @@ export const PromptEditorPanel = () => {
   const handleReset = async () => {
     if (!confirm(`确定要放弃未保存草稿并重新拉取服务器最新的 ${currentTabConfig.label} 吗？`)) return;
     const cfg = currentTabConfig;
-    localStorage.removeItem(cfg.storageKey);
-    localStorage.setItem(cfg.dirtyKey, 'false');
+    appStorage.removeItem(cfg.storageKey);
+    appStorage.setItem(cfg.dirtyKey, 'false');
     setDirties(prev => ({ ...prev, [activeTab]: false }));
     await fetchPrompt(activeTab, true);
   };

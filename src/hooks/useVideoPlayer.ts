@@ -1,3 +1,4 @@
+import { appStorage } from '../storage/appStorage';
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { videoRegistry } from '../services/videoRegistry';
 
@@ -15,11 +16,11 @@ export function useVideoPlayer({ cardId, rawSrc, initialTime = 0, onTimeUpdate }
   const [progress, setProgress] = useState(0);
   const lastSavedTimeRef = useRef<number>(0);
 
-  // Retrieve stored playback progress from localStorage or card props
+  // Retrieve stored playback progress from appStorage or card props
   const getSavedTime = useCallback((): number => {
     if (typeof window === 'undefined') return initialTime || 0;
     try {
-      const local = localStorage.getItem(`mira_vid_pos_${cardId}`);
+      const local = appStorage.getItem(`mira_vid_pos_${cardId}`);
       if (local !== null) {
         const val = parseFloat(local);
         if (!isNaN(val) && val > 0) return val;
@@ -47,7 +48,7 @@ export function useVideoPlayer({ cardId, rawSrc, initialTime = 0, onTimeUpdate }
     }
     if (currentTime > 0.1) {
       try {
-        localStorage.setItem(`mira_vid_pos_${cardId}`, currentTime.toFixed(2));
+        appStorage.setItem(`mira_vid_pos_${cardId}`, currentTime.toFixed(2));
       } catch {}
       if (Math.abs(currentTime - lastSavedTimeRef.current) >= 1.0) {
         lastSavedTimeRef.current = currentTime;

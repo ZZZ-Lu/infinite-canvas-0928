@@ -28,8 +28,8 @@ export default defineConfig(() => {
     server: {
       // HMR is completely disabled in AI Studio to prevent automatic page reload when Cloud Run/Nginx WebSocket times out.
       hmr: false,
-      // Disable file watching to prevent reload loops and save CPU during edits.
-      watch: null,
+      // Refresh must invalidate edited modules even when HMR is disabled.
+      watch: { ignored: ['**/.data/**', '**/dist/**'] },
     },
   };
 });

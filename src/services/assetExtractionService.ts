@@ -1,3 +1,4 @@
+import { appStorage } from '../storage/appStorage';
 import { 
   ExtractionModelType,
   NodePromptConfig,
@@ -17,7 +18,7 @@ export interface ExtractionOptions {
 export const assetExtractionService = {
   getNodeModels(): NodeModelConfig {
     try {
-      const saved = localStorage.getItem('node_models_config');
+      const saved = appStorage.getItem('node_models_config');
       if (saved) {
         const parsed = JSON.parse(saved);
         return {
@@ -26,14 +27,14 @@ export const assetExtractionService = {
         };
       }
     } catch (e) {
-      console.warn('Failed to parse node_models_config from localStorage', e);
+      console.warn('Failed to parse node_models_config from appStorage', e);
     }
     return { ...DEFAULT_NODE_MODELS };
   },
 
   saveNodeModels(models: NodeModelConfig): void {
     try {
-      localStorage.setItem('node_models_config', JSON.stringify(models));
+      appStorage.setItem('node_models_config', JSON.stringify(models));
     } catch (e) {
       console.error('Failed to save node_models_config', e);
     }

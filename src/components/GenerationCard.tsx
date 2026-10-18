@@ -1,3 +1,5 @@
+import { markStorageDirty, clearStorageDirty } from '../storage/status';
+import { appStorage } from '../storage/appStorage';
 import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence, MotionValue, useAnimationControls } from 'motion/react';
@@ -2567,7 +2569,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   const [hasEverMountedVideo, setHasEverMountedVideo] = useState(false);
   const [showLandmarksHUD, setShowLandmarksHUD] = useState(() => {
     if (typeof window === 'undefined') return true;
-    return localStorage.getItem('show_landmark_spatial_annotations') !== 'false';
+    return appStorage.getItem('show_landmark_spatial_annotations') !== 'false';
   });
   const prevLandmarksDetectedAtRef = useRef<number | undefined>(data.landmarks?.detectedAt);
 
@@ -2580,7 +2582,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     };
     window.addEventListener('landmark-hud-setting-changed', handleGlobalSetting);
     // Initial sync
-    const current = typeof window !== 'undefined' ? localStorage.getItem('show_landmark_spatial_annotations') !== 'false' : true;
+    const current = typeof window !== 'undefined' ? appStorage.getItem('show_landmark_spatial_annotations') !== 'false' : true;
     setShowLandmarksHUD(current);
     return () => window.removeEventListener('landmark-hud-setting-changed', handleGlobalSetting);
   }, []);
@@ -2589,7 +2591,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   useEffect(() => {
     if (data.landmarks?.detectedAt && data.landmarks.detectedAt !== prevLandmarksDetectedAtRef.current) {
       prevLandmarksDetectedAtRef.current = data.landmarks.detectedAt;
-      const isGloballyEnabled = typeof window !== 'undefined' ? localStorage.getItem('show_landmark_spatial_annotations') !== 'false' : true;
+      const isGloballyEnabled = typeof window !== 'undefined' ? appStorage.getItem('show_landmark_spatial_annotations') !== 'false' : true;
       if (isGloballyEnabled) {
         setShowLandmarksHUD(true);
       } else {
@@ -2614,7 +2616,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   const getStoredVideoProgress = useCallback((): number => {
     if (typeof window === 'undefined') return currentTime || 0;
     try {
-      const local = localStorage.getItem(`mira_vid_pos_${id}`);
+      const local = appStorage.getItem(`mira_vid_pos_${id}`);
       if (local !== null) {
         const parsed = parseFloat(local);
         if (!isNaN(parsed) && parsed > 0) return parsed;
@@ -2626,7 +2628,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   const saveStoredVideoProgress = useCallback((time: number) => {
     if (typeof window === 'undefined' || !id || isNaN(time) || time <= 0.1) return;
     try {
-      const existing = localStorage.getItem(`mira_vid_pos_${id}`);
+      const existing = appStorage.getItem(`mira_vid_pos_${id}`);
       if (existing !== null) {
         const parsed = parseFloat(existing);
         // CRITICAL PROTECTION: Never let initial seek/mount timestamps (<= 0.2s) overwrite established progress (> 0.5s)
@@ -2634,7 +2636,7 @@ export const GenerationCard = React.memo(function GenerationCard({
           return;
         }
       }
-      localStorage.setItem(`mira_vid_pos_${id}`, time.toFixed(2));
+      appStorage.setItem(`mira_vid_pos_${id}`, time.toFixed(2));
     } catch {}
   }, [id]);
 
@@ -2849,6 +2851,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       if (debounceTimerRef.current) {
         clearTimeout(debounceTimerRef.current);
         onUpdate(id, { prompt: localPromptRef.current }, false);
+        clearStorageDirty('prompt:' + id);
       }
     };
   }, [id, onUpdate]);
@@ -2860,6 +2863,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     }
     setLocalPrompt(newVal);
     onUpdate(id, { prompt: newVal }, isSignificant);
+    clearStorageDirty('prompt:' + id);
   };
 
   // Reference Image States
@@ -3901,7 +3905,7 @@ export const GenerationCard = React.memo(function GenerationCard({
 
       if (/^https?:\/\//i.test(targetMediaUrl)) {
         try {
-          const activeToken = localStorage.getItem('workrally_mcp_token') || '';
+          const activeToken = appStorage.getItem('workrally_mcp_token') || '';
           const taskId = data.mcpTaskId || targetMediaUrl.match(/(2k[a-z0-9]{6,16})/i)?.[1] || targetMediaUrl.match(/\/(2k[a-z0-9]+)_MAIN_/i)?.[1] || '';
           const proxyUrl = `/api/mcp/workrally/proxy-media?url=${encodeURIComponent(targetMediaUrl)}${taskId ? `&taskId=${encodeURIComponent(taskId)}` : ''}${activeToken ? `&token=${encodeURIComponent(activeToken)}` : ''}&download=true&filename=${encodeURIComponent(filename)}`;
 
@@ -4251,6 +4255,7 @@ export const GenerationCard = React.memo(function GenerationCard({
 
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
+    markStorageDirty('prompt:' + id);
     const cursor = e.target.selectionStart;
     isTypingRef.current = true;
     setLocalPrompt(val);
@@ -4261,6 +4266,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     }
     debounceTimerRef.current = setTimeout(() => {
       onUpdate(id, { prompt: val }, false);
+      clearStorageDirty('prompt:' + id);
       debounceTimerRef.current = null;
     }, 250);
 
@@ -4273,6 +4279,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       clearTimeout(debounceTimerRef.current);
       debounceTimerRef.current = null;
       onUpdate(id, { prompt: localPromptRef.current }, false);
+      clearStorageDirty('prompt:' + id);
     }
   };
 
@@ -5002,7 +5009,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                     const video = e.currentTarget;
                     const currTime = video.currentTime;
                     if (video.duration > 0 && currTime >= video.duration - 0.4) {
-                      try { localStorage.removeItem(`mira_vid_pos_${id}`); } catch {}
+                      try { appStorage.removeItem(`mira_vid_pos_${id}`); } catch {}
                       initialSeekPosRef.current = 0;
                     } else if (currTime > 0.1) {
                       saveStoredVideoProgress(currTime);

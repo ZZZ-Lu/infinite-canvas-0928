@@ -1,3 +1,4 @@
+import { appStorage } from '../storage/appStorage';
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import * as Diff from 'diff';
 import { motion, AnimatePresence } from 'motion/react';
@@ -44,7 +45,7 @@ const hashString = (str: string) => {
 
 const getSceneStore = () => {
   try {
-    return JSON.parse(localStorage.getItem('script_scene_store') || '{}');
+    return JSON.parse(appStorage.getItem('script_scene_store') || '{}');
   } catch {
     return {};
   }
@@ -52,7 +53,7 @@ const getSceneStore = () => {
 
 const saveSceneStore = (store: any) => {
   try {
-    localStorage.setItem('script_scene_store', JSON.stringify(store));
+    appStorage.setItem('script_scene_store', JSON.stringify(store));
   } catch {}
 };
 
@@ -179,7 +180,7 @@ export function ProjectScriptBible({
     setExtractionFeedback('正在深入分析剧本全文，提取实体资产...');
     
     try {
-      const apiKey = localStorage.getItem('deepseek_api_key') || '';
+      const apiKey = appStorage.getItem('deepseek_api_key') || '';
       const { project: updatedProject } = await assetExtractionService.extractAssetsFromScript(
         currentProject.id,
         scriptDraft,
@@ -201,7 +202,7 @@ export function ProjectScriptBible({
   // Position memory for each project's script reading location
   const [scrollPositions, setScrollPositions] = useState<Record<string, number>>(() => {
     try {
-      const saved = localStorage.getItem('script_scroll_positions');
+      const saved = appStorage.getItem('script_scroll_positions');
       if (!saved) return {};
       const parsed = JSON.parse(saved);
       const cleaned: Record<string, number> = {};
@@ -232,7 +233,7 @@ export function ProjectScriptBible({
   // Table of Contents (TOC) Dropdown state & parsing
   const [inferredPatterns, setInferredPatterns] = useState<string[]>(() => {
     try {
-      const saved = localStorage.getItem(`script_toc_patterns_${currentProject.id}`);
+      const saved = appStorage.getItem(`script_toc_patterns_${currentProject.id}`);
       return saved ? JSON.parse(saved) : [];
     } catch {
       return [];
@@ -262,7 +263,7 @@ export function ProjectScriptBible({
       let saved = tocScrollPositionsRef.current[currentProject.id];
       if (saved === undefined) {
         try {
-          const stored = localStorage.getItem(`script_toc_list_scroll_${currentProject.id}`);
+          const stored = appStorage.getItem(`script_toc_list_scroll_${currentProject.id}`);
           if (stored) {
             saved = parseFloat(stored) || 0;
             tocScrollPositionsRef.current[currentProject.id] = saved;
@@ -283,7 +284,7 @@ export function ProjectScriptBible({
     const top = e.currentTarget.scrollTop;
     tocScrollPositionsRef.current[currentProject.id] = top;
     try {
-      localStorage.setItem(`script_toc_list_scroll_${currentProject.id}`, String(top));
+      appStorage.setItem(`script_toc_list_scroll_${currentProject.id}`, String(top));
     } catch {}
     onTocAtBottomChange(top + e.currentTarget.clientHeight >= e.currentTarget.scrollHeight - 2);
   };
@@ -307,11 +308,11 @@ export function ProjectScriptBible({
   useEffect(() => {
     if (!scriptDraft || scriptDraft.trim().length < 20) return;
 
-    // Do not infer if we already have patterns loaded in state (either from localStorage or from a previous fallback in this session)
+    // Do not infer if we already have patterns loaded in state (either from appStorage or from a previous fallback in this session)
     if (inferredPatterns.length > 0) return;
     
-    // Check localStorage just to be safe
-    const saved = localStorage.getItem(`script_toc_patterns_${currentProject.id}`);
+    // Check appStorage just to be safe
+    const saved = appStorage.getItem(`script_toc_patterns_${currentProject.id}`);
     if (saved && saved !== '[]') return;
 
     if (inferenceAttemptedRef.current.has(currentProject.id)) return;
@@ -323,13 +324,13 @@ export function ProjectScriptBible({
       try {
         const sampleText = scriptDraft.slice(0, 4000);
         // Retrieve API credentials from settings
-        const agentModel = localStorage.getItem('agentModel') || 'deepseek-v4-flash';
-        const activeModel = localStorage.getItem('script_toc_infer_model') || agentModel;
+        const agentModel = appStorage.getItem('agentModel') || 'deepseek-v4-flash';
+        const activeModel = appStorage.getItem('script_toc_infer_model') || agentModel;
         
-        const deepseekKey = localStorage.getItem('deepseek_api_key') || '';
-        const qwenKey = localStorage.getItem('qwen_api_key') || '';
-        const glmKey = localStorage.getItem('glm_api_key') || '';
-        const arkKey = localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || '';
+        const deepseekKey = appStorage.getItem('deepseek_api_key') || '';
+        const qwenKey = appStorage.getItem('qwen_api_key') || '';
+        const glmKey = appStorage.getItem('glm_api_key') || '';
+        const arkKey = appStorage.getItem('ark_api_key') || appStorage.getItem('volcengine_api_key') || '';
         
         let apiKey = deepseekKey;
         if (activeModel.includes('doubao') || activeModel.includes('seed-2-1') || activeModel.includes('seed-2.1') || activeModel.includes('ark') || activeModel.includes('volces')) {
@@ -360,7 +361,7 @@ export function ProjectScriptBible({
 
         // Save raw inference to local storage for Settings debugging
         try {
-          localStorage.setItem('last_toc_infer_result', JSON.stringify(data, null, 2));
+          appStorage.setItem('last_toc_infer_result', JSON.stringify(data, null, 2));
         } catch (e) {}
 
         let patterns: string[] = [];
@@ -369,7 +370,7 @@ export function ProjectScriptBible({
 
         if (patterns.length > 0) {
           setInferredPatterns(patterns);
-          localStorage.setItem(`script_toc_patterns_${currentProject.id}`, JSON.stringify(patterns));
+          appStorage.setItem(`script_toc_patterns_${currentProject.id}`, JSON.stringify(patterns));
         }
 
         // Auto-slice scenes if scenePattern exists
@@ -585,7 +586,7 @@ export function ProjectScriptBible({
         const next = { ...prev, [currentProject.id]: targetScroll };
         scrollPositionsRef.current = next;
         try {
-          localStorage.setItem('script_scroll_positions', JSON.stringify(next));
+          appStorage.setItem('script_scroll_positions', JSON.stringify(next));
         } catch {}
         return next;
       });
@@ -647,7 +648,7 @@ export function ProjectScriptBible({
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [isVersionOpen, setIsVersionOpen] = useState(false);
   const [versions, setVersions] = useState<any[]>(() => {
-    try { return JSON.parse(localStorage.getItem(`script_versions_${currentProject?.id}`) || "[]"); } catch { return []; }
+    try { return JSON.parse(appStorage.getItem(`script_versions_${currentProject?.id}`) || "[]"); } catch { return []; }
   });
   const [searchText, setSearchText] = useState('');
   const [replaceText, setReplaceText] = useState('');
@@ -809,7 +810,7 @@ export function ProjectScriptBible({
   useEffect(() => {
     setScriptDraft(currentProject?.scriptText || '');
     try {
-      const saved = localStorage.getItem(`script_toc_patterns_${currentProject.id}`);
+      const saved = appStorage.getItem(`script_toc_patterns_${currentProject.id}`);
       setInferredPatterns(saved ? JSON.parse(saved) : []);
     } catch {
       setInferredPatterns([]);
@@ -864,7 +865,7 @@ export function ProjectScriptBible({
       const next = { ...prev, [currentProject.id]: top };
       scrollPositionsRef.current = next;
       try {
-        localStorage.setItem('script_scroll_positions', JSON.stringify(next));
+        appStorage.setItem('script_scroll_positions', JSON.stringify(next));
       } catch {}
       return next;
     });
@@ -978,20 +979,20 @@ export function ProjectScriptBible({
           const timestamp = new Date().toLocaleTimeString();
           const logLine = `[${timestamp}] 运行完成 (${duration}ms) => ${JSON.stringify(data)}`;
           let existingLogs = [];
-          try { existingLogs = JSON.parse(localStorage.getItem('change_assess_logs') || '[]'); } catch {}
+          try { existingLogs = JSON.parse(appStorage.getItem('change_assess_logs') || '[]'); } catch {}
           existingLogs.unshift(logLine);
           if (existingLogs.length > 50) existingLogs = existingLogs.slice(0, 50);
-          localStorage.setItem('change_assess_logs', JSON.stringify(existingLogs));
+          appStorage.setItem('change_assess_logs', JSON.stringify(existingLogs));
           
           // Save result data
-          localStorage.setItem('last_change_assess_result', JSON.stringify(data, null, 2));
+          appStorage.setItem('last_change_assess_result', JSON.stringify(data, null, 2));
           // Save raw input data so it shows up exactly in SettingsPage
-          localStorage.setItem('last_change_assess_raw_input', JSON.stringify(requestBody, null, 2));
+          appStorage.setItem('last_change_assess_raw_input', JSON.stringify(requestBody, null, 2));
           
           // We also need to save the formatted requestInput (system + user prompt)
           const systemPromptStr = '你是一个剧本版本意图判定助手。请仔细对比 before_snippet 和 after_snippet 评估修改级别(trivial/scene_edit/structural)。关键要求：summary 必须极其具体地说明改了什么内容。根据实际动作选择最贴切的句式，例如：删除操作用“删除了[某某剧情/词语]”；新增操作用“新增了[某某剧情/词语]”；替换操作用“将[原内容]改为[新内容]”。不要写“改台词”等模糊废话，也不要生硬套用替换句式。限制在15字以内。必须输出 JSON：{"scale":"trivial"|"scene_edit"|"structural", "summary":string}';
           const requestInputStr = `[SYSTEM]\n${systemPromptStr}\n\n[USER]\n${JSON.stringify(requestBody, null, 2)}`;
-          localStorage.setItem('last_change_assess_request', requestInputStr);
+          appStorage.setItem('last_change_assess_request', requestInputStr);
         } catch (e) {}
 
         const statusText = data.scale === 'trivial' ? '已保存 (微调)' : (data.scale === 'scene_edit' ? `${scene}已暂存: ${data.summary}` : `里程碑更新: ${data.summary}`);
@@ -1023,7 +1024,7 @@ export function ProjectScriptBible({
                globalOrderSnapshot: globalOrderSnapshot,
                scriptText: val // Keep fallback
              }, ...prev].slice(0, 50);
-             try { localStorage.setItem(`script_versions_${currentProject.id}`, JSON.stringify(newVersions)); } catch {}
+             try { appStorage.setItem(`script_versions_${currentProject.id}`, JSON.stringify(newVersions)); } catch {}
              return newVersions;
            });
       } else {
@@ -1885,7 +1886,7 @@ export function ProjectScriptBible({
                                                             globalOrderSnapshot: ['全局'],
                                                             scriptText: targetText
                                                         }, ...prev].slice(0, 50);
-                                                        try { localStorage.setItem(`script_versions_${currentProject.id}`, JSON.stringify(newVersions)); } catch {}
+                                                        try { appStorage.setItem(`script_versions_${currentProject.id}`, JSON.stringify(newVersions)); } catch {}
                                                         return newVersions;
                                                     });
                                                 }}
