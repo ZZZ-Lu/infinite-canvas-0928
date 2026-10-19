@@ -1942,7 +1942,7 @@ ${effectiveRequirement}
         middlewareMode: true,
         hmr: false,
         ws: false,
-        watch: { ignored: ['**/.data/**', '**/dist/**'] },
+        watch: null,
       },
       appType: "spa",
     });

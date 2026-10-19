@@ -1,0 +1,12 @@
+const fs=require('node:fs'),vm=require('node:vm'),ts=require('typescript'),assert=require('node:assert/strict');
+const context={exports:{},require:()=>({NANO_LOD_THRESHOLD:.4})};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/utils/lodHandoff.ts','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS}}).outputText,context);
+const ready=context.exports.canRetireDomForNano;
+const low={scale:.3,tx:10,ty:700};
+assert.equal(ready(low,{...low}),true);
+assert.equal(ready(low,{...low,scale:.5}),false);
+assert.equal(ready({...low,scale:.5},low),false);
+assert.equal(ready(low,{...low,ty:701}),false);
+assert.equal(ready(low,{...low,tx:11}),false);
+assert.equal(ready({...low,scale:.4},{...low,scale:.4}),false);
+console.log('PASS: only current completed Nano frame retires DOM; stale zoom, pan and standard-boundary frames rejected');

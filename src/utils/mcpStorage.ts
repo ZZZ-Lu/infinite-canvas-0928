@@ -18,7 +18,7 @@ export interface McpKeyItem {
 }
 
 const DB_NAME = 'mira_mcp_config_db';
-const DB_VERSION = 10;
+const DB_VERSION = 20;
 const STORE_NAME = 'mcp_keys';
 const DEFAULT_SERVER_URL = 'https://workrally.qq.com/zenstudio/api/mcp';
 
@@ -52,56 +52,29 @@ function openDB(): Promise<IDBDatabase> {
       return reject(new Error('IndexedDB not supported in current environment'));
     }
 
-    const tryOpen = (version?: number) => {
-      const request = version ? indexedDB.open(DB_NAME, version) : indexedDB.open(DB_NAME);
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
 
-      request.onupgradeneeded = (event) => {
-        const db = (event.target as IDBOpenDBRequest).result;
-        if (!db.objectStoreNames.contains(STORE_NAME)) {
-          const store = db.createObjectStore(STORE_NAME, { keyPath: 'id' });
-          store.createIndex('isActive', 'isActive', { unique: false });
-          store.createIndex('createdAt', 'createdAt', { unique: false });
-        }
-      };
-
-      request.onsuccess = (event) => {
-        dbInstance = (event.target as IDBOpenDBRequest).result;
-        dbInstance.onversionchange = () => {
-          dbInstance?.close();
-          dbInstance = null;
-        };
-        resolve(dbInstance);
-      };
-
-      request.onerror = () => {
-        const err = request.error;
-        if (err && err.name === 'VersionError' && version) {
-          console.warn(`Version error opening ${DB_NAME} at version ${version}. Attempting fallback...`);
-          const fallbackReq = indexedDB.open(DB_NAME);
-          fallbackReq.onsuccess = (ev) => {
-            const db = (ev.target as IDBOpenDBRequest).result;
-            if (db.objectStoreNames.contains(STORE_NAME)) {
-              dbInstance = db;
-              dbInstance.onversionchange = () => {
-                dbInstance?.close();
-                dbInstance = null;
-              };
-              resolve(dbInstance);
-            } else {
-              db.close();
-              const deleteReq = indexedDB.deleteDatabase(DB_NAME);
-              deleteReq.onsuccess = () => tryOpen(DB_VERSION);
-              deleteReq.onerror = () => reject(err || new Error('Failed to open MCP IndexedDB'));
-            }
-          };
-          fallbackReq.onerror = () => reject(err || new Error('Failed to open MCP IndexedDB'));
-          return;
-        }
-        reject(err || new Error('Failed to open MCP IndexedDB'));
-      };
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        const store = db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+        store.createIndex('isActive', 'isActive', { unique: false });
+        store.createIndex('createdAt', 'createdAt', { unique: false });
+      }
     };
 
-    tryOpen(DB_VERSION);
+    request.onsuccess = (event) => {
+      dbInstance = (event.target as IDBOpenDBRequest).result;
+      dbInstance.onversionchange = () => {
+        dbInstance?.close();
+        dbInstance = null;
+      };
+      resolve(dbInstance);
+    };
+
+    request.onerror = () => {
+      reject(request.error || new Error('Failed to open MCP IndexedDB'));
+    };
   });
 }
 

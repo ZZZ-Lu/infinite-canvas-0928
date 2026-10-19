@@ -1,67 +1,53 @@
-/**
- * Utility functions for drawing card outlines, borders, and icons on Canvas for Nano/Micro LOD rendering.
- */
-
-export function isStandardCardLod(scale: number): boolean {
-  return scale >= 0.22;
+// Shared by native card CSS and the loading canvas. Values are world pixels.
+export const NANO_LOD_THRESHOLD = 0.40;
+export const CARD_CORNER_RADIUS = 20;
+export const CARD_PANEL_WIDTH = 480;
+export const cardCornerStyle = { '--card-corner-radius': `${CARD_CORNER_RADIUS}px` };
+export const isStandardCardLod = (scale: number) => scale >= NANO_LOD_THRESHOLD;
+export const EMPTY_CARD_PATHS = [
+  'M8.5 2C8.8 4.5 10.5 6.2 13 6.5C10.5 6.8 8.8 8.5 8.5 11C8.2 8.5 6.5 6.8 4 6.5C6.5 6.2 8.2 4.5 8.5 2Z',
+  'M15.5 10L22 20H9L15.5 10Z',
+  'M8.5 13L13 20H4L8.5 13Z',
+];
+let emptyPaths: Path2D[] | undefined;
+export function drawEmptyCardIcon(ctx: CanvasRenderingContext2D, x: number, y: number, dark: boolean) {
+  emptyPaths ||= EMPTY_CARD_PATHS.map(path => new Path2D(path));
+  ctx.save(); ctx.translate(x - 24, y - 24); ctx.scale(2, 2);
+  ctx.fillStyle = dark ? '#525252' : '#d1d5db';
+  emptyPaths.forEach(path => ctx.fill(path));
+  ctx.restore();
 }
 
-export function cardOutline(
-  width: number,
-  height: number,
-  rounded = true,
-  _squircleSupported = false
-): Path2D {
+// CSS corner-shape:squircle is superellipse(2), i.e. exponent 4.
+// Cache normalized paths: camera transforms never rebuild geometry.
+const paths = new Map<string, Path2D>();
+export function cardOutline(width: number, height: number, standard: boolean, squircle = true): Path2D {
+  const key = `${width}:${height}:${standard}:${squircle}`;
+  const cached = paths.get(key);
+  if (cached) return cached;
   const path = new Path2D();
-  if (!rounded) {
-    path.rect(0, 0, width, height);
-    return path;
+  const r = Math.min(CARD_CORNER_RADIUS, width / 2, height / 2);
+  if (!standard) path.rect(0, 0, width, height);
+  else if (!squircle) path.roundRect(0, 0, width, height, r);
+  else {
+    path.moveTo(r, 0);
+    for (let corner = 0; corner < 4; corner++) {
+      const cx = corner === 0 || corner === 1 ? width - r : r;
+      const cy = corner === 0 || corner === 3 ? r : height - r;
+      for (let step = 0; step <= 16; step++) {
+        const angle = -Math.PI / 2 + corner * Math.PI / 2 + step * Math.PI / 32;
+        const cos = Math.cos(angle), sin = Math.sin(angle);
+        path.lineTo(cx + r * Math.sign(cos) * Math.sqrt(Math.abs(cos)), cy + r * Math.sign(sin) * Math.sqrt(Math.abs(sin)));
+      }
+    }
+    path.closePath();
   }
-  const radius = Math.min(16, width / 2, height / 2);
-  path.moveTo(radius, 0);
-  path.lineTo(width - radius, 0);
-  path.arcTo(width, 0, width, radius, radius);
-  path.lineTo(width, height - radius);
-  path.arcTo(width, height, width - radius, height, radius);
-  path.lineTo(radius, height);
-  path.arcTo(0, height, 0, height - radius, radius);
-  path.lineTo(0, radius);
-  path.arcTo(0, 0, radius, 0, radius);
-  path.closePath();
+  if (paths.size >= 128) paths.delete(paths.keys().next().value!);
+  paths.set(key, path);
   return path;
 }
 
-export function strokeCardOutline(
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  width: number,
-  height: number,
-  standard = true,
-  _squircleSupported = false
-): void {
-  ctx.save();
-  const radius = standard ? Math.min(16, width / 2, height / 2) : 4;
-  ctx.beginPath();
-  if (ctx.roundRect) {
-    ctx.roundRect(x, y, width, height, radius);
-  } else {
-    ctx.rect(x, y, width, height);
-  }
-  ctx.stroke();
-  ctx.restore();
-}
-
-export function drawEmptyCardIcon(
-  ctx: CanvasRenderingContext2D,
-  cx: number,
-  cy: number,
-  dark = false
-): void {
-  ctx.save();
-  ctx.fillStyle = dark ? 'rgba(255, 255, 255, 0.25)' : 'rgba(0, 0, 0, 0.2)';
-  ctx.beginPath();
-  ctx.arc(cx, cy, 12, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
+export function strokeCardOutline(ctx: CanvasRenderingContext2D, x: number, y: number, width: number, height: number, standard: boolean, squircle: boolean) {
+  if (!standard) { ctx.strokeRect(x, y, width, height); return; }
+  ctx.save(); ctx.translate(x, y); ctx.stroke(cardOutline(width, height, standard, squircle)); ctx.restore();
 }

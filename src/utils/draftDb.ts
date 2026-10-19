@@ -1,40 +1,16 @@
-const DB_NAME = 'MiraDraftsDb';
-const STORE_NAME = 'drafts';
-const DB_VERSION = 10;
+const DB_NAME = "MiraDraftsDb";
+const STORE_NAME = "drafts";
+const DB_VERSION = 20;
 
 export function initDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    if (typeof indexedDB === 'undefined') {
-      reject(new Error('IndexedDB is not supported in this environment'));
+    if (typeof indexedDB === "undefined") {
+      reject(new Error("IndexedDB is not supported in this environment"));
       return;
     }
 
     const tryOpen = (version?: number) => {
       const request = version ? indexedDB.open(DB_NAME, version) : indexedDB.open(DB_NAME);
-
-      request.onerror = () => {
-        const err = request.error;
-        if (err && err.name === 'VersionError' && version) {
-          console.warn(`Version error opening ${DB_NAME} at version ${version}. Attempting fallback...`);
-          const fallbackReq = indexedDB.open(DB_NAME);
-          fallbackReq.onsuccess = () => {
-            const db = fallbackReq.result;
-            if (db.objectStoreNames.contains(STORE_NAME)) {
-              resolve(db);
-            } else {
-              db.close();
-              const deleteReq = indexedDB.deleteDatabase(DB_NAME);
-              deleteReq.onsuccess = () => tryOpen(DB_VERSION);
-              deleteReq.onerror = () => reject(err);
-            }
-          };
-          fallbackReq.onerror = () => reject(err);
-          return;
-        }
-        reject(err);
-      };
-
-      request.onsuccess = () => resolve(request.result);
 
       request.onupgradeneeded = () => {
         const db = request.result;
@@ -42,9 +18,32 @@ export function initDb(): Promise<IDBDatabase> {
           db.createObjectStore(STORE_NAME);
         }
       };
+
+      request.onsuccess = () => {
+        const db = request.result;
+        if (db.objectStoreNames.contains(STORE_NAME)) {
+          resolve(db);
+        } else {
+          const nextVer = (db.version || 1) + 1;
+          db.close();
+          tryOpen(nextVer);
+        }
+      };
+
+      request.onerror = () => {
+        const err = request.error;
+        if (err && (err.name === "VersionError" || err.message?.includes("version"))) {
+          console.warn("Version error opening " + DB_NAME + ", recreating database...");
+          const delReq = indexedDB.deleteDatabase(DB_NAME);
+          delReq.onsuccess = () => tryOpen(DB_VERSION);
+          delReq.onerror = () => reject(err);
+        } else {
+          reject(err);
+        }
+      };
     };
 
-    tryOpen(DB_VERSION);
+    tryOpen();
   });
 }
 
@@ -52,7 +51,7 @@ export async function getDrafts(): Promise<Record<string, string>> {
   try {
     const db = await initDb();
     return new Promise((resolve, reject) => {
-      const transaction = db.transaction(STORE_NAME, 'readonly');
+      const transaction = db.transaction(STORE_NAME, "readonly");
       const store = transaction.objectStore(STORE_NAME);
       const request = store.openCursor();
       const result: Record<string, string> = {};
@@ -70,7 +69,7 @@ export async function getDrafts(): Promise<Record<string, string>> {
       request.onerror = () => reject(request.error);
     });
   } catch (err) {
-    console.error('Failed to get drafts from IndexedDB:', err);
+    console.error("Failed to get drafts from IndexedDB:", err);
     return {};
   }
 }
@@ -79,7 +78,7 @@ export async function saveDraft(targetId: string, text: string): Promise<void> {
   try {
     const db = await initDb();
     return new Promise((resolve, reject) => {
-      const transaction = db.transaction(STORE_NAME, 'readwrite');
+      const transaction = db.transaction(STORE_NAME, "readwrite");
       const store = transaction.objectStore(STORE_NAME);
       const request = store.put(text, targetId);
 
@@ -95,7 +94,7 @@ export async function deleteDraft(targetId: string): Promise<void> {
   try {
     const db = await initDb();
     return new Promise((resolve, reject) => {
-      const transaction = db.transaction(STORE_NAME, 'readwrite');
+      const transaction = db.transaction(STORE_NAME, "readwrite");
       const store = transaction.objectStore(STORE_NAME);
       const request = store.delete(targetId);
 

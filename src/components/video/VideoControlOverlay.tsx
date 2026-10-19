@@ -1,5 +1,6 @@
-import React from 'react';
-import { Play, Pause } from 'lucide-react';
+import React from "react";
+import { Pause } from "lucide-react";
+import { calculateVideoPlayButtonDimensions, PLAY_BUTTON_SVG_PATH } from "../../utils/videoPlayButton";
 
 interface VideoControlOverlayProps {
   isPlaying: boolean;
@@ -25,16 +26,13 @@ export const VideoControlOverlay: React.FC<VideoControlOverlayProps> = ({
   onSeek,
 }) => {
   const formatTime = (seconds: number) => {
-    if (isNaN(seconds) || seconds < 0) return '0:00';
+    if (isNaN(seconds) || seconds < 0) return "0:00";
     const mins = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
-    return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+    return `${mins}:${secs < 10 ? "0" : ""}${secs}`;
   };
 
-  const narrowerSide = Math.min(width, height);
-  const playButtonDiameter = narrowerSide / 2;
-  const playButtonIconSize = playButtonDiameter * 0.76;
-
+  const { playButtonDiameter, playButtonIconSize } = calculateVideoPlayButtonDimensions(width, height);
   const showControlBar = (isHovered || isPlaying) || savedTime > 0;
 
   return (
@@ -56,7 +54,18 @@ export const VideoControlOverlay: React.FC<VideoControlOverlayProps> = ({
               onTogglePlay(true);
             }}
           >
-            <Play className="text-white/85" style={{ width: playButtonIconSize, height: playButtonIconSize }} />
+            <svg
+              viewBox="0 0 24 24"
+              fill="currentColor"
+              xmlns="http://www.w3.org/2000/svg"
+              className="text-white/85"
+              style={{
+                width: playButtonIconSize,
+                height: playButtonIconSize,
+              }}
+            >
+              <path d={PLAY_BUTTON_SVG_PATH} />
+            </svg>
           </div>
         </div>
       ) : (
@@ -101,10 +110,11 @@ export const VideoControlOverlay: React.FC<VideoControlOverlayProps> = ({
               {isPlaying ? (
                 <Pause className="w-4.5 h-4.5 text-white" />
               ) : (
-                <Play className="w-4.5 h-4.5 text-white" />
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+                  <path d={PLAY_BUTTON_SVG_PATH} />
+                </svg>
               )}
             </button>
-
             {/* Range Slider */}
             <input
               type="range"
@@ -121,7 +131,6 @@ export const VideoControlOverlay: React.FC<VideoControlOverlayProps> = ({
               }}
               className="w-full h-1 bg-transparent rounded-lg appearance-none cursor-pointer accent-blue-500 focus:outline-none [&::-webkit-slider-runnable-track]:bg-white/20 [&::-webkit-slider-runnable-track]:h-1 [&::-webkit-slider-runnable-track]:rounded-lg [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-500 hover:[&::-webkit-slider-thumb]:scale-125 [&::-webkit-slider-thumb]:-translate-y-[4px]"
             />
-
             {/* Time Stamps */}
             <span className="text-[10px] font-mono text-white/90 select-none flex-shrink-0">
               {formatTime(duration > 0 && progress > 0 ? (progress / 100) * duration : savedTime)} / {formatTime(duration)}

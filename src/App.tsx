@@ -5,19 +5,20 @@ import { GenerationCard, CardData, CARD_DIMENSIONS, getCardSize, safeParseJsonRe
 import { WORKRALLY_IMAGE_MODELS, WORKRALLY_IMAGE_TOOL } from './config/workrallyImageModels';
 import { WORKRALLY_VIDEO_MODELS, WORKRALLY_VIDEO_TOOL } from './config/workrallyVideoModels';
 import { NanoLodCanvas } from './components/NanoLodCanvas';
-import { FpsCounter } from './components/FpsCounter';
+import { FpsCounter, showToastNotice } from './components/FpsCounter';
 import { generateImageThumbnail, generateVideoThumbnail, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
 import { fastGetImageDimensions } from './utils/imageHeader';
-import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, LOD_THRESHOLDS, getLodTierByScale, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
+import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
 import { CANVAS_IDLE_MS, scheduleCanvasSurface } from './utils/canvasPerformance';
 import { readyPromptPanels } from './utils/promptSurfaceCache';
 import { createCardMountStore, ProgressiveGenerationCard } from './components/ProgressiveGenerationCard';
+import { canRetireDomForNano, type LodFrame } from './utils/lodHandoff';
 import { buildCardQuadTree, QuadTree, BoundingBox } from './utils/quadTree';
 import { getBottomPanelHeight } from './utils/cardLayout';
 import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
 import { cropBoundingBoxFromImage } from './utils/imageCropper';
 import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp } from 'lucide-react';
-import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces, subscribeCardSaves, hasPendingStorage, retryFailedCardSaves, restoreCardBackup } from './db';
+import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
 import { SettingsPage } from './components/SettingsPage';
 import { getDrafts, saveDraft, deleteDraft } from './utils/draftDb';
 import { McpKeyButton } from './components/McpKeyButton';
@@ -369,7 +370,6 @@ export default function App() {
   const updateCurrentScale = (latestScale: number) => {
     const workspace = document.getElementById('canvas-workspace');
     if (workspace) {
-      workspace.style.setProperty('--current-scale', latestScale.toString());
       if (workspace.getAttribute('data-gesture') === 'true') {
         // A single boundary switch lets the already-active Nano canvas take over,
         // without reconciling/unmounting every editor in the middle of a wheel gesture.
@@ -378,6 +378,8 @@ export default function App() {
           if (useNanoPreview) workspace.setAttribute('data-gesture-low', 'true');
           else workspace.removeAttribute('data-gesture-low');
         }
+      } else {
+        workspace.style.setProperty('--current-scale', latestScale.toString());
       }
     }
   };
@@ -484,6 +486,7 @@ export default function App() {
   const isSpacePressedRef = useRef(false);
   const wheelZoomOutAccumulatorRef = useRef(0);
   const [showOverviewPromptToast, setShowOverviewPromptToast] = useState(false);
+  const [overviewProgress, setOverviewProgress] = useState(0);
   const overviewProgressBarRef = useRef<HTMLDivElement | null>(null);
   const overviewToastTimerRef = useRef<NodeJS.Timeout | null>(null);
   const resetOverviewPromptRef = useRef<() => void>(() => {});
@@ -519,15 +522,16 @@ export default function App() {
   }, [isDarkMode]);
 
   // Projects & Script Bible State
-  const directoryErrorRef = useRef<string | null>(null);
   const [projects, setProjects] = useState<ScriptProject[]>(() => {
     if (typeof window !== 'undefined') {
       const saved = localStorage.getItem('script_projects');
       if (saved) {
         try {
           const parsed = JSON.parse(saved);
-          if (!Array.isArray(parsed) || !parsed.length || parsed.some(p => !p || typeof p.id !== 'string')) throw new Error('项目目录格式无效，已保留原始内容并停止覆盖。');
-          const filtered = parsed;
+          // Filter out legacy sample project if present
+          const filtered = Array.isArray(parsed) 
+            ? parsed.filter((p: ScriptProject) => p && p.id !== 'proj_blackstone_night' && p.name !== '黑石之夜')
+            : [];
           if (filtered.length > 0) {
             return filtered.map((p: Partial<ScriptProject>) => ({
               ...DEFAULT_PROJECT,
@@ -542,7 +546,6 @@ export default function App() {
           }
         } catch (e) {
           console.error('Failed to parse saved projects', e);
-          directoryErrorRef.current = '项目目录读取失败，已停止自动保存。';
         }
       }
     }
@@ -552,12 +555,10 @@ export default function App() {
   const [currentProjectId, setCurrentProjectId] = useState<string>(() => {
     if (typeof window !== 'undefined') {
       const savedId = localStorage.getItem('current_project_id');
-      if (savedId && projects.some(project => project.id === savedId)) return savedId;
+      if (savedId && savedId !== 'proj_blackstone_night') return savedId;
     }
-    return projects[0]?.id || DEFAULT_PROJECT.id;
+    return DEFAULT_PROJECT.id;
   });
-  const initialWorkspaceRef = useRef(!localStorage.getItem('script_projects'));
-  const initialSaveRef = useRef<Promise<void> | null>(null);
   const rawProject = projects.find(p => p.id === currentProjectId) || projects[0] || DEFAULT_PROJECT;
   const currentProject = useMemo<ScriptProject>(() => ({
     ...DEFAULT_PROJECT,
@@ -680,10 +681,7 @@ export default function App() {
 
   // Sync projects to localStorage
   useEffect(() => {
-    if (!initialWorkspaceRef.current && !directoryErrorRef.current) {
-      try { localStorage.setItem('script_projects', JSON.stringify(projects)); }
-      catch (error) { setStorageError('项目目录保存失败：' + String(error)); }
-    }
+    localStorage.setItem('script_projects', JSON.stringify(projects));
   }, [projects]);
 
   useEffect(() => {
@@ -900,8 +898,6 @@ export default function App() {
       if (drafts) {
         setCardDrafts(drafts);
       }
-    }).catch(err => {
-      console.warn('Could not load drafts from IndexedDB:', err);
     });
   }, []);
 
@@ -1043,17 +1039,6 @@ export default function App() {
 
   // State for Cards & History
   const [isLoading, setIsLoading] = useState(true);
-  const [storageError, setStorageError] = useState<string | null>(directoryErrorRef.current);
-  const [storageReload, setStorageReload] = useState(0);
-  const loadedCardsSnapshotRef = useRef<CardData[] | null>(null);
-  const savedCardsSnapshotRef = useRef<CardData[] | null>(null);
-  useEffect(() => subscribeCardSaves(event => {
-    if (event.state === 'error') setStorageError('项目保存失败，请勿关闭页面：' + event.error);
-    else if (event.projectId === currentProjectId) {
-      savedCardsSnapshotRef.current = event.cards || null;
-      setStorageError(previous => previous?.startsWith('项目读取失败') || previous?.startsWith('项目目录') ? previous : null);
-    }
-  }), [currentProjectId]);
   const [history, setHistory] = useState<{ past: CardData[][], present: CardData[], future: CardData[][] }>({
     past: [],
     present: [],
@@ -1397,6 +1382,10 @@ export default function App() {
     initialCards: { id: string; x: number; y: number }[];
   } | null>(null);
   const loadedProjectIdRef = useRef<string | null>(null);
+  const currentProjectIdRef = useRef(currentProjectId);
+  useEffect(() => {
+    currentProjectIdRef.current = currentProjectId;
+  }, [currentProjectId]);
   const recoveringTaskIdsRef = useRef(new Set<string>());
 
   // 🎯 Serialized Card Inspection Queue: ensures agent reviews multiple completed cards one by one
@@ -2335,8 +2324,6 @@ export default function App() {
         res: '2K',
         prompt: `${sourceLabel} ${isVideo ? 'video' : 'image'}: ${file.name || 'unnamed'}`,
         imageUrl: fileUrl, // Visible on the canvas instantly!
-        fileData: file,
-        trueOriginalFileData: file,
         isVideo: isVideo,
         customWidth: customWidth,
         customHeight: customHeight,
@@ -2597,40 +2584,59 @@ export default function App() {
   }, [tx, ty, tScale, currentProjectId]);
   // -------------------------------------
 
-  const projectTransitionRef = useRef(false);
-  const handleSelectProject = async (projectId: string) => {
-    if (projectId === currentProjectId || projectTransitionRef.current || isLoading) return;
-    projectTransitionRef.current = true;
+  const handleSelectProject = (projectId: string) => {
+    if (projectId === currentProjectId) return;
+    // Save current cards first before switching
+    if (loadedProjectIdRef.current === currentProjectId && !isLoading) {
+      saveCards(cardsRef.current, currentProjectId).catch(console.error);
+    }
+    loadedProjectIdRef.current = null;
     setIsLoading(true);
-    try {
-      if (loadedProjectIdRef.current === currentProjectId && cardsRef.current !== loadedCardsSnapshotRef.current) await saveCards(cardsRef.current, currentProjectId);
-      loadedProjectIdRef.current = null;
-      setCurrentProjectId(projectId);
-    } catch (error) { setStorageError('当前项目未保存成功，已停止切换。'); setIsLoading(false); }
-    finally { projectTransitionRef.current = false; }
+    setCurrentProjectId(projectId);
   };
 
   const handleCreateProject = async (name: string) => {
-    if (projectTransitionRef.current || isLoading) return;
-    projectTransitionRef.current = true;
+    // Save current project's cards first
+    if (loadedProjectIdRef.current === currentProjectId && !isLoading) {
+      await saveCards(cardsRef.current, currentProjectId).catch(console.error);
+    }
+    loadedProjectIdRef.current = null;
     setIsLoading(true);
-    try {
-      if (loadedProjectIdRef.current === currentProjectId && cardsRef.current !== loadedCardsSnapshotRef.current) await saveCards(cardsRef.current, currentProjectId);
-      const newId = 'proj_' + crypto.randomUUID();
-      const newProj: ScriptProject = { ...DEFAULT_PROJECT, id: newId, name, logline: '', createdAt: Date.now(), updatedAt: Date.now(), characters: [], locations: [], props: [], scenes: [], scriptText: '' };
-      await saveCards([{ id: 'card_' + crypto.randomUUID(), x: 360, y: 120, state: 'draft', ratio: '3:4', res: '2K', prompt: '', imageUrl: null }], newId);
-      const next = [newProj, ...projects];
-      localStorage.setItem('script_projects', JSON.stringify(next));
-      loadedProjectIdRef.current = null;
-      setProjects(next);
-      setCurrentProjectId(newId);
-    } catch (error) { setStorageError('新项目保存失败，已保留当前项目。'); setIsLoading(false); }
-    finally { projectTransitionRef.current = false; }
+
+    const newId = `proj_${Date.now()}`;
+    const newProj: ScriptProject = {
+      ...DEFAULT_PROJECT,
+      id: newId,
+      name,
+      logline: '',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      characters: [],
+      locations: [],
+      props: [],
+      scriptText: ''
+    };
+
+    // Create a pristine initial card for the new project
+    const initialNewCards: CardData[] = [{
+      id: `card_${Date.now()}_1`,
+      x: 360,
+      y: 120,
+      state: 'draft',
+      ratio: '3:4',
+      res: '2K',
+      prompt: '',
+      imageUrl: null
+    }];
+    await saveCards(initialNewCards, newId).catch(console.error);
+
+    setProjects(prev => [newProj, ...prev]);
+    setCurrentProjectId(newId);
   };
 
   const handleDeleteProject = async (projectId: string) => {
     if (projects.length <= 1) return;
-    try { await deleteCardsForProject(projectId); } catch { setStorageError('项目删除失败，已保留原项目。'); return; }
+    await deleteCardsForProject(projectId).catch(console.error);
     setProjects(prev => {
       const remaining = prev.filter(p => p.id !== projectId);
       if (currentProjectId === projectId) {
@@ -2647,25 +2653,19 @@ export default function App() {
     let mounted = true;
     const fetchProjectCards = async () => {
       setIsLoading(true);
-      setStorageError(null);
-      loadedProjectIdRef.current = null;
-      void requestPersistence();
+      await requestPersistence();
       
       // Artificial delay to allow the Gaussian blur mask to fade in smoothly
       // and hide the jump cut, especially on smaller projects.
       await sleep(250);
-      if (!mounted) return;
 
       try {
-        if (directoryErrorRef.current) throw new Error(directoryErrorRef.current);
         const saved = await loadCards(currentProjectId);
         if (!mounted) return;
         
-        if (saved !== null) {
-          if (initialWorkspaceRef.current) { localStorage.setItem('script_projects', JSON.stringify(projects)); initialWorkspaceRef.current = false; }
+        if (saved && saved.length > 0) {
           const processedSaved = saved.map(card => {
             const updates: any = {};
-            if (card.state === 'generating' && !card.mcpTaskId && card.fileName && card.fileData instanceof Blob) updates.state = 'completed';
             if (card.generationError) {
               const start = card.generationError.indexOf('{');
               const end = card.generationError.indexOf('}', start + 1);
@@ -2739,8 +2739,6 @@ export default function App() {
               ...updates
             };
           });
-          loadedCardsSnapshotRef.current = processedSaved;
-          savedCardsSnapshotRef.current = processedSaved;
           setHistory({ past: [], present: processedSaved, future: [] });
           loadedProjectIdRef.current = currentProjectId;
 
@@ -2886,32 +2884,26 @@ export default function App() {
                 ...updates
               };
             });
-            await saveCards(processedFallback, currentProjectId);
-            loadedCardsSnapshotRef.current = processedFallback;
-            savedCardsSnapshotRef.current = processedFallback;
             setHistory({ past: [], present: processedFallback, future: [] });
-          } else if (initialWorkspaceRef.current && currentProjectId === DEFAULT_PROJECT.id) {
-            if (!initialSaveRef.current) {
-              const initialCards: CardData[] = [{ id: 'card_' + crypto.randomUUID(), x: 360, y: 120, state: 'draft', ratio: '3:4', res: '2K', prompt: '', imageUrl: null }];
-              initialSaveRef.current = saveCards(initialCards, currentProjectId).catch(error => { initialSaveRef.current = null; throw error; });
-            }
-            await initialSaveRef.current;
-            const initialCards = await loadCards(currentProjectId);
-            if (!mounted) return;
-            if (!initialCards) throw new Error('初始项目保存后读取失败');
-            localStorage.setItem('script_projects', JSON.stringify(projects));
-            initialWorkspaceRef.current = false;
-            loadedCardsSnapshotRef.current = initialCards;
-            savedCardsSnapshotRef.current = initialCards;
-            setHistory({ past: [], present: initialCards, future: [] });
+            await saveCards(processedFallback, currentProjectId).catch(console.error);
           } else {
-            throw new Error('已有项目的卡片数据缺失，已停止自动初始化和覆盖。');
+            const initialCards: CardData[] = [{
+              id: `card_${Date.now()}_1`,
+              x: 360,
+              y: 120,
+              state: 'draft',
+              ratio: '3:4',
+              res: '2K',
+              prompt: '',
+              imageUrl: null
+            }];
+            setHistory({ past: [], present: initialCards, future: [] });
+            await saveCards(initialCards, currentProjectId).catch(console.error);
           }
           loadedProjectIdRef.current = currentProjectId;
         }
       } catch (e) {
         console.error('Failed to load project cards from DB:', e);
-        if (mounted) setStorageError('项目读取失败，已停止自动保存：' + (e instanceof Error ? e.message : String(e)));
       } finally {
         if (mounted) {
           setIsLoading(false);
@@ -2921,40 +2913,59 @@ export default function App() {
     };
     fetchProjectCards();
     return () => { mounted = false; };
-  }, [currentProjectId, storageReload]);
+  }, [currentProjectId]);
 
-  // A save owns both its project and snapshot; cleanup cancels every scheduler.
-  const saveDeadlineRef = useRef<{ project: string; at: number } | null>(null);
+  // Save cards to IndexedDB for current project ONLY when cards belong to current project (debounced & idle-scheduled)
+  const saveCardsTimerRef = useRef<NodeJS.Timeout | null>(null);
   useEffect(() => {
-    if (isLoading || loadedProjectIdRef.current !== currentProjectId || cards === loadedCardsSnapshotRef.current) return;
-    loadedCardsSnapshotRef.current = null;
-    const snapshot = cards, projectId = currentProjectId;
-    if (saveDeadlineRef.current?.project !== projectId) saveDeadlineRef.current = { project: projectId, at: Date.now() };
-    const deadline = saveDeadlineRef.current.at;
-    let cancelled = false;
-    const timer = setTimeout(() => {
-      if (cancelled || loadedProjectIdRef.current !== projectId) return;
-      saveDeadlineRef.current = null;
-      saveCards(snapshot, projectId).catch(console.error);
-    }, cards.some(card => card.state === 'generating' && card.fileData instanceof Blob) ? 0 : Math.min(500, Math.max(0, 2000 - (Date.now() - deadline))));
-    return () => { cancelled = true; clearTimeout(timer); };
+    if (!isLoading && currentProjectId && loadedProjectIdRef.current === currentProjectId) {
+      if (saveCardsTimerRef.current) {
+        clearTimeout(saveCardsTimerRef.current);
+      }
+      saveCardsTimerRef.current = setTimeout(() => {
+        const doSave = async () => {
+          if (isUserPointerDownRef.current || (window as any).isDraggingCard || isDraggingCanvasRef.current) {
+            // Postpone save if user is actively interacting with the canvas/cards
+            saveCardsTimerRef.current = setTimeout(doSave, 1500);
+            return;
+          }
+          try {
+            showToastNotice("正在保存...", { id: "save-status", dotColor: "bg-blue-500 animate-pulse", duration: 0 });
+            await saveCards(cardsRef.current, currentProjectId);
+            showToastNotice("已保存", { id: "save-status", dotColor: "bg-emerald-500", duration: 2000 });
+          } catch (err) {
+            console.error(err);
+            showToastNotice("保存失败", { id: "save-status", dotColor: "bg-red-500", duration: 3000 });
+          }
+        };
+
+        if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
+          (window as any).requestIdleCallback(doSave, { timeout: 3000 });
+        } else {
+          doSave();
+        }
+      }, 1500);
+
+      return () => {
+        if (saveCardsTimerRef.current) {
+          clearTimeout(saveCardsTimerRef.current);
+        }
+      };
+    }
   }, [cards, isLoading, currentProjectId]);
 
-  // Best effort only; commit during normal editing rather than relying on unload.
+  // Synchronous flush on page reload or close to prevent in-flight video playback state from being lost
   useEffect(() => {
-    const flush = () => {
-      if (loadedProjectIdRef.current === currentProjectId && cardsRef.current !== savedCardsSnapshotRef.current) saveCards(cardsRef.current, currentProjectId).catch(console.error);
+    const handleBeforeUnload = () => {
+      if (currentProjectId && loadedProjectIdRef.current === currentProjectId && cardsRef.current.length > 0) {
+        saveCards(cardsRef.current, currentProjectId).catch(() => {});
+      }
     };
-    const beforeUnload = (event: BeforeUnloadEvent) => {
-      const edited = loadedProjectIdRef.current === currentProjectId && cardsRef.current !== savedCardsSnapshotRef.current;
-      flush();
-      if (edited || hasPendingStorage() || storageError) { event.preventDefault(); event.returnValue = ''; }
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
     };
-    const visibility = () => { if (document.visibilityState === 'hidden') flush(); };
-    window.addEventListener('beforeunload', beforeUnload);
-    document.addEventListener('visibilitychange', visibility);
-    return () => { window.removeEventListener('beforeunload', beforeUnload); document.removeEventListener('visibilitychange', visibility); };
-  }, [currentProjectId, storageError]);
+  }, [currentProjectId]);
 
   const handleUpdateCard = useCallback((id: string, updates: Partial<CardData>, isSignificant = false) => {
     if (typeof updates.currentTime === 'number' && updates.currentTime > 0) {
@@ -3629,21 +3640,18 @@ export default function App() {
     };
   }, [tx, ty, tScale, updateCircularCulling]);
 
-  // Micro-LOD state tracking (0.40 <= scale < 0.70)
-  const [isMicroLod, setIsMicroLod] = useState(() => {
-    const s = tScale.get();
-    return s >= LOD_THRESHOLDS.NANO && s < LOD_THRESHOLDS.MICRO;
-  });
-  // Nano-LOD state tracking (scale < 0.40)
-  const [isNanoLod, setIsNanoLod] = useState(() => tScale.get() < LOD_THRESHOLDS.NANO);
+  // Micro-LOD state tracking (scale < dynamic threshold)
+  const [isMicroLod, setIsMicroLod] = useState(() => tScale.get() < getNanoLodThreshold());
+  // Nano-LOD state tracking (scale < dynamic threshold)
+  const [isNanoLod, setIsNanoLod] = useState(() => tScale.get() < getNanoLodThreshold());
   // Extended Nano-LOD state to act as a backend backdrop during DOM card fade-in
-  const [isNanoCanvasActive, setIsNanoCanvasActive] = useState(() => tScale.get() < LOD_THRESHOLDS.NANO);
+  const [isNanoCanvasActive, setIsNanoCanvasActive] = useState(() => tScale.get() < getNanoLodThreshold());
   // Extended DOM card state to act as a frontend backdrop while Canvas prepares to render
-  const [isDomCardsActive, setIsDomCardsActive] = useState(() => tScale.get() >= LOD_THRESHOLDS.NANO);
+  const [isDomCardsActive, setIsDomCardsActive] = useState(() => tScale.get() >= getNanoLodThreshold());
 
   // Track LOD switch from Low -> Standard to animate text labels fade-in
   const [isLodFading, setIsLodFading] = useState(false);
-  const wasMicroLodRef = useRef(tScale.get() < LOD_THRESHOLDS.MICRO);
+  const wasMicroLodRef = useRef(tScale.get() < getNanoLodThreshold());
   const lodFadeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const triggerLodFadeIn = useCallback(() => {
@@ -3667,11 +3675,11 @@ export default function App() {
     if (ws) ws.removeAttribute('data-lod-fade');
   }, []);
 
-  const handleNanoCanvasReady = useCallback(() => {
-    if (isNanoLod) {
+  const handleNanoCanvasReady = useCallback((frame: LodFrame) => {
+    if (isNanoLod && canRetireDomForNano(frame, { scale: tScale.get(), tx: tx.get(), ty: ty.get() })) {
       setIsDomCardsActive(false);
     }
-  }, [isNanoLod]);
+  }, [isNanoLod, tScale, tx, ty]);
 
   useEffect(() => {
     if (isNanoLod) {
@@ -3691,19 +3699,18 @@ export default function App() {
       if (isZoomingRef.current || isDraggingCanvasRef.current) {
         return;
       }
-      const tier = getLodTierByScale(s);
-      const isMicro = tier === 'micro';
-      const isNano = tier === 'nano';
-      const isSubStandard = s < LOD_THRESHOLDS.MICRO;
+      const threshold = getNanoLodThreshold();
+      const isMicro = s < threshold;
+      const isNano = s < threshold;
       
-      if (wasMicroLodRef.current && !isSubStandard) {
+      if (wasMicroLodRef.current && !isMicro) {
         // Switched from Micro/Nano to Standard LOD: trigger smooth fade-in
         triggerLodFadeIn();
-      } else if (!wasMicroLodRef.current && isSubStandard) {
+      } else if (!wasMicroLodRef.current && isMicro) {
         // Switched from Standard to Micro/Nano LOD: immediately cancel fade and hide tags
         cancelLodFade();
       }
-      wasMicroLodRef.current = isSubStandard;
+      wasMicroLodRef.current = isMicro;
 
       setIsMicroLod(isMicro);
       setIsNanoLod(isNano);
@@ -3854,6 +3861,24 @@ export default function App() {
             }, 250); // Natural 250ms hold threshold
           }
         }
+      }
+
+      // Global Ctrl+S / Cmd+S manual save shortcut
+      if ((e.ctrlKey || e.metaKey) && (e.code === 'KeyS' || e.key.toLowerCase() === 's')) {
+        e.preventDefault();
+        const pid = currentProjectIdRef.current;
+        if (pid) {
+          showToastNotice("正在保存...", { id: "save-status", dotColor: "bg-blue-500 animate-pulse", duration: 0 });
+          saveCards(cardsRef.current, pid)
+            .then(() => {
+              showToastNotice("已保存", { id: "save-status", dotColor: "bg-emerald-500", duration: 2000 });
+            })
+            .catch((err) => {
+              console.error(err);
+              showToastNotice("保存失败", { id: "save-status", dotColor: "bg-red-500", duration: 3000 });
+            });
+        }
+        return;
       }
 
       if ((e.ctrlKey || e.metaKey) && !isInputActive) {
@@ -6157,19 +6182,17 @@ export default function App() {
     
     // Restore accurate LOD states now that the user has stopped zooming or dragging
     const currentScale = tScale.get();
-    const tier = getLodTierByScale(currentScale);
-    const isMicro = tier === 'micro';
-    const isNano = tier === 'nano';
-    const isSubStandard = currentScale < LOD_THRESHOLDS.MICRO;
-    if (wasMicroLodRef.current && !isSubStandard) {
+    const threshold = getNanoLodThreshold();
+    const isMicro = currentScale < threshold;
+    if (wasMicroLodRef.current && !isMicro) {
       triggerLodFadeIn();
-    } else if (!wasMicroLodRef.current && isSubStandard) {
+    } else if (!wasMicroLodRef.current && isMicro) {
       cancelLodFade();
     }
-    wasMicroLodRef.current = isSubStandard;
+    wasMicroLodRef.current = isMicro;
 
     setIsMicroLod(isMicro);
-    setIsNanoLod(isNano);
+    setIsNanoLod(isMicro);
     setMountEpoch(n => (n + 1) % 1000000);
     
     if (workspace) {
@@ -6209,6 +6232,7 @@ export default function App() {
       overviewToastTimerRef.current = null;
     }
     setShowOverviewPromptToast(false);
+    setOverviewProgress(0);
     if (overviewProgressBarRef.current) {
       overviewProgressBarRef.current.style.width = '0%';
     }
@@ -6411,6 +6435,7 @@ export default function App() {
       if (!showOverviewPromptToast) {
         setShowOverviewPromptToast(true);
       }
+      setOverviewProgress(progress);
       if (overviewProgressBarRef.current) {
         overviewProgressBarRef.current.style.width = `${progress * 100}%`;
       }
@@ -6591,6 +6616,7 @@ export default function App() {
         if (!showOverviewPromptToast) {
           setShowOverviewPromptToast(true);
         }
+        setOverviewProgress(progress);
         if (overviewProgressBarRef.current) {
           overviewProgressBarRef.current.style.width = `${progress * 100}%`;
         }
@@ -7036,24 +7062,15 @@ export default function App() {
     isQueueProcessingRef.current = false;
   }, []);
 
-  // Exclusive high-LOD focus card ID: single selection OR active canvas picker target
-  const highLodFocusCardId = useMemo(() => {
-    if (pickerSession) return pickerSession.targetCardId;
-    if (selectedCardIds.length === 1) return selectedCardIds[0];
-    return null;
-  }, [pickerSession, selectedCardIds]);
-
   const runCenterOutMountQueue = useCallback(() => {
     if (!isDomCardsActive || isZoomAnimationActiveRef.current) {
       if (!isDomCardsActive) {
         setRenderedCardIds(prev => {
-          const currentTarget = pickerSessionRef.current?.targetCardId || 
-            (selectedCardIdsRef.current.length === 1 ? selectedCardIdsRef.current[0] : null);
-          const allowed = currentTarget ? new Set([currentTarget]) : new Set<string>();
-          if (prev.size === allowed.size && Array.from(prev).every(id => allowed.has(id))) {
+          const selectedSet = new Set(selectedCardIdsRef.current);
+          if (prev.size === selectedSet.size && Array.from(prev).every(id => selectedSet.has(id))) {
             return prev;
           }
-          return allowed;
+          return selectedSet;
         });
       }
       return;
@@ -7164,7 +7181,7 @@ export default function App() {
                 });
               }
               resolve();
-            });
+            }, { label: `mount:${batchToMount[0].id}` });
             abortToken.cancel = () => { cancel(); resolve(); };
           });
         }
@@ -7204,6 +7221,27 @@ export default function App() {
       window.removeEventListener('resume-mount-queue', handleResume);
     };
   }, [abortMountQueue, runCenterOutMountQueue]);
+
+  // Calculated overviewProgress state used
+
+  const topNotices = useMemo(() => {
+    const list: import("./components/FpsCounter").ToastNotice[] = [];
+    if (isOverviewMode) {
+      list.push({
+        id: "overview-hint",
+        text: "鼠标点击任意位置跳转",
+        dotColor: "bg-blue-500 animate-pulse",
+      });
+    } else if (showOverviewPromptToast) {
+      list.push({
+        id: "overview-prompt",
+        text: "继续缩小进入全景视图",
+        dotColor: "bg-blue-500",
+        progress: overviewProgress,
+      });
+    }
+    return list;
+  }, [isOverviewMode, showOverviewPromptToast, overviewProgress]);
 
   return (
     <div 
@@ -7466,8 +7504,8 @@ export default function App() {
         style={{ transformOrigin: '0 0', x: tx, y: ty, scale: tScale }}
       >
 
-        {/* Canvas Items: In Overview mode or Nano-LOD mode (scale < 0.40), unmount all except the single focused high-LOD card */}
-        {!isOverviewMode && (isDomCardsActive ? visibleCards : (highLodFocusCardId ? visibleCards.filter(card => card.id === highLodFocusCardId) : [])).map(card => {
+        {/* Canvas Items: All cards follow the same LOD lifecycle, including selected cards. */}
+        {!isOverviewMode && isDomCardsActive && visibleCards.map(card => {
           const hasImage = Boolean(card.imageUrl || card.originalImageUrl || card.thumbnailUrl);
           const isPickerSelectable = Boolean(pickerSession && card.id !== pickerSession.targetCardId && hasImage);
           const pickerIndex = pickerSession 
@@ -7491,7 +7529,6 @@ export default function App() {
           return (
             <ProgressiveGenerationCard
               mountStore={cardMountStore}
-              isHighLodTarget={highLodFocusCardId === card.id}
               key={card.id}
               data={card}
               scale={tScale}
@@ -8085,60 +8122,9 @@ export default function App() {
         </button>
       </div>
 
-      {storageError && loadedProjectIdRef.current !== currentProjectId && <div className="fixed inset-0 z-[9998] bg-black/30" />}
-      {storageError && <div role="alert" className="fixed top-20 left-1/2 -translate-x-1/2 z-[9999] max-w-xl rounded-xl bg-red-950 text-white px-4 py-3 shadow-lg">
-        {storageError}
-        <button className="ml-3 underline" onClick={() => {
-          if (loadedProjectIdRef.current !== currentProjectId) setStorageReload(value => value + 1);
-          else if (storageError.startsWith('项目目录保存失败')) {
-            try { localStorage.setItem('script_projects', JSON.stringify(projects)); setStorageError(null); }
-            catch (error) { setStorageError('项目目录保存失败：' + String(error)); }
-          } else void retryFailedCardSaves().catch(error => setStorageError('项目保存失败，请勿关闭页面：' + String(error)));
-        }}>{loadedProjectIdRef.current !== currentProjectId ? '重新读取' : '重试保存'}</button>
-        {loadedProjectIdRef.current !== currentProjectId && <button className="ml-3 underline" onClick={() => {
-          void restoreCardBackup(currentProjectId).then(() => setStorageReload(value => value + 1)).catch(error => setStorageError('备份恢复失败：' + String(error)));
-        }}>恢复上次保存</button>}
-      </div>}
-      {/* Toast: Overview Mode Navigation Hint */}
-      <AnimatePresence>
-        {isOverviewMode && (
-          <motion.div
-            initial={{ opacity: 0, y: -20, scale: 0.94 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: -16, scale: 0.94 }}
-            transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
-            className="fixed top-5 left-1/2 -translate-x-1/2 z-[100] pointer-events-none select-none"
-          >
-            <div className="flex items-center gap-2 px-4 py-2 rounded-full bg-white/95 dark:bg-[#252528]/95 backdrop-blur-md border border-neutral-200/90 dark:border-neutral-700/80 shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:shadow-[0_8px_30px_rgb(0,0,0,0.35)] text-xs md:text-sm font-medium text-neutral-800 dark:text-neutral-100">
-              <MousePointerClick className="w-4 h-4 text-blue-500 dark:text-blue-400 shrink-0" />
-              <span className="tracking-wide">鼠标点击任意位置跳转</span>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
-      {/* Toast: Prompt to enter Overview Mode */}
-      <AnimatePresence>
-        {showOverviewPromptToast && !isOverviewMode && (
-          <motion.div
-            initial={{ opacity: 0, y: -20, scale: 0.94 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: -16, scale: 0.94 }}
-            transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            className="fixed top-5 left-1/2 -translate-x-1/2 z-[100] pointer-events-none select-none"
-          >
-            <div className="relative overflow-hidden flex items-center justify-center px-5 py-2 rounded-full bg-white/95 dark:bg-[#252528]/95 backdrop-blur-md border border-neutral-200/90 dark:border-neutral-700/80 shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:shadow-[0_8px_30px_rgb(0,0,0,0.35)] text-xs md:text-sm font-medium text-neutral-800 dark:text-neutral-100 min-w-[200px]">
-              {/* Full-bleed background progress bar from left to right */}
-              <div 
-                ref={overviewProgressBarRef}
-                className="absolute inset-y-0 left-0 bg-blue-500/20 dark:bg-blue-400/25 border-r border-blue-500/50 dark:border-blue-400/50 transition-[width] duration-150 ease-out pointer-events-none"
-                style={{ width: '0%' }}
-              />
-              <span className="relative z-10 tracking-wide font-medium">继续缩小进入全景视图</span>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+
+
 
       {/* Top Reference Picker Control Bar & Tray (Positioned below the top toast area) */}
       <AnimatePresence>
@@ -8148,7 +8134,7 @@ export default function App() {
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -20, scale: 0.95 }}
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            className={`fixed ${showOverviewPromptToast && !isOverviewMode ? 'top-20' : 'top-5'} left-1/2 -translate-x-1/2 z-[110] flex flex-col items-center gap-2 w-max max-w-[98vw] select-none pointer-events-auto`}
+            className={`fixed ${topNotices.length > 0 ? 'top-20' : 'top-5'} left-1/2 -translate-x-1/2 z-[110] flex flex-col items-center gap-2 w-max max-w-[98vw] select-none pointer-events-auto`}
             onPointerDown={(e) => e.stopPropagation()}
           >
             {/* 1. Control Bar (Main HUD Toast) */}
@@ -8257,7 +8243,7 @@ export default function App() {
       </AnimatePresence>
 
       {/* Real-time FPS Counter */}
-      <FpsCounter hasActiveTask={!!agentTask} />
+      <FpsCounter hasActiveTask={!!agentTask} notices={topNotices} />
 
     </div>
   );

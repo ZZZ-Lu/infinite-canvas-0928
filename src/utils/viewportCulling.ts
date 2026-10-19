@@ -1,5 +1,6 @@
 import { AspectRatio, CARD_DIMENSIONS, getCardSize } from '../components/GenerationCard';
 import { getBottomPanelHeight } from './cardLayout';
+import { NANO_LOD_THRESHOLD } from './cardLodAppearance';
 
 export interface CardBounds {
   id: string;
@@ -10,6 +11,7 @@ export interface CardBounds {
   customHeight?: number;
   prompt?: string;
   referenceImages?: any[];
+  referenceImageUrl?: string | null;
   fileName?: string;
   isAsset?: boolean;
 }
@@ -29,26 +31,20 @@ export interface CanvasViewport {
 export function getCardDimensions(card: CardBounds): { width: number; height: number } {
   const dim = getCardSize(card);
   const isGenerationCard = !card.fileName && !card.isAsset;
-  const visualWidth = Math.max(dim.width, 480);
+  const visualWidth = isGenerationCard ? Math.max(dim.width, 480) : dim.width;
   if (!isGenerationCard) {
     return { width: visualWidth, height: dim.height };
   }
-  const panelHeight = getBottomPanelHeight(card.prompt, card.referenceImages?.length);
+  const panelHeight = getBottomPanelHeight(card.prompt, card.referenceImages?.length || (card.referenceImageUrl ? 1 : 0));
   const visualHeight = dim.height + 12 + panelHeight;
   return { width: visualWidth, height: visualHeight };
 }
 
-/** Shared world-space bounds for DOM, spatial indexing and Canvas fallback. */
-export function getCardVisualBounds(card: CardBounds) {
-  const dim = getCardSize(card);
-  const isGenerationCard = !card.fileName && !card.isAsset;
-  const panelLeft = card.x + (dim.width - 480) / 2;
-  return {
-    minX: isGenerationCard ? Math.min(card.x, panelLeft) : card.x,
-    minY: card.y,
-    maxX: isGenerationCard ? Math.max(card.x + dim.width, panelLeft + 480) : card.x + dim.width,
-    maxY: card.y + dim.height + (isGenerationCard ? 12 + getBottomPanelHeight(card.prompt, card.referenceImages?.length) : 0),
-  };
+export function getCardWorldBounds(card: CardBounds) {
+  const image = getCardSize(card);
+  const visual = getCardDimensions(card);
+  const left = card.x + Math.min(0, (image.width - visual.width) / 2);
+  return { minX: left, minY: card.y, maxX: left + visual.width, maxY: card.y + visual.height };
 }
 
 /**
@@ -66,7 +62,7 @@ export function isCardIntersectingRectangle(
   if (viewportWidth <= 0 || viewportHeight <= 0 || scale <= 0) return true;
 
   // Card dimensions in canvas coordinates
-  const bounds = getCardVisualBounds(card);
+  const bounds = getCardWorldBounds(card);
 
   // Card AABB in screen coordinates
   const cardLeft = bounds.minX * scale + tx;
@@ -89,26 +85,12 @@ export function isCardIntersectingRectangle(
 }
 
 /**
- * Shared Nano/Micro/Standard LOD Scale Thresholds:
- * - Scale < 0.40: Nano-LOD (Macro panoramic overview, pure 2D Canvas color blocks)
- * - 0.40 <= Scale < 0.70 (or active gesture): Micro-LOD (Mid-range browsing, 12px rounded, GPU composited)
- * - Scale >= 0.70 (idle): Standard-LOD (Full rich DOM card, 12px squircle curvature)
+ * Shared Nano/Micro-LOD Scale Threshold: 0.40 (40%)
+ * Scale < 0.40 renders via NanoLodCanvas (2D Canvas mode with color blocks).
+ * Scale >= 0.40 renders via DOM cards mode (interactive prompt component).
  */
-export type LodTier = 'nano' | 'micro' | 'standard';
-
-export const LOD_THRESHOLDS = {
-  NANO: 0.40,
-  MICRO: 0.70,
-} as const;
-
 export function getNanoLodThreshold(): number {
-  return LOD_THRESHOLDS.NANO;
-}
-
-export function getLodTierByScale(scale: number): LodTier {
-  if (scale < LOD_THRESHOLDS.NANO) return 'nano';
-  if (scale < LOD_THRESHOLDS.MICRO) return 'micro';
-  return 'standard';
+  return NANO_LOD_THRESHOLD;
 }
 
 export const CARD_DENSITY_HIGH_THRESHOLD = 15; // Kept for backwards compatibility
