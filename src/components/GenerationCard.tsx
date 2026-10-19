@@ -396,7 +396,7 @@ export interface CardData {
   }>;
 }
 
-const refDimensionsCache = new Map<string, { width: number; height: number }>();
+
 
 const ReferenceThumbItem = React.memo(function ReferenceThumbItem({
   item,
@@ -446,19 +446,6 @@ const ReferenceThumbItem = React.memo(function ReferenceThumbItem({
   const togglePreview = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (targetUrl) {
-      if (!refDimensionsCache.has(targetUrl)) {
-        const img = new Image();
-        img.referrerPolicy = 'no-referrer';
-        img.src = targetUrl;
-        img.onload = () => {
-          if (img.naturalWidth && img.naturalHeight) {
-            refDimensionsCache.set(targetUrl, {
-              width: img.naturalWidth,
-              height: img.naturalHeight,
-            });
-          }
-        };
-      }
       setHoveredRefUrl(prev => prev === targetUrl ? null : targetUrl);
     }
   };
@@ -2880,6 +2867,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   const [activePreviewUrl, setActivePreviewUrl] = useState<string | null>(null);
   const [isRebounding, setIsRebounding] = useState(false);
   const reboundTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const reboundFinishTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // @ Mention State
   const [mentionMenuOpen, setMentionMenuOpen] = useState(false);
@@ -2887,12 +2875,11 @@ export const GenerationCard = React.memo(function GenerationCard({
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const mirrorRef = useRef<HTMLDivElement>(null);
   const mentionMenuRef = useRef<HTMLDivElement>(null);
-  const [previewDimensions, setPreviewDimensions] = useState<{ width: number; height: number } | null>(() => {
-    return hoveredRefUrl ? refDimensionsCache.get(hoveredRefUrl) || null : null;
-  });
+  const [previewDimensions, setPreviewDimensions] = useState<{ width: number; height: number } | null>(null);
 
   useEffect(() => {
     if (hoveredRefUrl) {
+      if (reboundFinishTimerRef.current) clearTimeout(reboundFinishTimerRef.current);
       if (reboundTimerRef.current) {
         clearTimeout(reboundTimerRef.current);
         reboundTimerRef.current = null;
@@ -2907,46 +2894,22 @@ export const GenerationCard = React.memo(function GenerationCard({
       if (reboundTimerRef.current) {
         clearTimeout(reboundTimerRef.current);
       }
+      if (reboundFinishTimerRef.current) clearTimeout(reboundFinishTimerRef.current);
     };
   }, []);
 
+  const [previewLoadError, setPreviewLoadError] = useState(false);
+  const previewReference = data.referenceImages?.find(ref => ref.url === hoveredRefUrl);
+  const previewSourceCard = hoveredRefUrl ? allCards?.find(card =>
+    (previewReference?.sourceCardId && card.id === previewReference.sourceCardId) ||
+    card.imageUrl === hoveredRefUrl || card.originalImageUrl === hoveredRefUrl || card.trueOriginalImageUrl === hoveredRefUrl
+  ) : undefined;
+  // Reuse the display image generated during import. No preview resize or cache.
+  const previewSource = (previewSourceCard?.isVideo ? undefined : previewSourceCard?.imageUrl) || hoveredRefUrl;
+  useEffect(() => { setPreviewLoadError(false); }, [previewSource]);
   useEffect(() => {
-    if (!hoveredRefUrl) {
-      setPreviewDimensions(null);
-      return;
-    }
-
-    const cached = refDimensionsCache.get(hoveredRefUrl);
-    if (cached) {
-      setPreviewDimensions(cached);
-      return;
-    }
-
-    let isMounted = true;
-    const img = new Image();
-    img.referrerPolicy = 'no-referrer';
-    img.src = hoveredRefUrl;
-
-    const onDims = () => {
-      if (!isMounted) return;
-      const dims = {
-        width: img.naturalWidth || 16,
-        height: img.naturalHeight || 9,
-      };
-      refDimensionsCache.set(hoveredRefUrl, dims);
-      setPreviewDimensions(dims);
-    };
-
-    if (img.complete && img.naturalWidth > 0) {
-      onDims();
-    } else {
-      img.onload = onDims;
-    }
-
-    return () => {
-      isMounted = false;
-    };
-  }, [hoveredRefUrl]);
+    if (!hoveredRefUrl && !activePreviewUrl) setPreviewDimensions(null);
+  }, [hoveredRefUrl, activePreviewUrl]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const refMenuContainerRef = useRef<HTMLDivElement>(null);
   
@@ -4475,7 +4438,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     ? selectedMcpModel.resolutions.map(option => (typeof option === 'object' ? option.label : option))
     : (data.isVideo ? ['720p', '1080p'] : ['1K', '2K', '4K']);
   const selectedModel = selectedMcpModel?.name || '选择模型';
-  const useNativePromptPanel = Boolean(isHighLodTarget) || isPromptPanelHovered || isPromptEditing || Boolean(openMenu) || mentionMenuOpen ||
+  const useNativePromptPanel = Boolean(isHighLodTarget) || isPromptPanelHovered || isPromptEditing || isRebounding || Boolean(openMenu) || mentionMenuOpen ||
     Boolean(hoveredRefUrl || activePreviewUrl || data.generationError) || isReferenceFilePickerOpen;
   const enumParameters: McpSchemaParameter[] = data.isVideo ? [
     {
@@ -4539,19 +4502,22 @@ export const GenerationCard = React.memo(function GenerationCard({
     if (showNativePromptPanel && mirrorRef.current) mirrorRef.current.scrollTop = promptScrollTop;
   }, [showNativePromptPanel, promptScrollTop]);
   // Dynamic height calculation based on hovered reference image aspect ratio
-  const textareaHeight = textareaRef.current?.offsetHeight || 50;
+  const textareaHeight = getPromptAreaHeight(localPrompt);
   const targetPreviewHeight = previewDimensions
     ? Math.min(280, Math.max(80, Math.round(448 / (previewDimensions.width / previewDimensions.height))))
     : 200;
-  const expandedPromptHeight = (hoveredRefUrl || activePreviewUrl) ? Math.max(textareaHeight, targetPreviewHeight) : 'auto';
+  const expandedPromptHeight = Math.max(textareaHeight, targetPreviewHeight);
+  const displayedPromptHeight = hoveredRefUrl || activePreviewUrl ? expandedPromptHeight : textareaHeight;
+  const displayedPanelHeight = getBottomPanelHeight(localPrompt, refList.length) + displayedPromptHeight - textareaHeight;
 
   const handleExitComplete = () => {
+    if (hoveredRefUrl) return;
     if (reboundTimerRef.current) {
       clearTimeout(reboundTimerRef.current);
       reboundTimerRef.current = null;
     }
 
-    const currentTextareaHeight = textareaRef.current?.offsetHeight || 50;
+    const currentTextareaHeight = textareaHeight;
     const currentPreviewHeight = previewDimensions
       ? Math.min(280, Math.max(80, Math.round(448 / (previewDimensions.width / previewDimensions.height))))
       : 200;
@@ -4569,7 +4535,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     reboundTimerRef.current = setTimeout(() => {
       setIsRebounding(true);
       setActivePreviewUrl(null);
-      setTimeout(() => {
+      reboundFinishTimerRef.current = setTimeout(() => {
         setIsRebounding(false);
       }, 250);
     }, 300);
@@ -5400,8 +5366,9 @@ export const GenerationCard = React.memo(function GenerationCard({
       }`}
         style={{
           marginLeft: (w - 480) / 2,
-          height: getBottomPanelHeight(localPrompt, refList.length),
+          height: displayedPanelHeight,
           minHeight: getBottomPanelHeight(localPrompt, refList.length),
+          transition: isRebounding ? 'height 0.24s cubic-bezier(0.16, 1, 0.3, 1)' : 'none',
           opacity: hasPresentedPanel || showNativePromptPanel ? 1 : 0,
           pointerEvents: hasPresentedPanel || showNativePromptPanel ? undefined : 'none',
         }}
@@ -5562,11 +5529,7 @@ export const GenerationCard = React.memo(function GenerationCard({
             }
           }}
           style={{
-            height: activePreviewUrl
-              ? expandedPromptHeight
-              : isRebounding
-                ? textareaHeight
-                : getPromptAreaHeight(localPrompt),
+            height: displayedPromptHeight,
             minHeight: getPromptAreaHeight(localPrompt),
             transition: isRebounding ? 'height 0.24s cubic-bezier(0.16, 1, 0.3, 1)' : 'none',
           }}
@@ -5707,7 +5670,6 @@ export const GenerationCard = React.memo(function GenerationCard({
                 onClick={(e) => {
                   e.stopPropagation();
                   setHoveredRefUrl(null);
-                  setActivePreviewUrl(null);
                 }}
                 className="absolute inset-0 z-30 pointer-events-auto cursor-pointer flex items-center justify-center overflow-hidden shadow-md transform-gpu group/large-preview"
                 title="点击关闭大图预览"
@@ -5715,13 +5677,17 @@ export const GenerationCard = React.memo(function GenerationCard({
                 {/* Frosted glass mask without rounded corners */}
                 <div className="absolute inset-0 backdrop-blur-md bg-gray-100/90 dark:bg-neutral-800/90" />
 
-                {/* Direct large image without rounded corners */}
-                <img 
-                  src={hoveredRefUrl} 
-                  alt="Reference Preview" 
+                {previewLoadError && <span className="relative z-10 text-sm text-neutral-500">预览加载失败，请关闭后重试</span>}
+                {/* Reuse the imported 1200px display image directly. */}
+                {!previewLoadError && previewSource && <img
+                  key={previewSource}
+                  src={previewSource}
+                  alt="Reference Preview"
+                  onLoad={event => setPreviewDimensions({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })}
+                  onError={() => setPreviewLoadError(true)}
                   className="relative z-10 w-full h-full object-contain pointer-events-none select-none"
                   referrerPolicy="no-referrer"
-                />
+                />}
 
                 {/* Close button at top right */}
                 <button
@@ -5729,7 +5695,6 @@ export const GenerationCard = React.memo(function GenerationCard({
                   onClick={(e) => {
                     e.stopPropagation();
                     setHoveredRefUrl(null);
-                    setActivePreviewUrl(null);
                   }}
                   className="absolute top-2 right-2 z-40 w-6 h-6 rounded-full bg-black/60 hover:bg-black/80 text-white flex items-center justify-center transition-colors shadow-sm cursor-pointer"
                   title="关闭预览"

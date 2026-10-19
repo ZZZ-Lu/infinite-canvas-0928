@@ -38,6 +38,19 @@ export function getCardDimensions(card: CardBounds): { width: number; height: nu
   return { width: visualWidth, height: visualHeight };
 }
 
+/** Shared world-space bounds for DOM, spatial indexing and Canvas fallback. */
+export function getCardVisualBounds(card: CardBounds) {
+  const dim = getCardSize(card);
+  const isGenerationCard = !card.fileName && !card.isAsset;
+  const panelLeft = card.x + (dim.width - 480) / 2;
+  return {
+    minX: isGenerationCard ? Math.min(card.x, panelLeft) : card.x,
+    minY: card.y,
+    maxX: isGenerationCard ? Math.max(card.x + dim.width, panelLeft + 480) : card.x + dim.width,
+    maxY: card.y + dim.height + (isGenerationCard ? 12 + getBottomPanelHeight(card.prompt, card.referenceImages?.length) : 0),
+  };
+}
+
 /**
  * Determines whether a card's axis-aligned bounding box intersects with
  * a rectangle defined by the viewport plus a pre-load buffer.
@@ -53,13 +66,13 @@ export function isCardIntersectingRectangle(
   if (viewportWidth <= 0 || viewportHeight <= 0 || scale <= 0) return true;
 
   // Card dimensions in canvas coordinates
-  const { width: cardWidth, height: cardHeight } = getCardDimensions(card);
+  const bounds = getCardVisualBounds(card);
 
   // Card AABB in screen coordinates
-  const cardLeft = card.x * scale + tx;
-  const cardTop = card.y * scale + ty;
-  const cardRight = cardLeft + cardWidth * scale;
-  const cardBottom = cardTop + cardHeight * scale;
+  const cardLeft = bounds.minX * scale + tx;
+  const cardTop = bounds.minY * scale + ty;
+  const cardRight = bounds.maxX * scale + tx;
+  const cardBottom = bounds.maxY * scale + ty;
 
   // Add a scale-adaptive buffer zone outside screen edges for smooth pre-loading
   const buffer = Math.max(40, Math.min(150, Math.round(150 * Math.sqrt(scale))));

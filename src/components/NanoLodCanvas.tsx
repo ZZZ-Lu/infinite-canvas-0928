@@ -8,7 +8,7 @@ import {
   thumbCache,
 } from '../utils/thumbnail';
 import { calculateObjectCover, fullImageCache, getOrLoadCanvasImage } from '../utils/imageTextureCache';
-import { getNanoLodThreshold, getLodTierByScale, type LodTier } from '../utils/viewportCulling';
+import { getCardVisualBounds, getNanoLodThreshold, getLodTierByScale, type LodTier } from '../utils/viewportCulling';
 import { getBottomPanelHeight, getPromptAreaHeight, calculatePromptLines } from '../utils/cardLayout';
 import { buildCardQuadTree, QuadTree, BoundingBox } from '../utils/quadTree';
 
@@ -675,7 +675,6 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
     for (let i = 0; i < candidateCards.length; i++) {
       const card = candidateCards[i];
-      const dim = getCardSize(card);
 
       // Determine real-time dragging position for visibility test
       let cx = card.x;
@@ -690,12 +689,15 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         }
       }
 
-      // Instant AABB culling with dragging offset
+      // Include the visible prompt panel even when its image is above the viewport.
+      const bounds = getCardVisualBounds(card);
+      const offsetX = cx - card.x;
+      const offsetY = cy - card.y;
       if (
-        cx + dim.width < vpLeft ||
-        cx > vpRight ||
-        cy + dim.height < vpTop ||
-        cy > vpBottom
+        bounds.maxX + offsetX < vpLeft ||
+        bounds.minX + offsetX > vpRight ||
+        bounds.maxY + offsetY < vpTop ||
+        bounds.minY + offsetY > vpBottom
       ) {
         continue;
       }
