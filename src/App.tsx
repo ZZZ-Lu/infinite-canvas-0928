@@ -18,7 +18,7 @@ import { getBottomPanelHeight } from './utils/cardLayout';
 import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
 import { cropBoundingBoxFromImage } from './utils/imageCropper';
 import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp } from 'lucide-react';
-import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces } from './db';
+import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces, hasPendingCardSaves } from './db';
 import { SettingsPage } from './components/SettingsPage';
 import { getDrafts, saveDraft, deleteDraft } from './utils/draftDb';
 import { McpKeyButton } from './components/McpKeyButton';
@@ -2584,21 +2584,47 @@ export default function App() {
   }, [tx, ty, tScale, currentProjectId]);
   // -------------------------------------
 
-  const handleSelectProject = (projectId: string) => {
-    if (projectId === currentProjectId) return;
+  const projectTransitionRef = useRef(false);
+  const flushCurrentProject = async () => {
+    let snapshot: CardData[];
+    do {
+      snapshot = cardsRef.current;
+      await saveCards(snapshot, currentProjectId);
+    } while (snapshot !== cardsRef.current);
+  };
+  const handleSelectProject = async (projectId: string) => {
+    if (projectId === currentProjectId || isLoading || projectTransitionRef.current) return;
+    projectTransitionRef.current = true;
+    setIsLoading(true);
     // Save current cards first before switching
-    if (loadedProjectIdRef.current === currentProjectId && !isLoading) {
-      saveCards(cardsRef.current, currentProjectId).catch(console.error);
+    if (loadedProjectIdRef.current === currentProjectId) {
+      try { await flushCurrentProject(); }
+      catch (error) {
+        projectTransitionRef.current = false;
+        setIsLoading(false);
+        showToastNotice(`保存失败，暂未切换：${error instanceof Error ? error.message : '请重试'}`, { duration: 6000 });
+        return;
+      }
     }
+    dirtySaveRef.current = null;
     loadedProjectIdRef.current = null;
     setIsLoading(true);
     setCurrentProjectId(projectId);
+    projectTransitionRef.current = false;
   };
 
   const handleCreateProject = async (name: string) => {
+    if (isLoading || projectTransitionRef.current) return;
+    projectTransitionRef.current = true;
+    setIsLoading(true);
     // Save current project's cards first
-    if (loadedProjectIdRef.current === currentProjectId && !isLoading) {
-      await saveCards(cardsRef.current, currentProjectId).catch(console.error);
+    if (loadedProjectIdRef.current === currentProjectId) {
+      try { await flushCurrentProject(); }
+      catch (error) {
+        projectTransitionRef.current = false;
+        setIsLoading(false);
+        showToastNotice(`保存失败：${String(error)}`, { duration: 6000 }); return;
+      }
     }
     loadedProjectIdRef.current = null;
     setIsLoading(true);
@@ -2628,15 +2654,25 @@ export default function App() {
       prompt: '',
       imageUrl: null
     }];
-    await saveCards(initialNewCards, newId).catch(console.error);
+    try { await saveCards(initialNewCards, newId); }
+    catch (error) {
+      projectTransitionRef.current = false;
+      setIsLoading(false);
+      loadedProjectIdRef.current = currentProjectId;
+      showToastNotice(`新项目保存失败：${String(error)}`, { duration: 6000 });
+      return;
+    }
 
     setProjects(prev => [newProj, ...prev]);
+    dirtySaveRef.current = null;
     setCurrentProjectId(newId);
+    projectTransitionRef.current = false;
   };
 
   const handleDeleteProject = async (projectId: string) => {
     if (projects.length <= 1) return;
-    await deleteCardsForProject(projectId).catch(console.error);
+    try { await deleteCardsForProject(projectId); }
+    catch (error) { showToastNotice(`删除失败：${String(error)}`, { duration: 6000 }); return; }
     setProjects(prev => {
       const remaining = prev.filter(p => p.id !== projectId);
       if (currentProjectId === projectId) {
@@ -2663,7 +2699,7 @@ export default function App() {
         const saved = await loadCards(currentProjectId);
         if (!mounted) return;
         
-        if (saved && saved.length > 0) {
+        if (saved !== null) {
           const processedSaved = saved.map(card => {
             const updates: any = {};
             if (card.generationError) {
@@ -2885,7 +2921,7 @@ export default function App() {
               };
             });
             setHistory({ past: [], present: processedFallback, future: [] });
-            await saveCards(processedFallback, currentProjectId).catch(console.error);
+            await saveCards(processedFallback, currentProjectId);
           } else {
             const initialCards: CardData[] = [{
               id: `card_${Date.now()}_1`,
@@ -2898,12 +2934,14 @@ export default function App() {
               imageUrl: null
             }];
             setHistory({ past: [], present: initialCards, future: [] });
-            await saveCards(initialCards, currentProjectId).catch(console.error);
+            await saveCards(initialCards, currentProjectId);
           }
           loadedProjectIdRef.current = currentProjectId;
         }
       } catch (e) {
         console.error('Failed to load project cards from DB:', e);
+        loadedProjectIdRef.current = null;
+        showToastNotice(`项目读取失败，已停止自动保存：${e instanceof Error ? e.message : String(e)}`, { duration: 0 });
       } finally {
         if (mounted) {
           setIsLoading(false);
@@ -2915,38 +2953,48 @@ export default function App() {
     return () => { mounted = false; };
   }, [currentProjectId]);
 
-  // Save cards to IndexedDB for current project ONLY when cards belong to current project (debounced & idle-scheduled)
+  // Debounce incremental saves; bound continuous edits and cancel stale project callbacks.
   const saveCardsTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const dirtySaveRef = useRef<{ project: string; since: number } | null>(null);
   useEffect(() => {
     if (!isLoading && currentProjectId && loadedProjectIdRef.current === currentProjectId) {
+      if (dirtySaveRef.current?.project !== currentProjectId) dirtySaveRef.current = { project: currentProjectId, since: Date.now() };
+      let cancelled = false;
+      let retries = 0;
       if (saveCardsTimerRef.current) {
         clearTimeout(saveCardsTimerRef.current);
       }
       saveCardsTimerRef.current = setTimeout(() => {
         const doSave = async () => {
-          if (isUserPointerDownRef.current || (window as any).isDraggingCard || isDraggingCanvasRef.current) {
+          if (cancelled || loadedProjectIdRef.current !== currentProjectId || currentProjectIdRef.current !== currentProjectId) return;
+          if ((isUserPointerDownRef.current || (window as any).isDraggingCard || isDraggingCanvasRef.current || isZoomingRef.current)
+              && Date.now() - (dirtySaveRef.current?.since || Date.now()) < 2000) {
             // Postpone save if user is actively interacting with the canvas/cards
-            saveCardsTimerRef.current = setTimeout(doSave, 1500);
+            saveCardsTimerRef.current = setTimeout(doSave, 300);
             return;
           }
           try {
             showToastNotice("正在保存...", { id: "save-status", dotColor: "bg-blue-500 animate-pulse", duration: 0 });
-            await saveCards(cardsRef.current, currentProjectId);
-            showToastNotice("已保存", { id: "save-status", dotColor: "bg-emerald-500", duration: 2000 });
+            const snapshot = cardsRef.current;
+            await saveCards(snapshot, currentProjectId);
+            if (!cancelled && currentProjectIdRef.current === currentProjectId && cardsRef.current === snapshot) {
+              dirtySaveRef.current = null;
+              showToastNotice("已保存", { id: "save-status", dotColor: "bg-emerald-500", duration: 2000 });
+            }
           } catch (err) {
             console.error(err);
-            showToastNotice("保存失败", { id: "save-status", dotColor: "bg-red-500", duration: 3000 });
+            if (!cancelled) {
+              showToastNotice(`保存失败：${err instanceof Error ? err.message : '请重试'}`, { id: "save-status", dotColor: "bg-red-500", duration: 6000 });
+              if (++retries <= 3 && !String(err).includes('其他页面')) saveCardsTimerRef.current = setTimeout(doSave, 1000 * retries);
+            }
           }
         };
 
-        if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
-          (window as any).requestIdleCallback(doSave, { timeout: 3000 });
-        } else {
-          doSave();
-        }
-      }, 1500);
+        void doSave();
+      }, Math.min(300, Math.max(0, 2000 - (Date.now() - dirtySaveRef.current.since))));
 
       return () => {
+        cancelled = true;
         if (saveCardsTimerRef.current) {
           clearTimeout(saveCardsTimerRef.current);
         }
@@ -2954,16 +3002,26 @@ export default function App() {
     }
   }, [cards, isLoading, currentProjectId]);
 
-  // Synchronous flush on page reload or close to prevent in-flight video playback state from being lost
+  // Flush on backgrounding. Unload cannot guarantee async completion; warn while dirty.
   useEffect(() => {
-    const handleBeforeUnload = () => {
-      if (currentProjectId && loadedProjectIdRef.current === currentProjectId && cardsRef.current.length > 0) {
+    const flushOnHide = () => {
+      if (currentProjectId && loadedProjectIdRef.current === currentProjectId) {
         saveCards(cardsRef.current, currentProjectId).catch(() => {});
       }
     };
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (dirtySaveRef.current || hasPendingCardSaves()) {
+        flushOnHide();
+        event.preventDefault();
+        event.returnValue = '';
+      }
+    };
+    const handleVisibility = () => { if (document.visibilityState === 'hidden') flushOnHide(); };
     window.addEventListener('beforeunload', handleBeforeUnload);
+    document.addEventListener('visibilitychange', handleVisibility);
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnload);
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, [currentProjectId]);
 
@@ -3867,15 +3925,19 @@ export default function App() {
       if ((e.ctrlKey || e.metaKey) && (e.code === 'KeyS' || e.key.toLowerCase() === 's')) {
         e.preventDefault();
         const pid = currentProjectIdRef.current;
-        if (pid) {
+        if (pid && loadedProjectIdRef.current === pid) {
           showToastNotice("正在保存...", { id: "save-status", dotColor: "bg-blue-500 animate-pulse", duration: 0 });
-          saveCards(cardsRef.current, pid)
+          const snapshot = cardsRef.current;
+          saveCards(snapshot, pid)
             .then(() => {
-              showToastNotice("已保存", { id: "save-status", dotColor: "bg-emerald-500", duration: 2000 });
+              if (currentProjectIdRef.current === pid && cardsRef.current === snapshot) {
+                dirtySaveRef.current = null;
+                showToastNotice("已保存", { id: "save-status", dotColor: "bg-emerald-500", duration: 2000 });
+              }
             })
             .catch((err) => {
               console.error(err);
-              showToastNotice("保存失败", { id: "save-status", dotColor: "bg-red-500", duration: 3000 });
+              showToastNotice(`保存失败：${err instanceof Error ? err.message : '请重试'}`, { id: "save-status", dotColor: "bg-red-500", duration: 6000 });
             });
         }
         return;

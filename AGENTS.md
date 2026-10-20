@@ -142,3 +142,10 @@ Runtime 负责状态机、工具状态、动作排队、页面变化和下一轮
 1. **视频卡片意图驱动懒挂载 (Lazy Mounting)**：平时必须表现为仅包含封面的纯 `div`，**绝对禁止**后台常驻 `<video>` 标签。只有当 `isHovered` 或 `isPlaying` 时才挂载 `<video>` 节点，离开即销毁，彻底释放 GPU 合成层负担。严禁使用 `backdrop-blur` 滤镜。
 2. **图片卡片动态 LOD**：收敛至 Canvas 渲染，`< 200%` 缩放时仅渲染缩略图/2K 代理，仅在 `> 200%` 且处于视口中心且停止拖拽时，才通过透明度过渡渲染 4K 原图。
 3. **视觉与数据深度解耦 (AI 数据流向)**：UI 永远渲染轻量代理图，但在进行 AI 生图/视频等业务请求时，必须无视 UI 状态，直接从底层模型 (`CardData`) 中提取最原始、未阉割的二进制对象 (`trueOriginalFileData` / `originalFileData`)，确保输入大模型的参考图 100% 无损。
+
+## 存储修改约束
+
+修改保存、加载、项目切换、卡片媒体字段或迁移前，阅读 `docs/architecture/incremental-storage.md`。
+卡片保存已通过 `src/db.ts` 接入 Worker 增量存储；禁止恢复整项目全量 put、删库重建或读取失败后保存默认数据。
+保持卡片及嵌套对象不可变更新；保存成功必须等事务完成。完成修改运行 `npm run test:storage`、`npm run lint` 和 `npm run build`。
+旧 workspace 仅是迁移时备份，不能当成新格式的最新数据回退。

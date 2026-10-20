@@ -1,9 +1,9 @@
 import type { AgentRuntimeTrace } from "./agent/debugTrace";
 import { CardData } from "./components/GenerationCard";
+import { cardRepository } from './storage/client';
 
 const DB_NAME = "InfiniteCanvasDB";
 const STORE_NAME = "workspace";
-const DB_VERSION = 20;
 
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -23,6 +23,7 @@ function openDB(): Promise<IDBDatabase> {
 
       request.onsuccess = () => {
         const db = request.result;
+        db.onversionchange = () => db.close();
         if (db.objectStoreNames.contains(STORE_NAME)) {
           resolve(db);
         } else {
@@ -34,14 +35,7 @@ function openDB(): Promise<IDBDatabase> {
 
       request.onerror = () => {
         const err = request.error;
-        if (err && (err.name === "VersionError" || err.message?.includes("version"))) {
-          console.warn("Version error opening " + DB_NAME + ", recreating database...");
-          const delReq = indexedDB.deleteDatabase(DB_NAME);
-          delReq.onsuccess = () => tryOpen(DB_VERSION);
-          delReq.onerror = () => reject(err);
-        } else {
-          reject(err);
-        }
+        reject(err);
       };
     };
 
@@ -66,41 +60,20 @@ export async function requestPersistence(): Promise<boolean> {
 }
 
 export async function saveCards(cards: CardData[], projectId?: string): Promise<void> {
-  const db = await openDB();
-  const key = projectId ? `cards_${projectId}` : "cards";
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readwrite");
-    const store = tx.objectStore(STORE_NAME);
-    const request = store.put(cards, key);
-        
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
-  });
+  await cardRepository.save(cards, projectId ? `cards_${projectId}` : 'cards');
 }
 
 export async function loadCards(projectId?: string): Promise<CardData[] | null> {
-  const db = await openDB();
-  const key = projectId ? `cards_${projectId}` : "cards";
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readonly");
-    const store = tx.objectStore(STORE_NAME);
-    const request = store.get(key);
-        
-    request.onsuccess = () => resolve(request.result || null);
-    request.onerror = () => reject(request.error);
-  });
+  return cardRepository.load(projectId ? `cards_${projectId}` : 'cards');
 }
 
 export async function deleteCardsForProject(projectId: string): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readwrite");
-    const store = tx.objectStore(STORE_NAME);
-    const request = store.delete(`cards_${projectId}`);
-        
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
-  });
+  await cardRepository.remove(`cards_${projectId}`);
+}
+
+export function hasPendingCardSaves() { return cardRepository.hasPending(); }
+export function restorePreviousCardSave(projectId: string) {
+  return cardRepository.restore(`cards_${projectId}`);
 }
 
 export async function saveAgentTraces(traces: AgentRuntimeTrace[]): Promise<void> {
@@ -109,8 +82,8 @@ export async function saveAgentTraces(traces: AgentRuntimeTrace[]): Promise<void
     const tx = db.transaction(STORE_NAME, "readwrite");
     const store = tx.objectStore(STORE_NAME);
     const request = store.put(traces.slice(-50), "agent_traces");
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onabort = () => { db.close(); reject(tx.error || request.error); };
   });
 }
 
@@ -121,7 +94,7 @@ export async function loadAgentTraces(): Promise<AgentRuntimeTrace[] | null> {
     const store = tx.objectStore(STORE_NAME);
     const request = store.get("agent_traces");
         
-    request.onsuccess = () => resolve(request.result || null);
-    request.onerror = () => reject(request.error);
+    request.onsuccess = () => { db.close(); resolve(request.result || null); };
+    request.onerror = () => { db.close(); reject(request.error); };
   });
 }
