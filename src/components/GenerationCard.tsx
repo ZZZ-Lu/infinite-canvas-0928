@@ -1,3 +1,4 @@
+import { cardEntryFrame } from '../utils/cardEntrance';
 import { calculateVideoPlayButtonDimensions, PLAY_BUTTON_SVG_PATH } from "../utils/videoPlayButton";
 import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
@@ -4597,6 +4598,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     displayY = posRef.current.y;
   }
 
+  const entryFrame = useState(() => cardEntryFrame(id, performance.now(), true))[0];
   return (
     <div 
       ref={cardRef}
@@ -4609,12 +4611,12 @@ export const GenerationCard = React.memo(function GenerationCard({
       onPointerDownCapture={handleContainerPointerDown}
     >
       <motion.div
-        initial={false}
-        animate={{ scale: 1, opacity: 1, y: 0 }}
-        transition={{ duration: 0 }}
+        initial={entryFrame ? { scale: entryFrame.scale, opacity: entryFrame.opacity } : false}
+        animate={entryFrame ? { scale: entryFrame.scales, opacity: entryFrame.opacities, y: 0 } : { scale: 1, opacity: 1, y: 0 }}
+        transition={{ duration: entryFrame?.duration || 0, delay: entryFrame?.delay || 0, ease: 'linear' }}
         transformTemplate={(_, generated) => generated.replace(/translateZ\([^)]+\)/g, '')}
         className={`flex flex-col gap-3 group items-start relative ${isAssetCard ? 'asset-card' : 'generation-card'}`}
-        style={{ transformOrigin: '50% 50%' }}
+        style={{ transformOrigin: entryFrame ? `${entryFrame.pivotX - data.x}px ${entryFrame.pivotY - data.y}px` : '50% 50%' }}
         onMouseEnter={() => {
           setIsHovered(true);
           onHover?.(id);

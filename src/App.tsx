@@ -1,3 +1,4 @@
+import { registerCardEntries } from './utils/cardEntrance';
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
 import { AgentContextMenu } from './components/AgentContextMenu';
@@ -2974,12 +2975,10 @@ export default function App() {
             return;
           }
           try {
-            showToastNotice("正在保存...", { id: "save-status", dotColor: "bg-blue-500 animate-pulse", duration: 0 });
             const snapshot = cardsRef.current;
             await saveCards(snapshot, currentProjectId);
             if (!cancelled && currentProjectIdRef.current === currentProjectId && cardsRef.current === snapshot) {
               dirtySaveRef.current = null;
-              showToastNotice("已保存", { id: "save-status", dotColor: "bg-emerald-500", duration: 2000 });
             }
           } catch (err) {
             console.error(err);
@@ -3926,13 +3925,11 @@ export default function App() {
         e.preventDefault();
         const pid = currentProjectIdRef.current;
         if (pid && loadedProjectIdRef.current === pid) {
-          showToastNotice("正在保存...", { id: "save-status", dotColor: "bg-blue-500 animate-pulse", duration: 0 });
           const snapshot = cardsRef.current;
           saveCards(snapshot, pid)
             .then(() => {
               if (currentProjectIdRef.current === pid && cardsRef.current === snapshot) {
                 dirtySaveRef.current = null;
-                showToastNotice("已保存", { id: "save-status", dotColor: "bg-emerald-500", duration: 2000 });
               }
             })
             .catch((err) => {
@@ -7107,6 +7104,12 @@ export default function App() {
     return cards.filter(card => visibleCardIdSet.has(card.id));
   }, [cards, visibleCardIdSet, tx, ty, tScale]);
 
+  // Register only actual additions/project loads, not LOD mounts or viewport changes.
+  useMemo(() => {
+    if (!isLoading && currentProjectId && loadedProjectIdRef.current === currentProjectId) {
+      registerCardEntries(currentProjectId, cards.map(card => ({ id: card.id, x: card.x, y: card.y, ...getCardSize(card) })), new Set(cards.filter(card => isCardIntersectingRectangle(card, { viewportWidth: window.innerWidth, viewportHeight: window.innerHeight, tx: tx.get(), ty: ty.get(), scale: tScale.get() })).map(card => card.id)), performance.now(), window.matchMedia('(prefers-reduced-motion: reduce)').matches, { x: (window.innerWidth / 2 - tx.get()) / tScale.get(), y: (window.innerHeight / 2 - ty.get()) / tScale.get() });
+    }
+  }, [cards, currentProjectId, isLoading, visibleCards]);
   // --- Center-Out Event-Driven Interruptible Mount Queue ---
   // Replaces fixed timers and arbitrary batch quotas with a human-centric priority queue:
   // 1. Sorts unmounted visible cards by Euclidean distance to viewport center (Center -> Perimeter).

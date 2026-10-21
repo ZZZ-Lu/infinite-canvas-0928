@@ -1,3 +1,4 @@
+import { cardEntryFrame } from '../utils/cardEntrance';
 import { calculateVideoPlayButtonDimensions, getPlayIconPath2D } from "../utils/videoPlayButton";
 import React, { useEffect, useRef } from 'react';
 import { readyPromptPanels } from '../utils/promptSurfaceCache';
@@ -881,16 +882,31 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       }
     };
 
+    let animating = false;
+    const renderWithEntry = (card: CardData) => {
+      const entry = cardEntryFrame(card.id);
+      if (!entry || dragging) { renderCard(card); return; }
+      animating = true;
+      const cx = entry.pivotX;
+      const cy = entry.pivotY;
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.scale(entry.scale, entry.scale);
+      ctx.translate(-cx, -cy);
+      ctx.globalAlpha *= entry.opacity;
+      renderCard(card);
+      ctx.restore();
+    };
     // Render unselected first, then selected on top
     for (let i = 0; i < unselectedCards.length; i++) {
-      renderCard(unselectedCards[i]);
+      renderWithEntry(unselectedCards[i]);
     }
     for (let i = 0; i < selectedCards.length; i++) {
-      renderCard(selectedCards[i]);
+      renderWithEntry(selectedCards[i]);
     }
 
     ctx.restore();
-    
+    if (animating) scheduleDraw();
     if (onReadyRef.current) {
       onReadyRef.current({ scale: currentScale, tx: currentTx, ty: currentTy });
     }
