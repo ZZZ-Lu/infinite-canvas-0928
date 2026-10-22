@@ -18,7 +18,7 @@ Media uploads are batched separately, at most four resources per message.
 Only one save runs per project; later queued snapshots coalesce into the newest.
 The confirmed baseline advances only after transaction completion. Failure leaves
 the baseline unchanged and the UI's current data pending. Automatic saves debounce
-300ms, checkpoint continuous edits after 2 seconds, and retry non-conflict failures
+300ms, checkpoint continuous edits after 2 seconds, and retry save failures
 three times. This checkpoint is not a 2-second idle recovery delay.
 Ctrl+S, backgrounding and project switches share the repository. Project switching
 waits for current changes; failure keeps the current project open. Unload warns
@@ -40,11 +40,9 @@ once; loaded resource IDs are reused. This is not content-hash deduplication of
 independently imported files with identical bytes.
 
 Large assets are committed before cards reference them. A single final transaction
-checks the expected revision and existence of referenced assets, writes changed
+merges field patches against current records and checks referenced assets, writes changed
 cards/deletions/order/history and advances the project head. Only `oncomplete`
-confirms success. Different tabs with stale revisions are rejected, not silently
-merged. Conflict UI keeps local changes available; do not reload before preserving
-those changes elsewhere if both versions are needed.
+confirms success. Concurrent tabs merge only fields changed against the local baseline. Same-field edits use transaction commit order; deletion wins over stale edits. No automatic recovery copy or conflict dialog is created.
 
 The last 50 commit journal entries are retained. `restorePreviousCardSave` provides
 explicit previous-commit recovery, including deleted-project recovery; it is not
@@ -90,3 +88,27 @@ move in approximately 7–13ms across six runs, with one metadata commit and no
 asset upload. This is a controlled benchmark, not an assertion that every real
 project operation has that latency. First migration, bulk import, loading and
 resource URL creation have separate costs.
+
+## Concurrent saves and page synchronization
+
+The repository attaches the last confirmed local field baseline only to changed
+cards. The Worker merges it with the newest database record inside the same write
+transaction. Plain nested objects merge by field; arrays and media-resource markers
+are atomic fields. The last committed change wins for a contested field. An absent
+card in a stale snapshot is not a deletion: only removal from that page's baseline
+is sent as a deletion. Edits cannot resurrect a remotely deleted card; intentional
+undo after synchronization may explicitly add it again. Project deletion still
+rejects writes. The existing 50-entry journal remains available.
+
+BroadcastChannel publishes project keys, never media. A focused/visible page also
+checks on focus. Synchronization first saves its pending local delta, checks a
+lightweight head, and only reads records/resources when the revision differs or a
+merge needs display reconciliation. Media is fetched in batches only for changed
+records. Before adopting remote state, both the UI snapshot and repository revision
+must still match; otherwise synchronization retries with the newer local edits.
+Unchanged routine saves do not reload the entire project.
+
+This coordinates pages sharing the same browser storage/origin; separate browsers,
+profiles, devices, or ports do not share the database. Old pre-merge application tabs
+must be refreshed before editing. A successful commit is durable only after its
+transaction completes; quota/worker errors still preserve the local unsaved state.

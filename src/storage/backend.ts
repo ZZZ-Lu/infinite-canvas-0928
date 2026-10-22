@@ -1,3 +1,4 @@
+import { mergeFields, resourceIds } from './merge';
 import { CardCodec, type EncodedCard, type Resource } from './codec';
 
 const NAME = 'InfiniteCanvasIncrementalDB';
@@ -25,10 +26,10 @@ export class StorageBackend {
     this.staged.set(token, [...(this.staged.get(token) || []), ...cards]);
   }
   async discard(token: string) { this.staged.delete(token); }
-  async commitStaged(project: string, revision: number, token: string, removed: string[], order: string[]) {
+  async commitStaged(project: string, revision: number, token: string, removed: string[], order: string[], baselineOrder?: string[]) {
     const changes = this.staged.get(token);
     if (!changes) throw new Error('后台待保存批次丢失，请重试');
-    try { return await this.commit(project, revision, changes, removed, order); }
+    try { return await this.commit(project, revision, changes, removed, order, baselineOrder); }
     finally { this.staged.delete(token); }
   }
   private connection?: Promise<IDBDatabase>;
@@ -117,6 +118,7 @@ export class StorageBackend {
     if (!existing) store.put({ generation, revision: 1, order: old.map(c => c.id) }, project);
     await done;
   }
+  async getHead(project: string) { return this.head(project); }
   async load(project: string): Promise<{ head: Head; cards: EncodedCard[] } | null> {
     let head = await this.head(project);
     if (!head) { await this.migrate(project); head = await this.head(project); }
@@ -132,7 +134,7 @@ export class StorageBackend {
     if (cards.some(c => !c)) throw new Error('卡片记录不完整，停止加载');
     return { head, cards };
   }
-  async commit(project: string, revision: number, changes: EncodedCard[], removed: string[], order: string[]) {
+  async commit(project: string, revision: number, changes: EncodedCard[], removed: string[], order: string[], baselineOrder?: string[]) {
     validate(changes);
     if (new Set(order).size !== order.length) throw new Error('卡片顺序重复');
     const db = await this.open();
@@ -141,9 +143,30 @@ export class StorageBackend {
     try {
       const heads = tx.objectStore('projects');
       const old: Head | undefined = await request(heads.get(project));
-      if ((old?.revision || 0) !== revision || old?.deleted) throw new Error('项目已在其他页面修改，请保留当前页面并重新加载后处理冲突');
+      if (old?.deleted) throw new Error('项目已删除，不能写入旧页面数据');
+      if (!baselineOrder && (old?.revision || 0) !== revision) throw new Error('项目已在其他页面修改');
       const generation = old?.generation || crypto.randomUUID();
       const cards = tx.objectStore('cards');
+      if (baselineOrder) {
+        const latest = await Promise.all(changes.map(c => request<EncodedCard | undefined>(cards.get([project, generation, c.id]))));
+        changes = changes.flatMap((change, i) => {
+          const remote = latest[i];
+          // Deletion wins over an edit from a page that still held the deleted card.
+          if (change.base != null && !remote) return [];
+          const data = remote && change.base != null ? mergeFields(change.base, change.data, remote.data) : change.data;
+          return [{ id: change.id, data, resources: resourceIds(data) }];
+        });
+        const ids = new Set(old?.order || []);
+        removed.forEach(id => ids.delete(id));
+        changes.forEach(card => ids.add(card.id));
+        const orderIds = new Set(order), baselineIds = new Set(baselineOrder);
+        const reordered = baselineOrder.filter(id => orderIds.has(id));
+        const localExisting = order.filter(id => baselineIds.has(id));
+        const localReordered = reordered.some((id, i) => id !== localExisting[i]);
+        const preferred = localReordered ? order : (old?.order || []);
+        const preferredIds = new Set(preferred);
+        order = [...preferred.filter(id => ids.has(id)), ...[...ids].filter(id => !preferredIds.has(id))];
+      }
       const before: EncodedCard[] = [];
       const touched = [...new Set([...changes.map(c => c.id), ...removed])];
       const previous = await Promise.all(touched.map(id => request<EncodedCard | undefined>(cards.get([project, generation, id]))));
@@ -158,7 +181,7 @@ export class StorageBackend {
       if (nextIds.size !== order.length || order.some(id => !nextIds.has(id))) throw new Error('卡片清单不一致');
       for (const card of changes) cards.put(card, [project, generation, card.id]);
       for (const id of removed) cards.delete([project, generation, id]);
-      const next: Head = { generation, revision: revision + 1, order };
+      const next: Head = { generation, revision: (old?.revision || 0) + 1, order };
       tx.objectStore('history').put({ previousHead: old || null, before, added: changes.filter(c => !previous[touched.indexOf(c.id)]).map(c => c.id), at: Date.now() }, [project, next.revision]);
       if (next.revision > 50) tx.objectStore('history').delete([project, next.revision - 50]);
       heads.put(next, project);
@@ -178,7 +201,7 @@ export class StorageBackend {
       const store = tx.objectStore('projects');
       const old: Head | undefined = await request(store.get(project));
       if ((old?.revision || 0) !== revision) throw new Error('项目已在其他页面修改，未删除');
-      const next = { generation: old?.generation || crypto.randomUUID(), revision: revision + 1, order: [], deleted: true };
+      const next = { generation: old?.generation || crypto.randomUUID(), revision: (old?.revision || 0) + 1, order: [], deleted: true };
       tx.objectStore('history').put({ previousHead: old || null, at: Date.now(), deleted: true }, [project, next.revision]);
       if (next.revision > 50) tx.objectStore('history').delete([project, next.revision - 50]);
       store.put(next, project);

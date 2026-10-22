@@ -1,4 +1,4 @@
-import { cardEntryFrame } from '../utils/cardEntrance';
+import { cardEntryFrame, waitForEntryDom } from '../utils/cardEntrance';
 import { calculateVideoPlayButtonDimensions, getPlayIconPath2D } from "../utils/videoPlayButton";
 import React, { useEffect, useRef } from 'react';
 import { readyPromptPanels } from '../utils/promptSurfaceCache';
@@ -884,6 +884,12 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
     let animating = false;
     const renderWithEntry = (card: CardData) => {
+      if (currentScale >= threshold) {
+        const domReady = Boolean(renderedIdsRef.current?.has(card.id) &&
+          (window as any).__paintedCardIds?.has(card.id) &&
+          (card.fileName || card.isAsset || readyPromptPanels.has(card.id)));
+        if (waitForEntryDom(card.id, domReady)) return;
+      }
       const entry = cardEntryFrame(card.id);
       if (!entry || dragging) { renderCard(card); return; }
       animating = true;

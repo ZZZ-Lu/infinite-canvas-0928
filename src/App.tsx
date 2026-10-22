@@ -1,3 +1,4 @@
+import { EntryBlurOverlay } from './components/EntryBlurOverlay';
 import { registerCardEntries } from './utils/cardEntrance';
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
@@ -19,7 +20,7 @@ import { getBottomPanelHeight } from './utils/cardLayout';
 import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
 import { cropBoundingBoxFromImage } from './utils/imageCropper';
 import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp } from 'lucide-react';
-import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces, hasPendingCardSaves } from './db';
+import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces, hasPendingCardSaves, subscribeCardSync, synchronizeCards } from './db';
 import { SettingsPage } from './components/SettingsPage';
 import { getDrafts, saveDraft, deleteDraft } from './utils/draftDb';
 import { McpKeyButton } from './components/McpKeyButton';
@@ -2590,7 +2591,8 @@ export default function App() {
     let snapshot: CardData[];
     do {
       snapshot = cardsRef.current;
-      await saveCards(snapshot, currentProjectId);
+      try { await saveCards(snapshot, currentProjectId); }
+      catch (error) { throw error; }
     } while (snapshot !== cardsRef.current);
   };
   const handleSelectProject = async (projectId: string) => {
@@ -2955,6 +2957,35 @@ export default function App() {
   }, [currentProjectId]);
 
   // Debounce incremental saves; bound continuous edits and cancel stale project callbacks.
+  useEffect(() => {
+    if (isLoading || loadedProjectIdRef.current !== currentProjectId) return;
+    let cancelled = false, busy = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = () => { clearTimeout(timer); timer = setTimeout(sync, 300); };
+    const sync = async () => {
+      if (cancelled) return;
+      if (busy || isUserPointerDownRef.current || isDraggingCanvasRef.current || isZoomingRef.current) { schedule(); return; }
+      const snapshot = cardsRef.current;
+      busy = true;
+      try {
+        const current = () => !cancelled && currentProjectIdRef.current === currentProjectId && cardsRef.current === snapshot;
+        const latest = await synchronizeCards(currentProjectId, snapshot, current);
+        if (latest && current()) {
+          if (latest.length !== snapshot.length || latest.some((card, i) => card !== snapshot[i])) {
+            cardsRef.current = latest;
+            setCards(latest, false);
+          }
+        } else if (!cancelled) schedule();
+      } catch (error) { console.error('同步项目失败，当前修改保留', error); }
+      finally { busy = false; }
+    };
+    const unsubscribe = subscribeCardSync(id => { if (id === currentProjectId) schedule(); });
+    const onFocus = () => { if (document.visibilityState === 'visible') schedule(); };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onFocus);
+    schedule();
+    return () => { cancelled = true; clearTimeout(timer); unsubscribe(); window.removeEventListener('focus', onFocus); document.removeEventListener('visibilitychange', onFocus); };
+  }, [currentProjectId, isLoading, setCards]);
   const saveCardsTimerRef = useRef<NodeJS.Timeout | null>(null);
   const dirtySaveRef = useRef<{ project: string; since: number } | null>(null);
   useEffect(() => {
@@ -2976,7 +3007,8 @@ export default function App() {
           }
           try {
             const snapshot = cardsRef.current;
-            await saveCards(snapshot, currentProjectId);
+            try { await saveCards(snapshot, currentProjectId); }
+      catch (error) { throw error; }
             if (!cancelled && currentProjectIdRef.current === currentProjectId && cardsRef.current === snapshot) {
               dirtySaveRef.current = null;
             }
@@ -2984,7 +3016,7 @@ export default function App() {
             console.error(err);
             if (!cancelled) {
               showToastNotice(`保存失败：${err instanceof Error ? err.message : '请重试'}`, { id: "save-status", dotColor: "bg-red-500", duration: 6000 });
-              if (++retries <= 3 && !String(err).includes('其他页面')) saveCardsTimerRef.current = setTimeout(doSave, 1000 * retries);
+              if (++retries <= 3) saveCardsTimerRef.current = setTimeout(doSave, 1000 * retries);
             }
           }
         };
@@ -3005,7 +3037,7 @@ export default function App() {
   useEffect(() => {
     const flushOnHide = () => {
       if (currentProjectId && loadedProjectIdRef.current === currentProjectId) {
-        saveCards(cardsRef.current, currentProjectId).catch(() => {});
+        saveCards(cardsRef.current, currentProjectId).catch(error => console.error(error));
       }
     };
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
@@ -7104,11 +7136,14 @@ export default function App() {
     return cards.filter(card => visibleCardIdSet.has(card.id));
   }, [cards, visibleCardIdSet, tx, ty, tScale]);
 
+  const entryBlurBatchRef = useRef(0);
   // Register only actual additions/project loads, not LOD mounts or viewport changes.
-  useMemo(() => {
+  const entryBlurBatch = useMemo(() => {
     if (!isLoading && currentProjectId && loadedProjectIdRef.current === currentProjectId) {
-      registerCardEntries(currentProjectId, cards.map(card => ({ id: card.id, x: card.x, y: card.y, ...getCardSize(card) })), new Set(cards.filter(card => isCardIntersectingRectangle(card, { viewportWidth: window.innerWidth, viewportHeight: window.innerHeight, tx: tx.get(), ty: ty.get(), scale: tScale.get() })).map(card => card.id)), performance.now(), window.matchMedia('(prefers-reduced-motion: reduce)').matches, { x: (window.innerWidth / 2 - tx.get()) / tScale.get(), y: (window.innerHeight / 2 - ty.get()) / tScale.get() });
+      const added = registerCardEntries(currentProjectId, cards.map(card => ({ id: card.id, x: card.x, y: card.y, ...getCardSize(card) })), new Set(cards.filter(card => isCardIntersectingRectangle(card, { viewportWidth: window.innerWidth, viewportHeight: window.innerHeight, tx: tx.get(), ty: ty.get(), scale: tScale.get() })).map(card => card.id)), performance.now(), window.matchMedia('(prefers-reduced-motion: reduce)').matches, { x: (window.innerWidth / 2 - tx.get()) / tScale.get(), y: (window.innerHeight / 2 - ty.get()) / tScale.get() });
+      if (added) entryBlurBatchRef.current++;
     }
+    return entryBlurBatchRef.current;
   }, [cards, currentProjectId, isLoading, visibleCards]);
   // --- Center-Out Event-Driven Interruptible Mount Queue ---
   // Replaces fixed timers and arbitrary batch quotas with a human-centric priority queue:
@@ -8307,6 +8342,8 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      {/* One temporary blur layer above both card renderers. */}
+      {entryBlurBatch > 0 && <EntryBlurOverlay key={entryBlurBatch} />}
       {/* Real-time FPS Counter */}
       <FpsCounter hasActiveTask={!!agentTask} notices={topNotices} />
 

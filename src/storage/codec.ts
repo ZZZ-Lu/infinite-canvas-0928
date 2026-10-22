@@ -1,6 +1,6 @@
 // Storage DTOs contain resource IDs, never runtime blob URLs.
 export interface Resource { id: string; value: Blob | string }
-export interface EncodedCard { id: string; data: any; resources: string[] }
+export interface EncodedCard { id: string; data: any; resources: string[]; base?: any }
 const marker = '__infiniteCanvasResource';
 export class CardCodec {
   private blobs = new WeakMap<Blob, string>();

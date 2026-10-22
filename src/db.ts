@@ -98,3 +98,20 @@ export async function loadAgentTraces(): Promise<AgentRuntimeTrace[] | null> {
     request.onerror = () => { db.close(); reject(request.error); };
   });
 }
+
+
+const cardSyncListeners = new Set<(projectId: string) => void>();
+const cardSyncChannel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('infinite-canvas-card-commits') : null;
+const notifyCardSync = (key: string) => {
+  if (typeof key !== 'string' || !key.startsWith('cards_')) return;
+  cardSyncListeners.forEach(listener => listener(key.slice(6)));
+};
+cardRepository.onCommit = key => { cardSyncChannel?.postMessage(key); notifyCardSync(key); };
+if (cardSyncChannel) cardSyncChannel.onmessage = event => notifyCardSync(event.data);
+export function subscribeCardSync(listener: (projectId: string) => void) {
+  cardSyncListeners.add(listener);
+  return () => { cardSyncListeners.delete(listener); };
+}
+export function synchronizeCards(projectId: string, snapshot: CardData[], stillCurrent: () => boolean) {
+  return cardRepository.synchronize(`cards_${projectId}`, snapshot, stillCurrent);
+}

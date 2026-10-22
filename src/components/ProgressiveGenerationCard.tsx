@@ -1,4 +1,6 @@
-import React, { useCallback, useSyncExternalStore } from 'react';
+import { isNewCardAwaitingLod } from '../utils/cardEntrance';
+import { getNanoLodThreshold } from '../utils/viewportCulling';
+import React, { useCallback, useRef, useState, useSyncExternalStore } from 'react';
 import { GenerationCard } from './GenerationCard';
 
 // Renderer-local admission state, separate from serializable card/project data.
@@ -27,8 +29,16 @@ export const ProgressiveGenerationCard = React.memo(function ProgressiveGenerati
   React.ComponentProps<typeof GenerationCard> & { mountStore: ReturnType<typeof createCardMountStore> }) {
   const id = props.data.id;
   const isSelected = Boolean(props.isSelected);
+  // Only newly created cards bypass the deferred global LOD state. Existing cards
+  // retain their painted-frame handoff while the camera crosses the threshold.
+  const [newCard] = useState(() => isNewCardAwaitingLod(id));
+  const subscribeScale = useCallback((listener: () => void) => newCard ? props.scale.on('change', listener) : () => {}, [newCard, props.scale]);
+  const getDomLod = useCallback(() => !newCard || props.scale.get() >= getNanoLodThreshold(), [newCard, props.scale]);
+  const useDomLod = useSyncExternalStore(subscribeScale, getDomLod, getDomLod);
   const subscribe = useCallback((listener: () => void) => mountStore.subscribe(id, listener), [id, mountStore]);
   const snapshot = useCallback(() => Boolean(isSelected || mountStore.ids.has(id)), [id, isSelected, mountStore]);
   const mounted = useSyncExternalStore(subscribe, snapshot, snapshot);
-  return (mounted || isSelected) ? <GenerationCard {...props} /> : null;
+  const admittedDom = useRef(false);
+  if (useDomLod && (mounted || isSelected)) admittedDom.current = true;
+  return (admittedDom.current || useDomLod) && (mounted || isSelected) ? <GenerationCard {...props} /> : null;
 });

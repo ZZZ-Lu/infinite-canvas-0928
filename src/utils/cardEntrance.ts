@@ -1,30 +1,40 @@
 // Renderer-only group state: all members share one world-space pivot and clock.
 type EntryGroup = { start?: number; x: number; y: number };
 const entries = new Map<string, EntryGroup>();
+const awaitingEntryDom = new Set<string>();
 let project: string | null = null;
 let known = new Set<string>();
-export const CARD_ENTRY_MS = 360;
+export const CARD_ENTRY_MS = 450;
 export function registerCardEntries(projectId: string, cards: { id: string; x: number; y: number; width: number; height: number }[], visible: Set<string>, now: number, reduced: boolean, pivot: { x: number; y: number }) {
-  if (project !== projectId) { project = projectId; known = new Set(); entries.clear(); }
+  const isProjectEntry = project !== projectId;
+  if (isProjectEntry) { project = projectId; known = new Set(); entries.clear(); awaitingEntryDom.clear(); }
   const next = new Set(cards.map(card => card.id));
   const added = reduced ? [] : cards.filter(card => !known.has(card.id) && visible.has(card.id));
   if (added.length) {
     const group: EntryGroup = { x: pivot.x, y: pivot.y };
-    for (const card of added) entries.set(card.id, group);
+    for (const card of added) {
+      if (!isProjectEntry) awaitingEntryDom.add(card.id);
+      entries.set(card.id, isProjectEntry ? group : { x: card.x + card.width / 2, y: card.y + card.height / 2 });
+    }
   }
   for (const [id, group] of entries) if (!next.has(id) || (group.start !== undefined && now >= group.start + CARD_ENTRY_MS)) entries.delete(id);
+  for (const id of awaitingEntryDom) if (!next.has(id)) awaitingEntryDom.delete(id);
   known = next;
+  // Only whole-project entrances trigger the shared blur overlay.
+  // New cards retain their individual entry animation without blurring the page.
+  return isProjectEntry && added.length > 0;
 }
-// Accelerate toward the surface and brake to rest without overshoot.
+// Accelerate into the canvas, then give one small scale pulse on landing.
 export function sampleCardEntry(progress: number) {
   const t = Math.max(0, Math.min(1, progress));
   const smooth = (v: number) => v * v * (3 - 2 * v);
-  // Cubic acceleration/deceleration: low launch speed, pronounced peak, firm stop.
-  const travel = t < 0.6
-    ? 0.6 * Math.pow(t / 0.6, 3)
-    : 1 - 0.4 * Math.pow((1 - t) / 0.4, 3);
-  const scale = 1 + 0.38 * (1 - travel);
-  return { scale, opacity: smooth(Math.min(1, t / 0.22)) };
+  // Land at 72%, expand gently to 101.8%, then settle at normal size.
+  const scale = t < 0.72
+    ? 1 + 0.38 * (1 - Math.pow(t / 0.72, 4))
+    : t < 0.86
+      ? 1 + 0.018 * smooth((t - 0.72) / 0.14)
+      : 1 + 0.018 * (1 - smooth((t - 0.86) / 0.14));
+  return { scale, opacity: 1 };
 }
 export function cardEntryFrame(id: string, now = performance.now(), keyframes = false) {
   const group = entries.get(id);
@@ -36,3 +46,12 @@ export function cardEntryFrame(id: string, now = performance.now(), keyframes = 
   const samples = keyframes ? Array.from({ length: 41 }, (_, i) => sampleCardEntry(progress + (1 - progress) * i / 40)) : [];
   return { pivotX: group.x, pivotY: group.y, ...sampleCardEntry(progress), scales: samples.map(frame => frame.scale), opacities: samples.map(frame => frame.opacity), delay: Math.max(0, start - now) / 1000, duration: (1 - progress) * CARD_ENTRY_MS / 1000 };
 }
+
+// New cards at DOM scale wait for that renderer rather than showing a nano placeholder.
+// Retire this one-time guard only after the normal painted/panel-ready handshake.
+export function waitForEntryDom(id: string, ready: boolean) {
+  if (!awaitingEntryDom.has(id)) return false;
+  if (ready) awaitingEntryDom.delete(id);
+  return true;
+}
+export function isNewCardAwaitingLod(id: string) { return awaitingEntryDom.has(id); }

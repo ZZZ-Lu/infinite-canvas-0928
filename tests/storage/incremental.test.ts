@@ -81,14 +81,14 @@ test('failed transaction retains old revision and retry commits the pending chan
   await repo.save([card('a', { x: 5 })], 'p');
   assert.equal((await backend.load('p'))!.cards[0].data.x, 5);
 });
-test('cross-tab stale revision rejects without replacing newer data', async () => {
+test('cross-tab same field uses last committed edit', async () => {
   const first = harness();
   await first.repo.save([card('a')], 'p');
   const second = harness();
   await second.repo.load('p');
   await first.repo.save([card('a', { x: 3 })], 'p');
-  await assert.rejects(second.repo.save([card('a', { x: 7 })], 'p'), /其他页面/);
-  assert.equal((await first.backend.load('p'))!.cards[0].data.x, 3);
+  await second.repo.save([card('a', { x: 7 })], 'p');
+  assert.equal((await first.backend.load('p'))!.cards[0].data.x, 7);
 });
 test('deletion tombstone prevents stale saves and legacy resurrection', async () => {
   await seedLegacy('p', [card('a')]);
@@ -198,4 +198,59 @@ test('failed bulk staging never publishes a partial project and can retry', asyn
   fail = false;
   await repo.save(next, 'p');
   assert.equal((await backend.load('p'))!.cards.length, 48);
+});
+
+test('concurrent fields/additions merge; explicit deletion wins; sync adopts latest', async () => {
+  const { repo, rpc } = harness();
+  await repo.save([card('a'),card('b')], 'p');
+  const other = new CardRepository(rpc);
+  const local = (await repo.load('p'))!;
+  const remote = (await other.load('p'))!;
+  await other.save([{...remote[0],prompt:'remote'},remote[1],card('c')], 'p');
+  const edited = [{...local[0],x:17},local[1]];
+  await repo.save(edited,'p');
+  const latest = (await repo.synchronize('p',edited,()=>true))!;
+  assert.equal(latest[0].prompt,'remote'); assert.equal(latest[0].x,17);
+  assert.deepEqual(latest.map(c=>c.id),['a','b','c']);
+  await repo.save(latest.filter(c=>c.id!=='a'),'p');
+  await other.save([{...remote[0],prompt:'stale edit'},remote[1],card('c')],'p');
+  const reader = new CardRepository(rpc);
+  assert.deepEqual((await reader.load('p'))!.map(c=>c.id),['b','c']);
+});
+test('nested fields merge and removed fields do not overwrite unrelated edits', async () => {
+  const {repo,rpc}=harness();
+  await repo.save([card('a',{mcpParameters:{quality:'low',duration:5}})],'p');
+  const other=new CardRepository(rpc);
+  const a=(await repo.load('p'))!, b=(await other.load('p'))!;
+  await repo.save([{...a[0],mcpParameters:{duration:5}}],'p');
+  await other.save([{...b[0],mcpParameters:{quality:'low',duration:10}}],'p');
+  assert.deepEqual((await new CardRepository(rpc).load('p'))![0].mcpParameters,{duration:10});
+});
+test('sync rejects stale UI snapshot and catches changes on a later sync', async () => {
+  const {repo,rpc}=harness(); await repo.save([card('a')],'p');
+  const base=(await repo.load('p'))!;
+  const other=new CardRepository(rpc); await other.load('p');
+  await other.save([card('a',{prompt:'remote'})],'p');
+  assert.equal(await repo.synchronize('p',base,()=>false),null);
+  const local=[{...base[0],x:42}];
+  const result=(await repo.synchronize('p',local,()=>true))!;
+  assert.equal(result[0].x,42); assert.equal(result[0].prompt,'remote');
+});
+test('stale bulk edits merge without dropping remote cards and preserve media', async () => {
+  const {repo,rpc}=harness();
+  const original = new Blob(['original']);
+  await repo.save(Array.from({length:20},(_,i)=>card(String(i),{fileData:original})), 'p');
+  const local=(await repo.load('p'))!;
+  const other=new CardRepository(rpc); const remote=(await other.load('p'))!;
+  await other.save([{...remote[0],prompt:'remote'},...remote.slice(1),card('extra')],'p');
+  await repo.save(local.map(c=>({...c,x:99})),'p');
+  const result=(await new CardRepository(rpc).load('p'))!;
+  assert.equal(result.length,21); assert.equal(result[0].prompt,'remote');
+  assert.equal(result[0].x,99); assert.equal(await result[0].fileData!.text(),'original');
+});
+test('unchanged sync checks only head, with no full load or assets', async () => {
+  const {repo,calls}=harness(); const cards=[card('a')];
+  await repo.save(cards,'p'); calls.length=0;
+  assert.equal(await repo.synchronize('p',cards,()=>true),cards);
+  assert.deepEqual(calls.map(c=>c.method),['getHead']);
 });

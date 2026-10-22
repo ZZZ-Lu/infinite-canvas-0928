@@ -4,7 +4,7 @@ const backend = new StorageBackend();
 self.onmessage = async (event: MessageEvent) => {
   const { id, method, args } = event.data;
   try {
-    if (!['load', 'assets', 'getAssets', 'commit', 'remove', 'restore', 'stage', 'discard', 'commitStaged'].includes(method)) throw new Error('Invalid storage operation');
+    if (!['getHead', 'load', 'assets', 'getAssets', 'commit', 'remove', 'restore', 'stage', 'discard', 'commitStaged'].includes(method)) throw new Error('Invalid storage operation');
     const value = await (backend[method as keyof StorageBackend] as Function).apply(backend, args);
     self.postMessage({ id, value });
   } catch (error) {

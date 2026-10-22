@@ -8,13 +8,14 @@ type Session = {
   revision: number; deleted: boolean; signatures: Map<string, string>;
   refs: Map<string, CardData>; order: string[];
   pending?: { cards: CardData[]; waiters: Waiter[] };
-  running?: Promise<void>; failed?: boolean;
+  running?: Promise<void>; failed?: boolean; needsSync?: boolean;
 };
 
 export class CardRepository {
   private codec = new CardCodec();
   private sessions = new Map<string, Session>();
   private loading = new Map<string, Promise<CardData[] | null>>();
+  onCommit?: (project: string) => void;
   constructor(private rpc: Transport) {}
   hasPending() { return [...this.sessions.values()].some(s => s.pending || s.running || s.failed); }
   load(project: string): Promise<CardData[] | null> {
@@ -94,7 +95,7 @@ export class CardRepository {
             const encoded = await this.codec.card(card);
             const signature = JSON.stringify(encoded.data);
             signatures.set(card.id, signature);
-            if (signature !== session.signatures.get(card.id)) changes.push(encoded);
+            if (signature !== session.signatures.get(card.id)) changes.push({ ...encoded, base: session.signatures.has(card.id) ? JSON.parse(session.signatures.get(card.id)!) : null });
           }
           if (performance.now() - sliceStart > 3) { await yieldTask(); sliceStart = performance.now(); }
         }
@@ -126,15 +127,17 @@ export class CardRepository {
                 batch.push(change); bytes += size;
               }
               if (batch.length) await this.rpc('stage', token, batch);
-              head = await this.rpc('commitStaged', project, session.revision, token, removed, order);
+              head = await this.rpc('commitStaged', project, session.revision, token, removed, order, session.order);
             } catch (error) {
               await this.rpc('discard', token).catch(() => {});
               throw error;
             }
           } else {
-            head = await this.rpc('commit', project, session.revision, changes, removed, order);
+            head = await this.rpc('commit', project, session.revision, changes, removed, order, session.order);
           }
+          session.needsSync ||= head.revision !== session.revision + 1;
           session.revision = head.revision;
+          this.onCommit?.(project);
         }
         session.signatures = signatures;
         session.refs = nextRefs;
@@ -147,6 +150,44 @@ export class CardRepository {
         // Keep the baseline unchanged. The UI retains current data; retries diff against it.
       }
     }
+  }
+  async synchronize(project: string, snapshot: CardData[], stillCurrent: () => boolean): Promise<CardData[] | null> {
+    // Flush this page's edits first. Never replace an editing page with a stale read.
+    await this.save(snapshot, project);
+    const session = this.sessions.get(project)!;
+    if (session.running) await session.running;
+    if (!stillCurrent() || session.pending || session.failed) return null;
+    const revision = session.revision;
+    const head = await this.rpc('getHead', project);
+    if (head && !head.deleted && head.revision === revision && !session.needsSync) return stillCurrent() ? snapshot : null;
+    const stored = await this.rpc('load', project);
+    if (!stored || stored.head.deleted) throw new Error('项目已删除，请切换项目');
+    const signatures = new Map<string, string>();
+    const changed: EncodedCard[] = [];
+    for (const record of stored.cards as EncodedCard[]) {
+      const signature = JSON.stringify(record.data);
+      signatures.set(record.id, signature);
+      if (signature !== session.signatures.get(record.id)) changed.push(record);
+    }
+    const ids = [...new Set(changed.flatMap(record => record.resources))];
+    for (let i = 0; i < ids.length; i += 8) {
+      this.codec.accept(await this.rpc('getAssets', ids.slice(i, i + 8)));
+      await yieldTask();
+    }
+    const cards: CardData[] = [];
+    for (let i = 0; i < stored.cards.length; i++) {
+      const record = stored.cards[i];
+      cards.push(signatures.get(record.id) === session.signatures.get(record.id)
+        ? session.refs.get(record.id)! : this.codec.decode(record.data));
+      if (i % 16 === 15) await yieldTask();
+    }
+    if (!stillCurrent() || session.running || session.pending || session.revision !== revision || session.failed) return null;
+    session.needsSync = false;
+    session.revision = stored.head.revision;
+    session.signatures = signatures;
+    session.refs = new Map(cards.map(card => [card.id, card]));
+    session.order = cards.map(card => card.id);
+    return cards;
   }
   async remove(project: string) {
     if (!this.sessions.has(project)) await this.load(project);
