@@ -1,5 +1,5 @@
 import { EntryBlurOverlay } from './components/EntryBlurOverlay';
-import { registerCardEntries } from './utils/cardEntrance';
+import { registerCardEntries, requestCardEntries } from './utils/cardEntrance';
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
 import { AgentContextMenu } from './components/AgentContextMenu';
@@ -11,7 +11,7 @@ import { FpsCounter, showToastNotice } from './components/FpsCounter';
 import { generateImageThumbnail, generateVideoThumbnail, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
 import { fastGetImageDimensions } from './utils/imageHeader';
 import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
-import { CANVAS_IDLE_MS, scheduleCanvasSurface } from './utils/canvasPerformance';
+import { CANVAS_IDLE_MS, scheduleCanvasSurface, canLoadDuringCameraGesture, subscribeCanvasLoadingMode } from './utils/canvasPerformance';
 import { readyPromptPanels } from './utils/promptSurfaceCache';
 import { createCardMountStore, ProgressiveGenerationCard } from './components/ProgressiveGenerationCard';
 import { canRetireDomForNano, type LodFrame } from './utils/lodHandoff';
@@ -372,6 +372,9 @@ export default function App() {
   const updateCurrentScale = (latestScale: number) => {
     const workspace = document.getElementById('canvas-workspace');
     if (workspace) {
+      // Selection strokes compensate camera scale every frame, independently of
+      // content loading and the frozen scale used by expensive gesture styles.
+      workspace.style.setProperty('--selection-scale', latestScale.toString());
       if (workspace.getAttribute('data-gesture') === 'true') {
         // A single boundary switch lets the already-active Nano canvas take over,
         // without reconciling/unmounting every editor in the middle of a wheel gesture.
@@ -714,6 +717,7 @@ export default function App() {
       imageUrl: null
     };
 
+    requestCardEntries(currentProjectId, [newCard.id]);
     setCards(prev => [...prev, newCard]);
     setSelectedCardIds([newId]);
     setDrawerOpen(false);
@@ -2350,6 +2354,7 @@ export default function App() {
 
     // Immediately place all cards on canvas with their true aspect ratio and visible image!
     const initialCards = parsedItems.map(item => item!.card);
+    requestCardEntries(currentProjectId, initialCards.map(card => card.id));
     setCards(prev => [...prev, ...initialCards]);
     setSelectedCardIds(initialCards.map(c => c.id));
 
@@ -3496,14 +3501,14 @@ export default function App() {
     const handleCardPainted = () => {
       if (timer !== null) return;
       const flush = () => {
-        if (isZoomingRef.current || (window as any).isDraggingCard || (window as any).__nanoDragging) {
+        if ((isZoomingRef.current && !canLoadDuringCameraGesture()) || (window as any).isDraggingCard || (window as any).__nanoDragging) {
           timer = setTimeout(flush, CANVAS_IDLE_MS);
           return;
         }
         timer = null;
         setPaintEpoch(n => (n + 1) % 1000000);
       };
-      timer = setTimeout(flush, CANVAS_IDLE_MS);
+      timer = setTimeout(flush, canLoadDuringCameraGesture() ? 32 : CANVAS_IDLE_MS);
     };
     window.addEventListener('card-painted', handleCardPainted);
     return () => {
@@ -3531,9 +3536,9 @@ export default function App() {
       cullingThrottleTimerRef.current = null;
     }
 
-    // STRICT ZERO STATE-UPDATE DURING ACTIVE GESTURE:
-    // Panning or card dragging must never trigger React state updates (setVisibleCardIdSet)
-    // to protect 60fps gesture smoothness. Full culling sync happens on pointer up / style restore.
+    // Camera gestures refresh visible candidates in bounded intervals while moving.
+    // Individual-card dragging still defers loading.
+    const liveCameraGesture = canLoadDuringCameraGesture();
     const isGestureActive = Boolean(
       isDraggingCanvasRef.current ||
       isZoomingRef.current ||
@@ -3546,8 +3551,16 @@ export default function App() {
       ))
     );
 
-    if (!_forceImmediate && isGestureActive) {
+    if (!_forceImmediate && isGestureActive && !liveCameraGesture) {
       return;
+    }
+    if (!_forceImmediate && liveCameraGesture) {
+      const elapsed = Date.now() - lastVisibleSetUpdateTimeRef.current;
+      if (elapsed < 80) {
+        cullingThrottleTimerRef.current = setTimeout(() => updateCircularCulling(), 80 - elapsed);
+        return;
+      }
+      lastVisibleSetUpdateTimeRef.current = Date.now();
     }
 
     const currentScale = tScale.get() || 1;
@@ -3605,7 +3618,10 @@ export default function App() {
     updateCircularCulling(true);
     const handleResize = () => updateCircularCulling(true);
     window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      clearTimeout(cullingThrottleTimerRef.current);
+    };
   }, [updateCircularCulling]);
 
   // Immediate sync when cards collection or active selection changes
@@ -3783,9 +3799,9 @@ export default function App() {
 
   useEffect(() => {
     const unsub = tScale.on('change', (s) => {
-      // Strictly defer React state updates during active zoom/drag gestures.
-      // Eliminates the 40% scale boundary frame spike by avoiding React re-renders mid-gesture.
-      if (isZoomingRef.current || isDraggingCanvasRef.current) {
+      // Admit the next LOD during camera motion; its cards still mount progressively.
+      // Keep the existing painted-frame handoff to avoid blank transitions.
+      if ((isZoomingRef.current || isDraggingCanvasRef.current) && !canLoadDuringCameraGesture()) {
         return;
       }
       const threshold = getNanoLodThreshold();
@@ -4266,6 +4282,7 @@ export default function App() {
         mcpParameters: { mode: 'SubjectToVideo', duration: 5, enable_sound: false, resolution: 3 },
       } : {}),
     };
+    requestCardEntries(currentProjectId, [newCard.id]);
     setCards(prev => [...prev, newCard]);
     if (ownerId === 'user') setSelectedCardIds([newCard.id]);
     
@@ -5122,6 +5139,7 @@ export default function App() {
             referenceImages: collectedRefImages,
             mcpModel: WORKRALLY_IMAGE_MODELS[0].id,
           };
+          requestCardEntries(currentProjectId, [newCardObj.id]);
           setCards(prev => [...prev, newCardObj]);
           cardsRef.current = [...cardsRef.current.filter(c => c.id !== newCardObj.id), newCardObj];
           activeCard = newCardObj;
@@ -6596,19 +6614,31 @@ export default function App() {
     // 1. If zoomed in past 100% (scale > 1.001), zoom directly back to 100% (1.0) anchored at the mouse cursor
     // 2. If at normal zoom (0.20 <= scale <= 1.001), zoom directly out to 10% (0.1) anchored at the mouse cursor
     // 3. If zoomed out (scale < 0.20), zoom directly into 100% (1.0) anchored at the mouse cursor
+    const returnToFullScale = (targetTx: number, targetTy: number) => {
+      const destination = { x: targetTx, y: targetTy, scale: 1 };
+      targetTransform.current = destination;
+      clearTimeout(zoomTimeoutRef.current);
+      // isZooming already pauses the mount queue; avoid an extra latch that
+      // could remain set if this tween is interrupted by another gesture.
+      const transition = { type: 'tween' as const, duration: 0.36, ease: [0.16, 1, 0.3, 1] as [number, number, number, number] };
+      // Wait for all camera axes, then start normal progressive loading immediately.
+      void Promise.all([
+        animate(tScale, 1, transition),
+        animate(tx, targetTx, transition),
+        animate(ty, targetTy, transition),
+      ]).then(() => {
+        // A wheel gesture or a newer zoom owns restoration if this one was superseded.
+        if (targetTransform.current !== destination) return;
+        clearTimeout(zoomTimeoutRef.current);
+        restoreCanvasStyles();
+      });
+    };
     if (currentScale > 1.001) {
       const targetScale = 1.0;
       const targetTx = cursorX - worldX * targetScale;
       const targetTy = cursorY - worldY * targetScale;
 
-      targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
-
-      clearTimeout(zoomTimeoutRef.current);
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
-
-      animate(tScale, targetScale, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
-      animate(tx, targetTx, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
-      animate(ty, targetTy, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
+      returnToFullScale(targetTx, targetTy);
     } else if (currentScale >= 0.20) {
       const targetScale = 0.1;
       const targetTx = cursorX - worldX * targetScale;
@@ -6628,27 +6658,7 @@ export default function App() {
       const targetTx = cursorX - worldX * targetScale;
       const targetTy = cursorY - worldY * targetScale;
 
-      targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
-
-      clearTimeout(zoomTimeoutRef.current);
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
-
-      // Set state to defer mounting until zoom animation completes
-      isZoomAnimationActiveRef.current = true;
-      setIsZoomAnimationActive(true);
-
-      animate(tScale, targetScale, { 
-        type: 'tween', 
-        duration: 0.36, 
-        ease: [0.16, 1, 0.3, 1],
-        onComplete: () => {
-          isZoomAnimationActiveRef.current = false;
-          setIsZoomAnimationActive(false);
-          setMountEpoch(n => (n + 1) % 1000000);
-        }
-      });
-      animate(tx, targetTx, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
-      animate(ty, targetTy, { type: 'tween', duration: 0.36, ease: [0.16, 1, 0.3, 1] });
+      returnToFullScale(targetTx, targetTy);
     }
   }, [tScale, tx, ty, restoreCanvasStyles]);
 
@@ -6758,8 +6768,7 @@ export default function App() {
         });
       }
 
-      // Instantly abort active mount queue on wheel tick to protect 60fps
-      window.dispatchEvent(new CustomEvent('abort-mount-queue'));
+      // Keep the adaptive queue running across wheel ticks; visibility updates reprioritize it.
 
       // 2. Clear the fallback timeout on every wheel tick
       clearTimeout(zoomTimeoutRef.current);
@@ -6968,6 +6977,7 @@ export default function App() {
             workspace.setAttribute('data-panning', 'true');
             workspace.setAttribute('data-gesture', 'true');
             window.dispatchEvent(new CustomEvent('canvas-gesture-start'));
+            window.dispatchEvent(new CustomEvent('resume-mount-queue'));
           }
           // Offload background video pauses to next animation frame to prevent pointerdown jank
           requestAnimationFrame(() => {
@@ -7149,8 +7159,7 @@ export default function App() {
   // Replaces fixed timers and arbitrary batch quotas with a human-centric priority queue:
   // 1. Sorts unmounted visible cards by Euclidean distance to viewport center (Center -> Perimeter).
   // 2. Mounts cards sequentially: Card 1 mounts -> awaits paint completion handshake -> Card 2 mounts -> ...
-  // 3. Fully interruptible (Abort token): Wheel or drag gestures instantly halt the queue (0ms latency),
-  //    and re-launch from the newly centered coordinates once motion stops.
+    // 3. Zoom/card drag pauses admission; camera panning reprioritizes visible work live.
   const mountQueueAbortRef = useRef<{ aborted: boolean; cancel?: () => void }>({ aborted: false });
   const isQueueProcessingRef = useRef(false);
   const visibleCardsRef = useRef<CardData[]>([]);
@@ -7163,7 +7172,7 @@ export default function App() {
   }, []);
 
   const runCenterOutMountQueue = useCallback(() => {
-    if (!isDomCardsActive || isZoomAnimationActiveRef.current) {
+    if (!isDomCardsActive) {
       if (!isDomCardsActive) {
         setRenderedCardIds(prev => {
           const selectedSet = new Set(selectedCardIdsRef.current);
@@ -7187,7 +7196,7 @@ export default function App() {
       currentWorkspace?.getAttribute('data-zooming') === 'true' ||
       currentWorkspace?.getAttribute('data-panning') === 'true'
     );
-    if (isGestureActive) {
+    if (isGestureActive && !canLoadDuringCameraGesture()) {
       abortMountQueue();
       return;
     }
@@ -7274,7 +7283,9 @@ export default function App() {
                 setRenderedCardIds(prev => {
                   const next = new Set(prev);
                   let hasNew = false;
+                  const stillVisible = new Set(visibleCardsRef.current.map(card => card.id));
                   for (const id of batchIds) {
+                    if (!stillVisible.has(id)) continue;
                     if (!next.has(id)) { next.add(id); hasNew = true; }
                   }
                   return hasNew ? next : prev;
@@ -7310,6 +7321,16 @@ export default function App() {
     visibleCardsRef.current = visibleCards;
     runCenterOutMountQueue();
   }, [visibleCards, runCenterOutMountQueue, mountEpoch]);
+
+  useEffect(() => subscribeCanvasLoadingMode(() => {
+    updateCircularCulling();
+    if (canLoadDuringCameraGesture() || (!isZoomingRef.current && !isDraggingCanvasRef.current)) {
+      const nano = tScale.get() < getNanoLodThreshold();
+      setIsMicroLod(nano);
+      setIsNanoLod(nano);
+    }
+    runCenterOutMountQueue();
+  }), [updateCircularCulling, tScale, runCenterOutMountQueue]);
 
   useEffect(() => {
     const handleAbort = () => abortMountQueue();

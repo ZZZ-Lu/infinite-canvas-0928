@@ -3,6 +3,40 @@ import { createRecoveryPacer } from './canvasRecoveryPolicy';
 // Shared idle interval for gesture effects and high-resolution image restoration.
 export const CANVAS_IDLE_MS = 300;
 
+export type CanvasLoadingMode = 'immediate' | 'lazy';
+const loadingModeKey = 'canvas_loading_mode';
+export const CANVAS_LOADING_MODE_EVENT = 'canvas-loading-mode-change';
+let loadingMode: CanvasLoadingMode = 'immediate';
+try {
+  if (localStorage.getItem(loadingModeKey) === 'lazy') loadingMode = 'lazy';
+} catch { /* A disabled preference store must not prevent rendering. */ }
+export function getCanvasLoadingMode() { return loadingMode; }
+export function setCanvasLoadingMode(mode: CanvasLoadingMode) {
+  loadingMode = mode;
+  try { localStorage.setItem(loadingModeKey, mode); } catch { /* Session preference still applies. */ }
+  window.dispatchEvent(new Event(CANVAS_LOADING_MODE_EVENT));
+}
+export function subscribeCanvasLoadingMode(listener: () => void) {
+  window.addEventListener(CANVAS_LOADING_MODE_EVENT, listener);
+  return () => window.removeEventListener(CANVAS_LOADING_MODE_EVENT, listener);
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', event => {
+    if (event.key !== loadingModeKey && event.key !== null) return;
+    loadingMode = event.newValue === 'lazy' ? 'lazy' : 'immediate';
+    window.dispatchEvent(new Event(CANVAS_LOADING_MODE_EVENT));
+  });
+}
+
+// Rendering policy only: camera pan and zoom may load proxies progressively.
+export function canLoadDuringCameraGesture() {
+  if (loadingMode === 'lazy' || typeof document === 'undefined') return false;
+  const workspace = document.getElementById('canvas-workspace');
+  return (workspace?.getAttribute('data-panning') === 'true' ||
+    workspace?.getAttribute('data-zooming') === 'true') &&
+    !(window as any).isDraggingCard && !(window as any).__nanoDragging;
+}
+
 // Mounting and drawing share this adaptive, render-only queue.
 type SurfaceOptions = { priority?: 'prompt'; label?: string };
 const surfaceJobs = new Map<symbol, { run: () => void; options: SurfaceOptions; queuedAt: number }>();
@@ -33,7 +67,8 @@ function pumpSurfaces(frameTime: number) {
     return;
   }
   const workspace = document.getElementById('canvas-workspace');
-  const moving = ['data-gesture', 'data-panning', 'data-zooming'].some(
+  const cameraMoving = canLoadDuringCameraGesture();
+  const moving = !cameraMoving && ['data-gesture', 'data-panning', 'data-zooming'].some(
     name => workspace?.getAttribute(name) === 'true',
   );
   if (moving) {
@@ -46,7 +81,7 @@ function pumpSurfaces(frameTime: number) {
     // the synchronous time spent admitting a card to the mount store.
     if (previousFrame !== null) pacer.observeFrame(frameTime - previousFrame);
     previousFrame = frameTime;
-    if (++framesSinceJob > pacer.idleFrames) {
+    if (++framesSinceJob > Math.max(cameraMoving ? 1 : 0, pacer.idleFrames)) {
       framesSinceJob = 0;
       // Finish already-mounted prompt surfaces before admitting another card.
       // Still execute just one job at the existing adaptive frame cadence.

@@ -4760,15 +4760,15 @@ export const GenerationCard = React.memo(function GenerationCard({
             width: w, 
             height: h,
             outlineWidth: pickerSelectionIndex && pickerSelectionIndex > 0 
-              ? 'calc(4px / var(--current-scale, 1))' 
+              ? 'calc(4px / var(--selection-scale, 1))'
               : isAgentTarget && isSelected
                 ? '0px'
               : isAgentTarget
-                ? 'calc(2px / var(--current-scale, 1))'
+                ? 'calc(2px / var(--selection-scale, 1))'
                 : isPickerTarget
-                  ? 'calc(2px / var(--current-scale, 1))'
+                  ? 'calc(2px / var(--selection-scale, 1))'
                   : isSelected 
-                    ? 'calc(2px / var(--current-scale, 1))' 
+                    ? 'calc(2px / var(--selection-scale, 1))'
                     : '0px',
             boxShadow: pickerSelectionIndex && pickerSelectionIndex > 0
               ? '0 12px 30px rgba(37, 99, 235, 0.45)'
@@ -5373,7 +5373,7 @@ export const GenerationCard = React.memo(function GenerationCard({
           <div 
             className="dual-selection-border absolute inset-0 pointer-events-none rounded-[20px] corner-squircle z-[90] select-none transition-opacity duration-150"
             style={{
-              padding: 'calc(2px / var(--current-scale, 1))',
+              padding: 'calc(2px / var(--selection-scale, 1))',
               background: 'linear-gradient(135deg, #3b82f6 0%, #3b82f6 44%, #a45cf8 56%, #a45cf8 100%)',
               WebkitMask: 'linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0)',
               WebkitMaskComposite: 'xor',

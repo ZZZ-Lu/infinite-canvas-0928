@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
+import { getCanvasLoadingMode, setCanvasLoadingMode, subscribeCanvasLoadingMode } from '../utils/canvasPerformance';
 import {
   Braces,
   Database,
@@ -202,6 +203,7 @@ const parseModelInput = (value: string) => {
 };
 
 export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProject, onUpdateProject, agentRuntimeTraces = [] }) => {
+  const loadingMode = useSyncExternalStore(subscribeCanvasLoadingMode, getCanvasLoadingMode);
   const [selectedNode, setSelectedNode] = useState<NodeKey>('toc_infer');
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('debug');
   const [centerTab, setCenterTab] = useState<CenterTab>('input');
@@ -668,6 +670,17 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
       onWheel={(event) => event.stopPropagation()}
       className="fixed inset-0 z-[100] flex flex-col overflow-hidden bg-[#f7f7f8] text-slate-900 select-text dark:bg-[#0d0d0f] dark:text-slate-100"
     >
+      <div className="flex shrink-0 items-center justify-between gap-4 border-b border-slate-200 px-4 py-3 dark:border-white/10">
+        <div>
+          <div className="text-sm font-medium">画布即时分批加载</div>
+          <p className="text-xs text-slate-500">开启：缩放、拖拽时实时分批加载。关闭：停止操作 300ms 后懒分批加载。两种模式均自动调整加载节奏。</p>
+        </div>
+        <button type="button" role="switch" aria-checked={loadingMode === 'immediate'} aria-label="画布即时分批加载"
+          onClick={() => setCanvasLoadingMode(loadingMode === 'immediate' ? 'lazy' : 'immediate')}
+          className={`shrink-0 rounded-lg px-3 py-2 text-xs ${loadingMode === 'immediate' ? 'bg-violet-600 text-white' : 'bg-slate-200 text-slate-700 dark:bg-white/10 dark:text-slate-200'}`}>
+          {loadingMode === 'immediate' ? '即时分批加载 · 开' : '懒分批加载 · 关'}
+        </button>
+      </div>
       <header className="flex h-14 shrink-0 items-center gap-3 border-b border-slate-200 bg-gray-100 px-4 dark:border-white/10 dark:bg-[#151517]">
         <div className="grid h-8 w-8 place-items-center rounded-lg bg-violet-600 text-white"><ListTree size={16} /></div>
         <div className="min-w-0">
