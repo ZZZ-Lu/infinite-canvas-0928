@@ -4,6 +4,22 @@ import { IDBFactory, IDBObjectStore } from 'fake-indexeddb';
 import { StorageBackend } from '../../src/storage/backend';
 import { CardRepository } from '../../src/storage/repository';
 import { CardCodec } from '../../src/storage/codec';
+import { getVideoThumbnailDimensions } from '../../src/utils/thumbnail';
+
+test('native video posters retain source dimensions and survive storage separately from Nano thumbnails', async () => {
+  assert.deepEqual(getVideoThumbnailDimensions(3840, 2160, 0), { width: 3840, height: 2160 });
+  assert.deepEqual(getVideoThumbnailDimensions(1080, 1920, 0), { width: 1080, height: 1920 });
+  assert.deepEqual(getVideoThumbnailDimensions(3840, 2160, 256), { width: 256, height: 144 });
+  const { repo, rpc } = harness();
+  const video = new Blob(['video-bytes'], { type: 'video/mp4' });
+  const poster = 'data:image/webp;base64,cG9zdGVy';
+  const thumb = 'data:image/webp;base64,dGh1bWI=';
+  await repo.save([card('v', { isVideo: true, fileData: video, videoPosterUrl: poster, thumbnailUrl: thumb })], 'poster-test');
+  const loaded = await new CardRepository(rpc).load('poster-test');
+  assert.equal(loaded![0].videoPosterUrl, poster);
+  assert.equal(loaded![0].thumbnailUrl, thumb);
+  assert.equal(await loaded![0].fileData.text(), 'video-bytes');
+});
 
 beforeEach(() => { globalThis.indexedDB = new IDBFactory(); });
 function harness(backend = new StorageBackend()) {

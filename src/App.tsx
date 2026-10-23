@@ -3,12 +3,12 @@ import { registerCardEntries, requestCardEntries } from './utils/cardEntrance';
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
 import { AgentContextMenu } from './components/AgentContextMenu';
-import { GenerationCard, CardData, CARD_DIMENSIONS, getCardSize, safeParseJsonResponse, compressImageBlob, resolveReferenceToPayload, SubjectLandmarks, VisualElementAnnotation } from './components/GenerationCard';
+import { GenerationCard, CardData, CARD_DIMENSIONS, getCardSize, safeParseJsonResponse, compressImageBlob, resolveReferenceToPayload, SubjectLandmarks, VisualElementAnnotation, pauseVideosForNanoLod } from './components/GenerationCard';
 import { WORKRALLY_IMAGE_MODELS, WORKRALLY_IMAGE_TOOL } from './config/workrallyImageModels';
 import { WORKRALLY_VIDEO_MODELS, WORKRALLY_VIDEO_TOOL } from './config/workrallyVideoModels';
 import { NanoLodCanvas } from './components/NanoLodCanvas';
 import { FpsCounter, showToastNotice } from './components/FpsCounter';
-import { generateImageThumbnail, generateVideoThumbnail, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
+import { generateImageThumbnail, generateVideoThumbnail, generateNativeVideoPoster, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
 import { fastGetImageDimensions } from './utils/imageHeader';
 import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
 import { CANVAS_IDLE_MS, scheduleCanvasSurface, canLoadDuringCameraGesture, subscribeCanvasLoadingMode } from './utils/canvasPerformance';
@@ -370,6 +370,7 @@ export default function App() {
 
   // Inject real-time scale as CSS variable for GPU-accelerated constant-width borders
   const updateCurrentScale = (latestScale: number) => {
+    if (latestScale < getNanoLodThreshold()) pauseVideosForNanoLod();
     const workspace = document.getElementById('canvas-workspace');
     if (workspace) {
       // Selection strokes compensate camera scale every frame, independently of
@@ -2402,12 +2403,14 @@ export default function App() {
       let microLodThumbnailUrl: string | undefined;
       let fullDetailThumbnailUrl: string | undefined;
       let closeupThumbnailUrl: string | undefined;
+      let videoPosterUrl: string | undefined;
       try {
         if (isVideo) {
-          closeupThumbnailUrl = await generateVideoThumbnail(processedFile, 256);
+          videoPosterUrl = await generateNativeVideoPoster(processedFile);
+          closeupThumbnailUrl = await generateImageThumbnail(videoPosterUrl, 256);
           thumbnailUrl = closeupThumbnailUrl;
-          microLodThumbnailUrl = await generateVideoThumbnail(processedFile, 64);
-          fullDetailThumbnailUrl = await generateVideoThumbnail(processedFile, 128);
+          microLodThumbnailUrl = await generateImageThumbnail(videoPosterUrl, 64);
+          fullDetailThumbnailUrl = await generateImageThumbnail(videoPosterUrl, 128);
         } else {
           closeupThumbnailUrl = await generateImageThumbnail(processedFile, 256);
           thumbnailUrl = closeupThumbnailUrl;
@@ -2432,6 +2435,7 @@ export default function App() {
         microLodThumbnailUrl: microLodThumbnailUrl,
         fullDetailThumbnailUrl: fullDetailThumbnailUrl,
         closeupThumbnailUrl: closeupThumbnailUrl,
+        videoPosterUrl,
       } : c));
     });
   }, [tx, ty, tScale]);
@@ -3102,6 +3106,8 @@ export default function App() {
       return {
         ...c,
         ...(baselineConfig ? { baselineConfig } : {}),
+        ...((('imageUrl' in updates && updates.imageUrl !== c.imageUrl) ||
+          ('fileData' in updates && updates.fileData !== c.fileData)) ? { videoPosterUrl: undefined } : {}),
         ...updates
       };
     }), shouldPush);

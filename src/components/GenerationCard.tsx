@@ -34,10 +34,10 @@ import { cardCornerStyle, CARD_PANEL_WIDTH, EMPTY_CARD_PATHS } from '../utils/ca
 import { getStandardReferencePreview, resolveReferencePreviewSource } from '../utils/referencePreview';
 import { referenceDisplayName, shortenReferenceMentions } from '../utils/referenceName';
 import { PromptPanelCanvas, type PanelControl } from './PromptPanelCanvas';
-import { CANVAS_IDLE_MS } from '../utils/canvasPerformance';
+import { CANVAS_IDLE_MS, scheduleCanvasSurface } from '../utils/canvasPerformance';
 import { fullImageCache, originalImageCache } from '../utils/imageTextureCache';
 import { ScriptProject } from '../types/script';
-import { generateImageThumbnail, generateVideoThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from '../utils/thumbnail';
+import { generateImageThumbnail, generateVideoThumbnail, generateNativeVideoPoster, thumbCache, MAX_THUMBNAIL_EDGE } from '../utils/thumbnail';
 import { getActiveMcpKey, getActiveMcpKeySync, getActiveMcpTokenSync } from '../utils/mcpStorage';
 import { useMcpKey } from '../hooks/useMcpKey';
 import { useWorkrallyModels } from '../hooks/useWorkrallyModels';
@@ -82,11 +82,23 @@ export function getCardSize(data: { ratio: AspectRatio; customWidth?: number; cu
   return CARD_DIMENSIONS['1:1'];
 }
 
-const generateThumbnail = (video: HTMLVideoElement) => {
+// Session-only playback intent survives LOD unmounts; never stored in project data.
+const playingVideoSources = new Map<string, string>();
+export function pauseVideosForNanoLod() {
+  if (!playingVideoSources.size) return;
+  playingVideoSources.clear();
+  window.dispatchEvent(new Event('canvas-nano-pause'));
+}
+const isCameraGestureActive = () => {
+  const workspace = document.getElementById('canvas-workspace');
+  return ['data-gesture', 'data-panning', 'data-zooming'].some(name => workspace?.getAttribute(name) === 'true');
+};
+
+const generateThumbnail = (video: HTMLVideoElement, native = false) => {
   try {
-    if (!video.videoWidth || !video.videoHeight) return undefined;
+    if (!video.videoWidth || !video.videoHeight || video.readyState < 2 || video.seeking) return undefined;
     const canvas = document.createElement('canvas');
-    const width = 256;
+    const width = native ? video.videoWidth : 256;
     const aspect = video.videoHeight / video.videoWidth;
     if (!aspect || !isFinite(aspect)) return undefined;
     canvas.width = width;
@@ -107,7 +119,7 @@ const generateThumbnail = (video: HTMLVideoElement) => {
           return undefined;
         }
       } catch {}
-      return canvas.toDataURL('image/jpeg', 0.6);
+      return canvas.toDataURL('image/jpeg', native ? 0.9 : 0.6);
     }
   } catch (e) {
     // Ignore Cross-Origin errors
@@ -360,6 +372,7 @@ export interface CardData {
   originalImageUrl?: string | null;
   trueOriginalImageUrl?: string | null;
   currentTime?: number;
+  videoPosterUrl?: string; // Native-resolution still; imageUrl remains the playable video.
   thumbnailUrl?: string;
   microLodThumbnailUrl?: string; // 64px max edge
   fullDetailThumbnailUrl?: string; // 128px max edge
@@ -2559,7 +2572,12 @@ export const GenerationCard = React.memo(function GenerationCard({
   }, [id, imageUrl, isVideo]);
 
   const [openMenu, setOpenMenu] = useState<{ type: 'ratio' | 'res' | 'ref' | 'model' | 'param', ownerId: string } | null>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
+  const [isPlaying, setPlayingState] = useState(() => Boolean(imageUrl && playingVideoSources.get(id) === imageUrl));
+  const setIsPlaying = (playing: boolean) => {
+    if (playing && imageUrl) playingVideoSources.set(id, imageUrl);
+    else playingVideoSources.delete(id);
+    setPlayingState(playing);
+  };
   const [isHovered, setIsHovered] = useState(false);
   const [progress, setProgress] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -2722,6 +2740,8 @@ export const GenerationCard = React.memo(function GenerationCard({
 
     let isCancelled = false;
 
+    if (isCameraGestureActive()) return;
+
     if (isPlaying) {
       if (video.paused) {
         const playPromise = video.play();
@@ -2753,6 +2773,22 @@ export const GenerationCard = React.memo(function GenerationCard({
       setLocalThumbnailUrl(data.thumbnailUrl);
     }
   }, [data.thumbnailUrl]);
+
+  const videoPosterRevisionRef = useRef(0);
+  const lastCapturedVideoFrameRef = useRef<{ source: string; time: number } | null>(null);
+  // Upgrade existing video cards through the shared loading schedule. Persist the
+  // native still separately so Nano continues to use its lightweight thumbnail.
+  useEffect(() => {
+    if (!isVideo || !imageUrl || data.videoPosterUrl) return;
+    let cancelled = false;
+    const revision = videoPosterRevisionRef.current;
+    const cancelJob = scheduleCanvasSurface(() => {
+      void generateNativeVideoPoster(data.fileData || imageUrl, () => cancelled).then(poster => {
+        if (!cancelled && poster && revision === videoPosterRevisionRef.current) onUpdateRef.current(id, { videoPosterUrl: poster }, false);
+      }).catch(error => console.warn('[VideoPoster] Native poster generation failed', error));
+    }, { label: `video-poster:${id}` });
+    return () => { cancelled = true; cancelJob(); };
+  }, [id, isVideo, imageUrl, data.fileData, data.videoPosterUrl]);
 
   // Automatically generate first-frame thumbnail for video cards when mediaUrl becomes available
   useEffect(() => {
@@ -3025,7 +3061,10 @@ export const GenerationCard = React.memo(function GenerationCard({
   }, [activeVideoSrc]);
 
   const captureAndSaveVideoState = (video: HTMLVideoElement) => {
+    if (video.readyState < 2 || video.seeking) return;
     const currTime = video.currentTime;
+    const lastFrame = lastCapturedVideoFrameRef.current;
+    if (lastFrame?.source === video.currentSrc && lastFrame.time === currTime) return;
     const prevPos = getStoredVideoProgress();
     // CRITICAL: Never let 0s or uninitialized mount state overwrite an established valid progress
     if (currTime <= 0.1 && prevPos > 0.5) {
@@ -3037,13 +3076,42 @@ export const GenerationCard = React.memo(function GenerationCard({
     lastSavedTimeRef.current = currTime;
     const updates: Partial<CardData> = { currentTime: currTime };
     const thumbUrl = generateThumbnail(video);
-    if (thumbUrl) {
+    const posterUrl = generateThumbnail(video, true);
+    if (thumbUrl && posterUrl) {
+      videoPosterRevisionRef.current++;
+      lastCapturedVideoFrameRef.current = { source: video.currentSrc, time: currTime };
       updates.thumbnailUrl = thumbUrl;
+      updates.videoPosterUrl = posterUrl;
       thumbCache.set(id, thumbUrl);
       if (imageUrl) thumbCache.set(imageUrl, thumbUrl);
     }
     stateRef.current.onUpdate(stateRef.current.id, updates, false);
   };
+
+  const captureVideoFrameRef = useRef(captureAndSaveVideoState);
+  captureVideoFrameRef.current = captureAndSaveVideoState;
+  useEffect(() => {
+    if (!isVideo) return;
+    const pauseForNano = () => {
+      setPlayingState(false);
+      const video = videoRef.current;
+      if (video) {
+        video.removeAttribute('data-was-playing');
+        video.pause();
+      }
+    };
+    window.addEventListener('canvas-nano-pause', pauseForNano);
+    return () => window.removeEventListener('canvas-nano-pause', pauseForNano);
+  }, [isVideo]);
+  useEffect(() => {
+    if (!isVideo) return;
+    const capture = () => {
+      const video = videoRef.current;
+      if (video?.paused) captureVideoFrameRef.current(video);
+    };
+    window.addEventListener('canvas-gesture-start', capture);
+    return () => window.removeEventListener('canvas-gesture-start', capture);
+  }, [isVideo]);
 
   useEffect(() => {
     return () => {
@@ -3058,17 +3126,34 @@ export const GenerationCard = React.memo(function GenerationCard({
     const video = videoRef.current;
     if (!video) return;
 
-    if (!isZooming && isPlaying && video.paused) {
+    if (!isZooming && !isCameraGestureActive() && isPlaying && video.paused) {
       video.play().catch(() => {});
     }
   }, [isZooming, isPlaying]);
 
   // Ensure playback starts when isPlaying becomes true or video element remounts with updated source
   useEffect(() => {
-    if (isPlaying && videoRef.current && videoRef.current.paused) {
+    if (!isCameraGestureActive() && isPlaying && videoRef.current && videoRef.current.paused) {
       videoRef.current.play().catch(() => {});
     }
   }, [isPlaying, activeVideoSrc]);
+
+  useEffect(() => {
+    if (!isVideo) return;
+    const resume = () => {
+      const video = videoRef.current;
+      if (isPlaying && video?.paused && !isCameraGestureActive()) {
+        video.play().catch(error => {
+          if (error?.name === 'NotAllowedError') {
+            video.muted = true;
+            void video.play().catch(() => {});
+          }
+        });
+      }
+    };
+    window.addEventListener('canvas-styles-restored', resume);
+    return () => window.removeEventListener('canvas-styles-restored', resume);
+  }, [isVideo, isPlaying]);
 
   const formatTime = (seconds: number) => {
     if (isNaN(seconds)) return "0:00";
@@ -4867,6 +4952,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                   if (!isPlaying) {
                     setIsHovered(false);
                   } else if (videoRef.current && !videoRef.current.paused) {
+                    videoRef.current.setAttribute('data-was-playing', 'true');
                     videoRef.current.pause();
                   }
                 }
@@ -4911,7 +4997,7 @@ export const GenerationCard = React.memo(function GenerationCard({
               style={{
                 width: w,
                 height: h,
-                backgroundImage: (data.thumbnailUrl || localThumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined)) ? `url(${data.thumbnailUrl || localThumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined)})` : undefined,
+                backgroundImage: (data.videoPosterUrl || data.thumbnailUrl || localThumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined)) ? `url(${data.videoPosterUrl || data.thumbnailUrl || localThumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined)})` : undefined,
                 backgroundSize: 'cover',
                 backgroundPosition: 'center',
               }}
@@ -4929,7 +5015,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                   playsInline
                   muted={!isPlaying}
                   preload="auto"
-                  autoPlay={isPlaying}
+                  autoPlay={isPlaying && !isCameraGestureActive()}
                   className="absolute inset-0 w-full h-full object-cover pointer-events-none transition-opacity duration-500 group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform"
                   onLoadedData={(e) => {
                     setIsCardLoaded(true);
@@ -4984,7 +5070,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                         video.currentTime = savedPos;
                       }
                     }
-                    if (isPlaying && video.paused) {
+                    if (isPlaying && video.paused && !isCameraGestureActive()) {
                       const p = video.play();
                       if (p !== undefined) {
                         p.catch((err: any) => {

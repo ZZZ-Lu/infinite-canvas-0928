@@ -653,6 +653,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       // 2. Draw Ultra-Low-Resolution Thumbnail or cached Image (with Object-Cover preservation)
       let hasDrawnThumbnail = false;
       const thumbUrl =
+        (standard && card.isVideo ? card.videoPosterUrl : undefined) ||
         card.thumbnailUrl ||
         thumbCache.get(card.id) ||
         (card.imageUrl ? thumbCache.get(card.imageUrl) : undefined) ||
@@ -680,7 +681,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
           dim.height
         );
         ctx.drawImage(drawSourceImg, sx, sy, sw, sh, cardX, cardY, dim.width, dim.height);
-        // Add dark filter for videos in Nano LOD to match Micro LOD's bg-black/25
+        // Apply the single bg-black/25 overlay used by Micro LOD.
+        // The play badge below must not darken the whole card a second time.
         if (card.isVideo) {
           ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
           ctx.fillRect(cardX, cardY, dim.width, dim.height);
@@ -792,10 +794,6 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         const cy = cardY + dim.height / 2;
         const { playButtonDiameter, playButtonIconSize } = calculateVideoPlayButtonDimensions(dim.width, dim.height);
         const badgeRadius = playButtonDiameter / 2;
-
-        // 1. Semi-transparent dark card overlay matching DOM's bg-black/25
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
-        ctx.fillRect(cardX, cardY, dim.width, dim.height);
 
         // 2. Circular play button backdrop matching DOM's bg-white/40 dark:bg-black/50
         ctx.fillStyle = dark ? 'rgba(0, 0, 0, 0.50)' : 'rgba(255, 255, 255, 0.40)';

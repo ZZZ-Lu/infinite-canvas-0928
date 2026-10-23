@@ -203,7 +203,7 @@ export async function generateVideoThumbnail(
 
     // Check memory cache first
     if (typeof videoSource === 'string') {
-      const cached = thumbCache.get(videoSource);
+      const cached = videoThumbnailCache.get(`${maxEdge}:${quality}:${videoSource}`);
       if (cached) {
         resolve(cached);
         return;
@@ -258,7 +258,7 @@ export async function generateVideoThumbnail(
       try {
         const origW = video.videoWidth || 640;
         const origH = video.videoHeight || 360;
-        const { width: tw, height: th } = getThumbnailDimensions(origW, origH, maxEdge);
+        const { width: tw, height: th } = getVideoThumbnailDimensions(origW, origH, maxEdge);
 
         const canvas = document.createElement('canvas');
         canvas.width = tw;
@@ -310,7 +310,9 @@ export async function generateVideoThumbnail(
         }
         cleanup();
         if (typeof videoSource === 'string' && dataUrl) {
-          thumbCache.set(videoSource, dataUrl);
+          if (videoThumbnailCache.size >= 32) videoThumbnailCache.delete(videoThumbnailCache.keys().next().value!);
+          videoThumbnailCache.set(`${maxEdge}:${quality}:${videoSource}`, dataUrl);
+          if (maxEdge === MAX_THUMBNAIL_EDGE) thumbCache.set(videoSource, dataUrl);
         }
         resolve(dataUrl);
       } catch (err) {
@@ -323,7 +325,7 @@ export async function generateVideoThumbnail(
       if (!hasCaptured && video.videoWidth && video.videoHeight) {
         hasCaptured = true;
         try {
-          const { width: tw, height: th } = getThumbnailDimensions(video.videoWidth, video.videoHeight, maxEdge);
+          const { width: tw, height: th } = getVideoThumbnailDimensions(video.videoWidth, video.videoHeight, maxEdge);
           const canvas = document.createElement('canvas');
           canvas.width = tw;
           canvas.height = th;
@@ -333,7 +335,9 @@ export async function generateVideoThumbnail(
             const dataUrl = canvas.toDataURL('image/jpeg', quality);
             cleanup();
             if (typeof videoSource === 'string' && dataUrl) {
-              thumbCache.set(videoSource, dataUrl);
+              if (videoThumbnailCache.size >= 32) videoThumbnailCache.delete(videoThumbnailCache.keys().next().value!);
+              videoThumbnailCache.set(`${maxEdge}:${quality}:${videoSource}`, dataUrl);
+              if (maxEdge === MAX_THUMBNAIL_EDGE) thumbCache.set(videoSource, dataUrl);
             }
             resolve(dataUrl);
             return;
@@ -521,4 +525,17 @@ export async function getOrCreateMediaThumbnail(
   } finally {
     pendingThumbnailIds.delete(media.id);
   }
+}
+
+// A zero edge requests the actual decoded video dimensions, without resizing.
+export function getVideoThumbnailDimensions(width: number, height: number, maxEdge: number) {
+  return maxEdge === 0 ? { width, height } : getThumbnailDimensions(width, height, maxEdge);
+}
+const videoThumbnailCache = new Map<string, string>();
+// Only one full-resolution video decoder runs at a time across visible cards.
+let videoPosterQueue: Promise<unknown> = Promise.resolve();
+export function generateNativeVideoPoster(source: string | Blob, isCancelled: () => boolean = () => false): Promise<string> {
+  const task = videoPosterQueue.then(() => isCancelled() ? '' : generateVideoThumbnail(source, 0));
+  videoPosterQueue = task.catch(() => {});
+  return task;
 }

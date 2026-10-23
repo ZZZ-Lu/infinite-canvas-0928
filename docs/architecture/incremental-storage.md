@@ -39,6 +39,16 @@ Runtime URLs are recreated at load. The same Blob object / data URL is registere
 once; loaded resource IDs are reused. This is not content-hash deduplication of
 independently imported files with identical bytes.
 
+Video cards optionally store `videoPosterUrl`, a still captured at the decoded
+video's native width and height for the standard/Micro renderer. Nano continues
+to use `thumbnailUrl`. The generic resource codec stores this data URL separately
+from the playable video; no database migration is required. Older cards retain
+their small poster while visible cards progressively generate and save the native
+still. Import derives the small reference thumbnails from the same captured frame.
+Pause and paused seeking update `currentTime`, `thumbnailUrl`, and `videoPosterUrl`
+together from the decoded current frame. A render-only revision guard prevents an
+older background poster job from replacing a newer paused frame.
+
 Large assets are committed before cards reference them. A single final transaction
 merges field patches against current records and checks referenced assets, writes changed
 cards/deletions/order/history and advances the project head. Only `oncomplete`
