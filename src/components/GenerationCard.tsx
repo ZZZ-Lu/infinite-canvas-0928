@@ -4708,6 +4708,11 @@ export const GenerationCard = React.memo(function GenerationCard({
         initial={entryFrame ? { scale: entryFrame.scale, opacity: entryFrame.opacity } : false}
         animate={entryFrame ? { scale: entryFrame.scales, opacity: entryFrame.opacities, y: 0 } : { scale: 1, opacity: 1, y: 0 }}
         transition={{ duration: entryFrame?.duration || 0, delay: entryFrame?.delay || 0, ease: 'linear' }}
+        onAnimationComplete={() => {
+          if (entryFrame && typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('card-entrance-complete', { detail: { cardId: id } }));
+          }
+        }}
         transformTemplate={(_, generated) => generated.replace(/translateZ\([^)]+\)/g, '')}
         className={`flex flex-col gap-3 group items-start relative ${isAssetCard ? 'asset-card' : 'generation-card'}`}
         style={{ transformOrigin: entryFrame ? `${entryFrame.pivotX - data.x}px ${entryFrame.pivotY - data.y}px` : '50% 50%' }}
@@ -5027,7 +5032,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                   loop 
                   playsInline
                   muted={!isPlaying}
-                  preload="auto"
+                  preload={isPlaying ? "auto" : "metadata"}
                   autoPlay={isPlaying && !isCameraGestureActive()}
                   className="absolute inset-0 w-full h-full object-cover pointer-events-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform"
                   onLoadedData={(e) => {
@@ -5370,7 +5375,7 @@ export const GenerationCard = React.memo(function GenerationCard({
             >
               <RefreshCw className={`w-8 h-8 ${imageUrl ? 'text-white' : 'text-purple-600'} animate-spin mb-2 drop-shadow-md`} />
               <span className={`text-xs ${imageUrl ? 'text-white/95 font-medium' : 'text-purple-700 font-bold'} tracking-wider drop-shadow-md`}>
-                {imageUrl ? (data.prompt ? 'Mira 正在生成...' : '导入中...') : 'Mira 正在思考...'}
+                {imageUrl ? ((data.prompt?.startsWith('Dropped') || data.prompt?.startsWith('Imported') || data.prompt?.startsWith('Pasted')) ? '正在导入...' : data.prompt ? 'Mira 正在生成...' : '导入中...') : 'Mira 正在思考...'}
               </span>
             </motion.div>
           )}
