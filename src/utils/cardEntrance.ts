@@ -6,20 +6,8 @@ let project: string | null = null;
 let known = new Set<string>();
 // Only creation/import commands may authorize individual entrances. Never persist.
 const requested = new Map<string, string>();
-export function requestCardEntries(
-  projectId: string, 
-  items: (string | { id: string; x: number; y: number; width: number; height: number })[]
-) {
-  const now = performance.now();
-  for (const item of items) {
-    if (typeof item === 'string') {
-      requested.set(item, projectId);
-    } else {
-      requested.set(item.id, projectId);
-      awaitingEntryDom.add(item.id);
-      entries.set(item.id, { start: now, x: item.x + item.width / 2, y: item.y + item.height / 2 });
-    }
-  }
+export function requestCardEntries(projectId: string, ids: string[]) {
+  for (const id of ids) requested.set(id, projectId);
 }
 export const CARD_ENTRY_MS = 450;
 export function registerCardEntries(projectId: string, cards: { id: string; x: number; y: number; width: number; height: number }[], visible: Set<string>, now: number, reduced: boolean, pivot: { x: number; y: number }) {
