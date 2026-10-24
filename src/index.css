@@ -166,19 +166,16 @@
   transition: none !important;
 }
 
-/* Video GPU Compositor Optimization during canvas motion:
-   Instantly unbind and hide hardware video layers during zoom, pan, or gesture */
+/* Video display during canvas motion: keep video visible without transition delays */
 #canvas-workspace[data-zooming="true"] video,
 #canvas-workspace[data-panning="true"] video,
 #canvas-workspace[data-gesture="true"] video {
-  opacity: 0 !important;
-  visibility: hidden !important;
   transition: none !important;
   pointer-events: none !important;
 }
 
 #canvas-workspace video {
-  transition: opacity 0.5s ease-out;
+  pointer-events: none;
 }
 
 /* Asset Card Header Tags & Text Labels (Filename, Resolution Badge):

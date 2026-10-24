@@ -116,21 +116,26 @@ export const VideoControlOverlay: React.FC<VideoControlOverlayProps> = ({
               )}
             </button>
             {/* Range Slider */}
-            <input
-              type="range"
-              min="0"
-              max="100"
-              step="0.1"
-              value={progress > 0 ? progress : (duration > 0 && savedTime > 0 ? (savedTime / duration) * 100 : 0)}
-              onChange={(e) => {
-                const pct = parseFloat(e.target.value);
-                if (duration > 0) {
-                  const targetTime = (pct / 100) * duration;
-                  onSeek(targetTime);
-                }
-              }}
-              className="w-full h-1 bg-transparent rounded-lg appearance-none cursor-pointer accent-blue-500 focus:outline-none [&::-webkit-slider-runnable-track]:bg-white/20 [&::-webkit-slider-runnable-track]:h-1 [&::-webkit-slider-runnable-track]:rounded-lg [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-500 hover:[&::-webkit-slider-thumb]:scale-125 [&::-webkit-slider-thumb]:-translate-y-[4px]"
-            />
+            <div className="relative flex-1 flex items-center h-8">
+              <input
+                type="range"
+                min="0"
+                max="100"
+                step="0.1"
+                value={progress > 0 ? progress : (duration > 0 && savedTime > 0 ? (savedTime / duration) * 100 : 0)}
+                onPointerDown={(e) => {
+                  if (e.button === 0) e.stopPropagation();
+                }}
+                onChange={(e) => {
+                  const pct = parseFloat(e.target.value);
+                  if (duration > 0) {
+                    const targetTime = (pct / 100) * duration;
+                    onSeek(targetTime);
+                  }
+                }}
+                className="w-full h-8 py-3 bg-transparent appearance-none cursor-pointer accent-blue-500 focus:outline-none [&::-webkit-slider-runnable-track]:bg-white/25 hover:[&::-webkit-slider-runnable-track]:bg-white/40 [&::-webkit-slider-runnable-track]:h-1 [&::-webkit-slider-runnable-track]:rounded-full [&::-webkit-slider-runnable-track]:transition-colors [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-500 hover:[&::-webkit-slider-thumb]:scale-125 hover:[&::-webkit-slider-thumb]:shadow-[0_0_8px_rgba(59,130,246,0.7)] [&::-webkit-slider-thumb]:transition-transform [&::-webkit-slider-thumb]:mt-[-4px] [&::-moz-range-track]:bg-white/25 [&::-moz-range-track]:h-1 [&::-moz-range-track]:rounded-full [&::-moz-range-thumb]:h-3 [&::-moz-range-thumb]:w-3 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-blue-500 [&::-moz-range-thumb]:border-0 hover:[&::-moz-range-thumb]:scale-125"
+              />
+            </div>
             {/* Time Stamps */}
             <span className="text-[10px] font-mono text-white/90 select-none flex-shrink-0">
               {formatTime(duration > 0 && progress > 0 ? (progress / 100) * duration : savedTime)} / {formatTime(duration)}

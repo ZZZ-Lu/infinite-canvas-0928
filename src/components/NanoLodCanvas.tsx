@@ -1,5 +1,6 @@
 import { cardEntryFrame, waitForEntryDom } from '../utils/cardEntrance';
 import { calculateVideoPlayButtonDimensions, getPlayIconPath2D } from "../utils/videoPlayButton";
+import { getLiveVideoFrame } from '../utils/videoFrameBus';
 import React, { useEffect, useRef } from 'react';
 import { readyPromptPanels } from '../utils/promptSurfaceCache';
 import { cardOutline, strokeCardOutline, drawEmptyCardIcon, isStandardCardLod } from '../utils/cardLodAppearance';
@@ -650,33 +651,48 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       }
       ctx.fillRect(cardX, cardY, dim.width, dim.height);
 
-      // 2. Draw Ultra-Low-Resolution Thumbnail or cached Image (with Object-Cover preservation)
+      // 2. Draw Live Memory Frame (for video cards) or Ultra-Low-Resolution Thumbnail (with Object-Cover preservation)
       let hasDrawnThumbnail = false;
-      const thumbUrl =
-        (standard && card.isVideo ? card.videoPosterUrl : undefined) ||
-        card.thumbnailUrl ||
-        thumbCache.get(card.id) ||
-        (card.imageUrl ? thumbCache.get(card.imageUrl) : undefined) ||
-        card.imageUrl ||
-        card.originalImageUrl;
+      const liveFrame = card.isVideo ? getLiveVideoFrame(card.id) : null;
+      let drawSourceImg: CanvasImageSource | null = liveFrame;
+      let imgWidth = liveFrame ? liveFrame.width : 0;
+      let imgHeight = liveFrame ? liveFrame.height : 0;
 
-      let drawSourceImg: HTMLImageElement | null = null;
-      const full = standard && card.imageUrl ? fullImageCache.get(card.imageUrl) : undefined;
-      if (full?.complete && full.naturalWidth > 0) {
-        drawSourceImg = full;
-      } else if (thumbUrl) {
-        drawSourceImg = getOrLoadThumbImage(thumbUrl, scheduleDraw);
-      } else if (card.imageUrl && fullImageCache.has(card.imageUrl)) {
-        const cached = fullImageCache.get(card.imageUrl);
-        if (cached && cached.complete && cached.naturalWidth > 0) {
-          drawSourceImg = cached;
+      if (!drawSourceImg) {
+        const thumbUrl =
+          (standard && card.isVideo ? card.videoPosterUrl : undefined) ||
+          card.thumbnailUrl ||
+          thumbCache.get(card.id) ||
+          (card.imageUrl ? thumbCache.get(card.imageUrl) : undefined) ||
+          card.imageUrl ||
+          card.originalImageUrl;
+
+        const full = standard && card.imageUrl ? fullImageCache.get(card.imageUrl) : undefined;
+        if (full?.complete && full.naturalWidth > 0) {
+          drawSourceImg = full;
+          imgWidth = full.naturalWidth;
+          imgHeight = full.naturalHeight;
+        } else if (thumbUrl) {
+          const img = getOrLoadThumbImage(thumbUrl, scheduleDraw);
+          if (img && img.complete && img.naturalWidth > 0) {
+            drawSourceImg = img;
+            imgWidth = img.naturalWidth;
+            imgHeight = img.naturalHeight;
+          }
+        } else if (card.imageUrl && fullImageCache.has(card.imageUrl)) {
+          const cached = fullImageCache.get(card.imageUrl);
+          if (cached && cached.complete && cached.naturalWidth > 0) {
+            drawSourceImg = cached;
+            imgWidth = cached.naturalWidth;
+            imgHeight = cached.naturalHeight;
+          }
         }
       }
 
-      if (drawSourceImg && drawSourceImg.complete && drawSourceImg.naturalWidth > 0) {
+      if (drawSourceImg && imgWidth > 0 && imgHeight > 0) {
         const { sx, sy, sw, sh } = calculateObjectCover(
-          drawSourceImg.naturalWidth,
-          drawSourceImg.naturalHeight,
+          imgWidth,
+          imgHeight,
           dim.width,
           dim.height
         );
