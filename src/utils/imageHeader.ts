@@ -99,30 +99,22 @@ export async function fastGetImageDimensions(file: File): Promise<{ width: numbe
     console.warn('Fast header parse failed, falling back:', err);
   }
 
-  // 5. Fallback using createImageBitmap (instant if browser supports it)
+  // 5. Fast fallback using createImageBitmap with 60ms timeout to avoid drop-time stalls
   if (typeof createImageBitmap === 'function') {
     try {
-      const bmp = await createImageBitmap(file);
-      const { width, height } = bmp;
-      bmp.close();
-      if (width > 0 && height > 0) return { width, height };
+      const bmpPromise = createImageBitmap(file);
+      const timeoutPromise = new Promise<null>((r) => setTimeout(() => r(null), 60));
+      const bmp = await Promise.race([bmpPromise, timeoutPromise]);
+      if (bmp) {
+        const { width, height } = bmp;
+        bmp.close();
+        if (width > 0 && height > 0) return { width, height };
+      }
     } catch {
-      // Fall through to Image tag
+      // Fall through
     }
   }
 
-  // 6. Final fallback: new Image()
-  return new Promise((resolve) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      resolve({ width: img.naturalWidth || 480, height: img.naturalHeight || 480 });
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      resolve({ width: 480, height: 480 });
-    };
-    img.src = url;
-  });
+  // 6. Default standard dimension fallback (never blocks main thread)
+  return { width: 480, height: 480 };
 }

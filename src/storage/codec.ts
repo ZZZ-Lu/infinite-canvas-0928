@@ -27,11 +27,15 @@ export class CardCodec {
       if (value.startsWith('blob:')) {
         let id = this.strings.get(value);
         if (!id) {
-          const response = await fetch(value);
-          if (!response.ok) throw new Error('图片资源无法读取，已保留待保存数据');
-          const ref = this.reference(await response.blob(), 'url');
-          id = ref[marker];
-          this.strings.set(value, id);
+          try {
+            const response = await fetch(value);
+            if (!response.ok) throw new Error('图片资源无法读取，已保留待保存数据');
+            const ref = this.reference(await response.blob(), 'url');
+            id = ref[marker];
+            this.strings.set(value, id);
+          } catch (err) {
+            throw new Error('图片资源无法读取，已保留待保存数据');
+          }
         }
         return { [marker]: id, format: 'url' };
       }

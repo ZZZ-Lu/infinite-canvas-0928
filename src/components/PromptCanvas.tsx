@@ -82,9 +82,9 @@ export const PromptCanvas = React.memo(function PromptCanvas({
       const pattern = new RegExp(`@(?:${names.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'g');
       for (const match of text.matchAll(pattern)) ranges.push({ start: match.index!, end: match.index! + match[0].length });
     }
-    const layoutKey = JSON.stringify([content, width, style.font, style.letterSpacing]);
+    const layoutKey = JSON.stringify([content, width, style.fontFamily, style.fontWeight, style.fontSize, style.letterSpacing, mentionKey]);
     if (layoutRef.current?.key !== layoutKey) {
-      layoutRef.current = { key: layoutKey, value: layoutPromptText(content, width, style) };
+      layoutRef.current = { key: layoutKey, value: layoutPromptText(content, width, style, names) };
     }
     const { lines, baseline } = layoutRef.current.value;
     linesRef.current = lines;
@@ -117,7 +117,9 @@ export const PromptCanvas = React.memo(function PromptCanvas({
         const segment = row.text.slice(a - row.start, b - row.start);
         if (highlighted) {
           ctx.fillStyle = dark ? 'rgba(96,165,250,.20)' : 'rgba(59,130,246,.15)';
-          ctx.fillRect(x, y + 1, ctx.measureText(segment).width, 20);
+          ctx.beginPath();
+          ctx.roundRect(x, y + 1, ctx.measureText(segment).width, 20, 2);
+          ctx.fill();
         }
         ctx.fillStyle = !text ? (dark ? '#737373' : '#9ca3af') : highlighted ? (dark ? '#60a5fa' : '#2563eb') : style.color;
         ctx.fillText(segment, x, y + baseline);
