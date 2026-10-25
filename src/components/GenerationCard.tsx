@@ -34,8 +34,8 @@ import { cardCornerStyle, CARD_PANEL_WIDTH, EMPTY_CARD_PATHS } from '../utils/ca
 import { getStandardReferencePreview, resolveReferencePreviewSource } from '../utils/referencePreview';
 import { referenceDisplayName, shortenReferenceMentions } from '../utils/referenceName';
 import { PromptPanelCanvas, type PanelControl } from './PromptPanelCanvas';
-import { CANVAS_IDLE_MS, scheduleCanvasSurface } from '../utils/canvasPerformance';
-import { fullImageCache, originalImageCache } from '../utils/imageTextureCache';
+import { CANVAS_IDLE_MS, scheduleCanvasSurface, scheduleOriginalImageRestore } from '../utils/canvasPerformance';
+import { fullImageCache, originalImageCache, preloadAndDecodeImage } from '../utils/imageTextureCache';
 import { ScriptProject } from '../types/script';
 import { generateImageThumbnail, generateVideoThumbnail, generateNativeVideoPoster, thumbCache, MAX_THUMBNAIL_EDGE } from '../utils/thumbnail';
 import { captureLiveVideoFrame } from '../utils/videoFrameBus';
@@ -3167,19 +3167,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   };
 
   // Scale tracking for original high-resolution image swap (only active at extreme zoom > 2.0)
-  const [showOriginal, setShowOriginal] = useState(() => {
-    const s = scale.get();
-    const hasImage = Boolean(data.originalImageUrl || data.imageUrl);
-    if (s <= 2.0 || !hasImage) return false;
-    const vp = {
-      viewportWidth: window.innerWidth,
-      viewportHeight: window.innerHeight,
-      scale: s,
-      tx: tx.get(),
-      ty: ty.get()
-    };
-    return isCardIntersectingRectangle(data, vp);
-  });
+  const [showOriginal, setShowOriginal] = useState(false);
   const showOriginalRef = useRef(showOriginal);
   showOriginalRef.current = showOriginal;
 
@@ -3188,6 +3176,12 @@ export const GenerationCard = React.memo(function GenerationCard({
 
   useEffect(() => {
     let timeout: ReturnType<typeof setTimeout>;
+    let cancelRestore: (() => void) | null = null;
+
+    const cancelPendingRestore = () => {
+      cancelRestore?.();
+      cancelRestore = null;
+    };
 
     const evaluateOriginalImage = () => {
       const workspace = document.getElementById('canvas-workspace');
@@ -3198,6 +3192,7 @@ export const GenerationCard = React.memo(function GenerationCard({
 
       const s = scale.get();
       if (s <= 2.0) {
+        cancelPendingRestore();
         if (showOriginalRef.current) setShowOriginal(false);
         return;
       }
@@ -3210,9 +3205,34 @@ export const GenerationCard = React.memo(function GenerationCard({
         ty: ty.get()
       };
       if (isCardIntersectingRectangle(currentData, vp)) {
-        setShowOriginal(true);
-      } else if (showOriginalRef.current) {
-        setShowOriginal(false);
+        if (showOriginalRef.current || cancelRestore) return;
+        const originalUrl = currentData.originalImageUrl || currentData.imageUrl;
+        if (!originalUrl) return;
+        const centerX = (currentData.x * s + tx.get()) - window.innerWidth / 2;
+        const centerY = (currentData.y * s + ty.get()) - window.innerHeight / 2;
+        const queuedRestore = scheduleOriginalImageRestore(id, centerX * centerX + centerY * centerY, async isCancelled => {
+          const ready = await preloadAndDecodeImage(originalUrl, 'original');
+          if (cancelRestore === queuedRestore) cancelRestore = null;
+          if (!ready || isCancelled()) return;
+          const latest = dataRef.current;
+          const latestScale = scale.get();
+          const latestViewport = {
+            viewportWidth: window.innerWidth,
+            viewportHeight: window.innerHeight,
+            scale: latestScale,
+            tx: tx.get(),
+            ty: ty.get(),
+          };
+          if (latestScale > 2 && isCardIntersectingRectangle(latest, latestViewport) &&
+              document.getElementById('canvas-workspace')?.getAttribute('data-gesture') !== 'true') {
+            showOriginalRef.current = true;
+            setShowOriginal(true);
+          }
+        });
+        cancelRestore = queuedRestore;
+      } else {
+        cancelPendingRestore();
+        if (showOriginalRef.current) setShowOriginal(false);
       }
     };
 
@@ -3227,6 +3247,7 @@ export const GenerationCard = React.memo(function GenerationCard({
         showOriginalRef.current = false;
         setShowOriginal(false);
       }
+      cancelPendingRestore();
 
       clearTimeout(timeout);
       // The shared restoration event handles camera gestures; avoid one timer per card per frame.
@@ -3251,6 +3272,7 @@ export const GenerationCard = React.memo(function GenerationCard({
         workspace?.getAttribute('data-panning') === 'true' ||
         workspace?.getAttribute('data-zooming') === 'true'
       ) {
+        cancelPendingRestore();
         return;
       }
 
@@ -3271,8 +3293,10 @@ export const GenerationCard = React.memo(function GenerationCard({
     window.addEventListener('canvas-gesture-start', onZoom);
     window.addEventListener('resize', onZoom);
     window.addEventListener('canvas-styles-restored', onRestored);
+    evaluateOriginalImage();
 
     return () => {
+      cancelPendingRestore();
       unsubScale();
       unsubTx();
       unsubTy();

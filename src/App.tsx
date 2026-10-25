@@ -7403,8 +7403,8 @@ export default function App() {
       return distA - distB;
     });
 
-    // Prefer gradual loading: one card per two frame boundaries.
-    // Collecting IDs alone is not a render budget or a paint-completion handshake.
+    // Admit one card, then wait for its image and prompt surfaces to be
+    // presented before admitting the next one.
     (async () => {
       isQueueProcessingRef.current = true;
       let currentIndex = 0;
@@ -7459,6 +7459,47 @@ export default function App() {
             resolve();
           });
         });
+
+        if (batchToMount.length > 0 && !abortToken.aborted) {
+          const card = batchToMount[0];
+          await new Promise<void>(resolve => {
+            let finished = false;
+            let firstFrame: number | null = null;
+            let secondFrame: number | null = null;
+            let timeout: ReturnType<typeof setTimeout> | null = null;
+            const finish = () => {
+              if (finished) return;
+              finished = true;
+              window.removeEventListener('card-painted', check);
+              if (firstFrame !== null) cancelAnimationFrame(firstFrame);
+              if (secondFrame !== null) cancelAnimationFrame(secondFrame);
+              if (timeout !== null) clearTimeout(timeout);
+              abortToken.cancel = undefined;
+              resolve();
+            };
+            const check = (event?: Event) => {
+              if (event && (event as CustomEvent<{ cardId?: string }>).detail?.cardId !== card.id) return;
+              if (abortToken.aborted || !visibleCardsRef.current.some(visible => visible.id === card.id)) {
+                finish();
+                return;
+              }
+              const imageReady = Boolean((window as any).__paintedCardIds?.has(card.id));
+              const panelReady = Boolean(card.fileName || card.isAsset || readyPromptPanels.has(card.id));
+              if (imageReady && panelReady) finish();
+            };
+            window.addEventListener('card-painted', check);
+            // A missing or failed media source must not stall the whole queue.
+            timeout = setTimeout(finish, 2000);
+            abortToken.cancel = finish;
+            firstFrame = requestAnimationFrame(() => {
+              firstFrame = null;
+              secondFrame = requestAnimationFrame(() => {
+                secondFrame = null;
+                check();
+              });
+            });
+          });
+        }
 
         if (abortToken.aborted) {
           isQueueProcessingRef.current = false;

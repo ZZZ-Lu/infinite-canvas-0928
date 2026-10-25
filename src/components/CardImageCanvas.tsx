@@ -46,6 +46,8 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafIdRef = useRef<number | null>(null);
+  const paintedNoticeFrameRef = useRef<number | null>(null);
+  const paintedNoticeCardRef = useRef<string | null>(null);
 
   // Cross-fade animation progress states
   const fullAlphaRef = useRef<number>(1);
@@ -272,9 +274,20 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       if (!(window as any).__paintedCardIds) {
         (window as any).__paintedCardIds = new Set<string>();
       }
-      if (!(window as any).__paintedCardIds.has(cardId)) {
-        (window as any).__paintedCardIds.add(cardId);
-        window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId } }));
+      if (!(window as any).__paintedCardIds.has(cardId) && paintedNoticeCardRef.current !== cardId) {
+        paintedNoticeCardRef.current = cardId;
+        // A completed draw in useLayoutEffect has not necessarily reached the
+        // screen. Let the browser present it before retiring the Nano underlay.
+        paintedNoticeFrameRef.current = requestAnimationFrame(() => {
+          paintedNoticeFrameRef.current = requestAnimationFrame(() => {
+            paintedNoticeFrameRef.current = null;
+            paintedNoticeCardRef.current = null;
+            if (canvasRef.current && propsRef.current.cardId === cardId) {
+              (window as any).__paintedCardIds.add(cardId);
+              window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId } }));
+            }
+          });
+        });
       }
     }
 
@@ -305,6 +318,11 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
   // Clean up painted registration on unmount
   useEffect(() => {
     return () => {
+      if (paintedNoticeFrameRef.current !== null) {
+        cancelAnimationFrame(paintedNoticeFrameRef.current);
+        paintedNoticeFrameRef.current = null;
+        paintedNoticeCardRef.current = null;
+      }
       if (cardId && typeof window !== 'undefined') {
         if ((window as any).__paintedCardIds) {
           (window as any).__paintedCardIds.delete(cardId);

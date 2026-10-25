@@ -196,33 +196,31 @@ export function drawSquirclePath(
  * Asynchronously preload and decode an image URL into GPU memory before mounting to DOM/Canvas.
  * Ensures instantaneous non-flashing texture handoff.
  */
-export async function preloadAndDecodeImage(url: string | null | undefined): Promise<boolean> {
+export async function preloadAndDecodeImage(
+  url: string | null | undefined,
+  tier: 'full' | 'original' = 'full',
+): Promise<boolean> {
   if (!url) return false;
-  return new Promise((resolve) => {
-    const img = new Image();
-    if (!url.startsWith('data:') && !url.startsWith('blob:')) {
-      img.crossOrigin = 'anonymous';
-    }
-    img.referrerPolicy = 'no-referrer';
-
-    const handleDone = () => {
-      fullImageCache.set(url, img);
-      resolve(true);
+  const targetMap = tier === 'original' ? originalImageCache : fullImageCache;
+  const img = await new Promise<HTMLImageElement | null>(resolve => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      const loaded = targetMap.get(url);
+      resolve(loaded?.complete && loaded.naturalWidth > 0 ? loaded : null);
     };
-
-    img.onload = () => {
-      if ('decode' in img && typeof img.decode === 'function') {
-        img.decode().then(handleDone).catch(handleDone);
-      } else {
-        handleDone();
-      }
-    };
-
-    img.onerror = () => {
-      resolve(false);
-    };
-
-    img.src = url;
+    const timeout = setTimeout(finish, 8000);
+    const ready = getOrLoadCanvasImage(url, finish, tier);
+    if (ready) finish();
   });
+  if (!img) return false;
+  try {
+    await img.decode();
+  } catch {
+    // Some browsers reject decode() for an otherwise drawable cached image.
+  }
+  return img.complete && img.naturalWidth > 0;
 }
 
