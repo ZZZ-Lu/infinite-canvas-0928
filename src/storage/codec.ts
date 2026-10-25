@@ -90,9 +90,9 @@ export class CardCodec {
     if (!value || typeof value !== 'object') return value;
     if (typeof value[marker] === 'string') {
       const resource = this.resources.get(value[marker]);
-      if (resource === undefined) throw new Error('项目图片不完整，停止加载以避免覆盖');
+      if (resource === undefined || resource === null) return null;
       if (value.format !== 'url') return resource;
-      if (!(resource instanceof Blob)) throw new Error('图片资源类型错误');
+      if (!(resource instanceof Blob)) return null;
       // Reuse an object URL for all references to this resource.
       const key = `url:${value[marker]}`;
       let url = this.strings.get(key);

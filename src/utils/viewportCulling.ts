@@ -1,6 +1,6 @@
 import { AspectRatio, CARD_DIMENSIONS, getCardSize } from '../components/GenerationCard';
 import { getBottomPanelHeight } from './cardLayout';
-import { NANO_LOD_THRESHOLD } from './cardLodAppearance';
+import { NANO_LOD_THRESHOLD, NANO_LOD_ENTER_HIGH_THRESHOLD, NANO_LOD_EXIT_HIGH_THRESHOLD } from './cardLodAppearance';
 
 export interface CardBounds {
   id: string;
@@ -89,8 +89,22 @@ export function isCardIntersectingRectangle(
  * Scale < 0.40 renders via NanoLodCanvas (2D Canvas mode with color blocks).
  * Scale >= 0.40 renders via DOM cards mode (interactive prompt component).
  */
+export { NANO_LOD_ENTER_HIGH_THRESHOLD, NANO_LOD_EXIT_HIGH_THRESHOLD };
+
 export function getNanoLodThreshold(): number {
   return NANO_LOD_THRESHOLD;
+}
+
+/**
+ * Dual-threshold hysteresis state resolver to prevent rapid mount/unmount flickering
+ * near the scale 0.40 boundary during continuous zoom gestures.
+ */
+export function isNanoLodScale(scale: number, currentIsNano: boolean): boolean {
+  if (currentIsNano) {
+    return scale < NANO_LOD_ENTER_HIGH_THRESHOLD;
+  } else {
+    return scale < NANO_LOD_EXIT_HIGH_THRESHOLD;
+  }
 }
 
 export const CARD_DENSITY_HIGH_THRESHOLD = 15; // Kept for backwards compatibility

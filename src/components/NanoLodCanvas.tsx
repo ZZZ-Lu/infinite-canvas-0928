@@ -13,7 +13,7 @@ import {
   thumbCache,
 } from '../utils/thumbnail';
 import { calculateObjectCover, fullImageCache } from '../utils/imageTextureCache';
-import { getNanoLodThreshold, getCardWorldBounds } from '../utils/viewportCulling';
+import { getNanoLodThreshold, NANO_LOD_EXIT_HIGH_THRESHOLD, getCardWorldBounds } from '../utils/viewportCulling';
 import { getBottomPanelHeight, getPromptAreaHeight, calculatePromptLines } from '../utils/cardLayout';
 import { buildCardQuadTree, QuadTree, BoundingBox } from '../utils/quadTree';
 
@@ -41,7 +41,7 @@ export interface NanoLodCanvasProps {
   isDarkMode: boolean;
   isOverviewMode?: boolean;
   dotModeThreshold?: number;
-  isActive: boolean;
+  isActive?: boolean;
   onReady?: (frame: LodFrame) => void;
   onThumbnailGenerated?: (id: string, thumbnailUrl: string) => void;
 }
@@ -157,7 +157,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   isDarkMode,
   isOverviewMode = false,
   dotModeThreshold = DEFAULT_OVERVIEW_DOT_THRESHOLD,
-  isActive,
+  isActive = true,
   onReady,
   onThumbnailGenerated,
 }) {
@@ -282,7 +282,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       offscreen.height = textureH;
     }
 
-    const offCtx = offscreen.getContext('2d');
+    const offCtx = offscreen.getContext('2d', { alpha: true, desynchronized: true, willReadFrequently: false });
     if (!offCtx) return null;
 
     offCtx.clearRect(0, 0, textureW, textureH);
@@ -397,9 +397,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   // Single-frame draw call
   const draw = () => {
     const canvas = canvasRef.current;
-    if (!canvas || !isActiveRef.current) return;
+    if (!canvas || isActiveRef.current === false) return;
 
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext('2d', { alpha: true, desynchronized: true, willReadFrequently: false });
     if (!ctx) return;
 
     const currentScale = scale.get();
@@ -579,7 +579,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       const paintedSet = typeof window !== 'undefined' ? (window as any).__paintedCardIds : null;
       const isPainted = Boolean(paintedSet?.has(card.id));
       const panelReady = Boolean(card.fileName || card.isAsset) || readyPromptPanels.has(card.id);
-      const isCardReadyInDom = currentScale >= threshold && Boolean(renderedSet?.has(card.id) && isPainted && panelReady);
+      const isCardReadyInDom = currentScale >= NANO_LOD_EXIT_HIGH_THRESHOLD && Boolean(renderedSet?.has(card.id) && isPainted && panelReady);
 
       // Instant seamless handoff: if card is rendered and painted in DOM, DOM handles rendering directly!
       if (isCardReadyInDom) {
@@ -835,7 +835,24 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         // Fallback indicator when thumbnail is still generating/loading
         const cx = cardX + dim.width / 2;
         const cy = cardY + dim.height / 2;
-        if (standard) {
+        if (card.isImporting || (card.state === 'generating' && !card.prompt)) {
+          if (screenW >= 40) {
+            ctx.save();
+            const fontSize = Math.max(10, Math.min(18, 14 / currentScale));
+            ctx.font = `500 ${fontSize}px system-ui, -apple-system, sans-serif`;
+            ctx.fillStyle = dark ? '#60a5fa' : '#2563eb';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText("正在导入...", cx, cy);
+            ctx.restore();
+          } else {
+            const r = Math.max(2.5 / currentScale, 2);
+            ctx.fillStyle = dark ? '#60a5fa' : '#2563eb';
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        } else if (standard) {
           drawEmptyCardIcon(ctx, cx, cy, dark);
         } else if (hasMedia) {
           const r = Math.max(2.5 / currentScale, 2);
@@ -940,9 +957,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     });
   };
 
-  // Re-draw when active state changes
+  // Re-draw when active state changes or on mount
   useEffect(() => {
-    if (isActive) {
+    if (isActive !== false) {
       scheduleDraw();
     } else {
       if (rafIdRef.current !== null) {
@@ -959,24 +976,20 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
   // Re-draw when data changes (renderedCardIds excluded to prevent canvas redraw thrashing on DOM card mount)
   useEffect(() => {
-    if (isActive) {
-      scheduleDraw();
-    }
-  }, [cards, selectedCardIds, agentTargetCardId, agentTargetCardIds, agentReferenceCardIds, agentFocusMap, pickerSession, isDarkMode, isOverviewMode, dotModeThreshold, isActive]);
+    scheduleDraw();
+  }, [cards, selectedCardIds, agentTargetCardId, agentTargetCardIds, agentReferenceCardIds, agentFocusMap, pickerSession, isDarkMode, isOverviewMode, dotModeThreshold]);
 
-  // Listen to custom nano dragging events for local, non-react repaint
+  // Listen to custom card painted and surface ready events for seamless DOM handoff
   useEffect(() => {
-    if (!isActive) return;
     window.addEventListener('card-painted', scheduleDraw);
     window.addEventListener('card-surface-ready', scheduleDraw);
     return () => {
       window.removeEventListener('card-painted', scheduleDraw);
       window.removeEventListener('card-surface-ready', scheduleDraw);
     };
-  }, [isActive]);
+  }, []);
 
   useEffect(() => {
-    if (!isActive) return;
     const handleRepaint = () => {
       scheduleDraw();
     };
@@ -984,12 +997,11 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     return () => {
       window.removeEventListener('nano-dragging', handleRepaint);
     };
-  }, [isActive]);
+  }, []);
 
   // Listen to MotionValue camera transforms (pan & zoom)
+  // ALWAYS active to ensure zero-delay placeholder rendering during canvas dragging
   useEffect(() => {
-    if (!isActive) return;
-
     const unsubScale = scale.on('change', scheduleDraw);
     const unsubTx = tx.on('change', scheduleDraw);
     const unsubTy = ty.on('change', scheduleDraw);
@@ -1007,7 +1019,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         rafIdRef.current = null;
       }
     };
-  }, [scale, tx, ty, isActive]);
+  }, [scale, tx, ty]);
 
   // Keep the same canvas through LOD switches. Activation schedules its next
   // draw; DOM retirement is acknowledged only by that completed frame.

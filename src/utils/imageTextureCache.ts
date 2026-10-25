@@ -191,3 +191,38 @@ export function drawSquirclePath(
     ctx.closePath();
   }
 }
+
+/**
+ * Asynchronously preload and decode an image URL into GPU memory before mounting to DOM/Canvas.
+ * Ensures instantaneous non-flashing texture handoff.
+ */
+export async function preloadAndDecodeImage(url: string | null | undefined): Promise<boolean> {
+  if (!url) return false;
+  return new Promise((resolve) => {
+    const img = new Image();
+    if (!url.startsWith('data:') && !url.startsWith('blob:')) {
+      img.crossOrigin = 'anonymous';
+    }
+    img.referrerPolicy = 'no-referrer';
+
+    const handleDone = () => {
+      fullImageCache.set(url, img);
+      resolve(true);
+    };
+
+    img.onload = () => {
+      if ('decode' in img && typeof img.decode === 'function') {
+        img.decode().then(handleDone).catch(handleDone);
+      } else {
+        handleDone();
+      }
+    };
+
+    img.onerror = () => {
+      resolve(false);
+    };
+
+    img.src = url;
+  });
+}
+

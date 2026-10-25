@@ -361,6 +361,7 @@ export interface CardData {
   x: number;
   y: number;
   state: CardState;
+  isImporting?: boolean;
   ratio: AspectRatio;
   res: Resolution;
   prompt: string;
@@ -2629,6 +2630,9 @@ export const GenerationCard = React.memo(function GenerationCard({
   const [localThumbnailUrl, setLocalThumbnailUrl] = useState<string | undefined>(
     data.thumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined)
   );
+
+  const effectiveThumbnailUrl = data.thumbnailUrl || localThumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined);
+  const cardPlaceholderUrl = effectiveThumbnailUrl || imageUrl;
 
   useEffect(() => {
     if (isHovered || isPlaying) {
@@ -5355,20 +5359,31 @@ export const GenerationCard = React.memo(function GenerationCard({
               </div>
             </div>
           ) : (
-            <CardImageCanvas
-              cardId={id}
-              thumbnailUrl={data.thumbnailUrl}
-              imageUrl={imageUrl}
-              originalImageUrl={data.originalImageUrl || imageUrl}
-              showOriginal={showOriginal}
-              width={w}
-              height={h}
-              dpr={dpr}
-              state={state}
-              isZooming={isZooming}
-              onLoaded={handleImageLoaded}
-              className="squircle"
-            />
+            <div 
+              className="absolute inset-0 overflow-hidden squircle pointer-events-auto"
+              style={{
+                width: w,
+                height: h,
+                backgroundImage: cardPlaceholderUrl ? `url(${cardPlaceholderUrl})` : undefined,
+                backgroundSize: 'cover',
+                backgroundPosition: 'center',
+              }}
+            >
+              <CardImageCanvas
+                cardId={id}
+                thumbnailUrl={effectiveThumbnailUrl}
+                imageUrl={imageUrl}
+                originalImageUrl={data.originalImageUrl || imageUrl}
+                showOriginal={showOriginal}
+                width={w}
+                height={h}
+                dpr={dpr}
+                state={state}
+                isZooming={isZooming}
+                onLoaded={handleImageLoaded}
+                className="squircle"
+              />
+            </div>
           )
         )}
 

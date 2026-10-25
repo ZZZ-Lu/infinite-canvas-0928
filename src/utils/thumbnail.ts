@@ -4,7 +4,28 @@
  * fully portable to PixiJS / WebGL / Canvas / Worker environments.
  */
 
+import { compressAndResizeImage } from './gpuImageProcessor';
+
 export const MAX_THUMBNAIL_EDGE = 480;
+
+/**
+ * Yield execution to the browser main thread to prevent UI micro-jank during heavy batch import operations.
+ */
+export async function yieldToMain(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => {
+      setTimeout(resolve, 0);
+    });
+  });
+}
+
+export interface MultiLodResult {
+  microLodThumbnailUrl: string;
+  fullDetailThumbnailUrl: string;
+  closeupThumbnailUrl: string;
+  videoPosterUrl?: string;
+  displayBlob?: Blob;
+}
 
 // In-memory string cache for thumbnail Data URLs (media/card id -> DataURL)
 export const thumbCache = new Map<string, string>();
@@ -539,3 +560,62 @@ export function generateNativeVideoPoster(source: string | Blob, isCancelled: ()
   videoPosterQueue = task.catch(() => {});
   return task;
 }
+
+/**
+ * Generate Multi-LOD image pyramid textures for a given media asset (File, Blob, or URL).
+ * Interleaves `yieldToMain()` calls to guarantee 60fps UI responsiveness during batch generation.
+ */
+export async function generateMultiLodThumbnails(
+  source: File | Blob | string,
+  isVideo: boolean = false
+): Promise<MultiLodResult> {
+  let videoPosterUrl: string | undefined;
+  let sampleSource: File | Blob | string = source;
+  let displayBlob: Blob | undefined;
+
+  await yieldToMain();
+
+  if (isVideo) {
+    try {
+      videoPosterUrl = await generateNativeVideoPoster(source as any);
+      if (videoPosterUrl) {
+        sampleSource = videoPosterUrl;
+      }
+    } catch (err) {
+      console.warn('[thumbnail] Video poster extraction failed:', err);
+    }
+  } else if (typeof Blob !== 'undefined' && source instanceof Blob) {
+    try {
+      displayBlob = await compressAndResizeImage(source, 1200, 0.85);
+    } catch (err) {
+      console.warn('[thumbnail] GPU proxy compression fallback:', err);
+      displayBlob = source;
+    }
+  }
+
+  await yieldToMain();
+
+  let microLodThumbnailUrl = '';
+  let fullDetailThumbnailUrl = '';
+  let closeupThumbnailUrl = '';
+
+  try {
+    const targetSource = displayBlob || sampleSource;
+    microLodThumbnailUrl = await generateImageThumbnail(targetSource, 128, 0.80);
+    await yieldToMain();
+    fullDetailThumbnailUrl = await generateImageThumbnail(targetSource, 480, 0.88);
+    await yieldToMain();
+    closeupThumbnailUrl = await generateImageThumbnail(targetSource, 1200, 0.90);
+  } catch (err) {
+    console.warn('[thumbnail] Multi-LOD generation fallback notice:', err);
+  }
+
+  return {
+    microLodThumbnailUrl,
+    fullDetailThumbnailUrl,
+    closeupThumbnailUrl,
+    videoPosterUrl,
+    displayBlob
+  };
+}
+

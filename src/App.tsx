@@ -7736,28 +7736,6 @@ export default function App() {
             ty={ty}
             isDarkMode={isDarkMode}
             isOverviewMode={isOverviewMode}
-            isActive={
-              isNanoCanvasActive || 
-              isDraggingCanvasRef.current ||
-              isZooming ||
-              Boolean(
-                (window as any).isDraggingCard || 
-                (window as any).__nanoDragging ||
-                (typeof document !== 'undefined' && (
-                  document.getElementById('canvas-workspace')?.getAttribute('data-gesture') === 'true' ||
-                  document.getElementById('canvas-workspace')?.getAttribute('data-panning') === 'true' ||
-                  document.getElementById('canvas-workspace')?.getAttribute('data-zooming') === 'true'
-                ))
-              ) ||
-              (renderedCardIds.size < visibleCards.length && visibleCards.length > 0) ||
-              (() => {
-                if (typeof window === 'undefined') return false;
-                const paintedSet = (window as any).__paintedCardIds;
-                if (!paintedSet) return visibleCards.length > 0;
-                return visibleCards.some(c => !paintedSet.has(c.id) ||
-                  (!(c.fileName || c.isAsset) && !readyPromptPanels.has(c.id)));
-              })()
-            }
             onReady={handleNanoCanvasReady}
             onThumbnailGenerated={(id, thumbnailUrl) => {
               handleBatchThumbnailGenerated(id, thumbnailUrl);

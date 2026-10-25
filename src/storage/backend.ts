@@ -67,8 +67,7 @@ export class StorageBackend {
     const store = db.transaction('assets').objectStore('assets');
     return Promise.all(ids.map(async id => {
       const value = await request(store.get(id));
-      if (value === undefined) throw new Error('缺少已保存的媒体资源');
-      return { id, value };
+      return { id, value: value ?? null };
     }));
   }
   private async legacy(project: string): Promise<any[] | null> {

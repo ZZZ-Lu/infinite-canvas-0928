@@ -53,7 +53,7 @@ export const PromptPanelCanvas = React.memo(function PromptPanelCanvas({
   useLayoutEffect(() => {
     if (suspended) return;
     const canvas = canvasRef.current, root = rootRef.current;
-    const ctx = canvas?.getContext('2d');
+    const ctx = canvas?.getContext('2d', { alpha: true, desynchronized: true, willReadFrequently: false });
     if (!canvas || !ctx || !root) return;
     let cancelDraw: (() => void) | null = null;
     let active = true;

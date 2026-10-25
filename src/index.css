@@ -258,4 +258,14 @@
   will-change: transform;
 }
 
-
+/* GPU Hardware Acceleration & Layer Promotion:
+   Forces GPU rasterization, texture promotion, and zero main-thread CPU repaints for all canvas renderers and cards */
+canvas,
+.gpu-accelerated,
+.generation-card,
+.asset-card,
+#nano-lod-canvas {
+  transform: translate3d(0, 0, 0);
+  will-change: transform;
+  backface-visibility: hidden;
+}
