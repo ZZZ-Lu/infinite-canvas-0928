@@ -1,5 +1,5 @@
 import { EntryBlurOverlay } from './components/EntryBlurOverlay';
-import { registerCardEntries, requestCardEntries, CARD_ENTRY_MS, isNewCardAwaitingLod } from './utils/cardEntrance';
+import { registerCardEntries, requestCardEntries, stageCardEntry, startCardEntry, CARD_ENTRY_MS, isNewCardAwaitingLod } from './utils/cardEntrance';
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
 import { AgentContextMenu } from './components/AgentContextMenu';
@@ -10,6 +10,9 @@ import { NanoLodCanvas } from './components/NanoLodCanvas';
 import { FpsCounter, showToastNotice } from './components/FpsCounter';
 import { generateImageThumbnail, generateVideoThumbnail, generateNativeVideoPoster, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
 import { fastGetImageDimensions } from './utils/imageHeader';
+import { resizeImageOffThread } from './utils/imageResize';
+import { yieldToMain } from './utils/yieldToMain';
+import { getOrLoadCanvasImage } from './utils/imageTextureCache';
 import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
 import { CANVAS_IDLE_MS, scheduleCanvasSurface, canLoadDuringCameraGesture, subscribeCanvasLoadingMode } from './utils/canvasPerformance';
 import { readyPromptPanels } from './utils/promptSurfaceCache';
@@ -215,8 +218,12 @@ const getVideoDimensions = (url: string): Promise<MediaDimensions> => {
   });
 };
 
-const compressAndResizeImage = (file: File, maxDim = 1200, quality = 0.85): Promise<Blob> => {
-  return new Promise((resolve) => {
+const compressAndResizeImage = async (file: File, maxDim = 1200, quality = 0.85): Promise<Blob> => {
+  try {
+    return await resizeImageOffThread(file, maxDim, quality);
+  } catch {
+    // Keep support for browsers without OffscreenCanvas and recover from worker failures.
+    return new Promise((resolve) => {
     const reader = new FileReader();
     reader.onload = (e) => {
       const img = new Image();
@@ -253,8 +260,43 @@ const compressAndResizeImage = (file: File, maxDim = 1200, quality = 0.85): Prom
     };
     reader.onerror = () => resolve(file);
     reader.readAsDataURL(file);
-  });
+    });
+  }
 };
+
+const blobToDataUrl = (blob: Blob): Promise<string> => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('Thumbnail encoding failed'));
+  reader.onerror = () => reject(reader.error || new Error('Thumbnail encoding failed'));
+  reader.readAsDataURL(blob);
+});
+
+const generateImportThumbnail = async (source: Blob, maxEdge: number): Promise<string> => {
+  try {
+    // Reuse the resize worker so large-image downscaling never blocks the canvas thread.
+    return await blobToDataUrl(await resizeImageOffThread(source, maxEdge, 0.9));
+  } catch {
+    // Preserve compatibility with browsers that do not support the worker path.
+    return generateImageThumbnail(source, maxEdge);
+  }
+};
+
+const warmCanvasImage = (url: string, tier: 'full' | 'original' = 'full'): Promise<void> => new Promise(resolve => {
+  let settled = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    if (timer) clearTimeout(timer);
+    resolve();
+  };
+  const image = getOrLoadCanvasImage(url, finish, tier);
+  if (image) {
+    finish();
+    return;
+  }
+  timer = setTimeout(finish, 5000);
+});
 
 const getClosestAspectRatio = (width: number, height: number): '1:1' | '3:4' | '9:16' | '16:9' => {
   if (!width || !height) return '3:4';
@@ -2348,16 +2390,14 @@ export default function App() {
         id: newId,
         x: dropCanvasX - dim.width / 2 + offset,
         y: dropCanvasY - dim.height / 2 + offset,
-        state: 'idle',
+        state: 'generating',
         ratio: ratio,
         res: '2K',
         prompt: `${sourceLabel} ${isVideo ? 'video' : 'image'}: ${file.name || 'unnamed'}`,
-        imageUrl: fileUrl, // Visible on the canvas instantly!
-        fileData: file,    // Direct binary Blob reference
-        originalFileData: file,
-        trueOriginalFileData: file,
-        originalImageUrl: fileUrl,
-        trueOriginalImageUrl: fileUrl,
+        imageUrl: undefined,
+        // Keep the raw file available for recovery, but don't decode/draw the full source on the
+        // canvas thread. The card shows its import placeholder until a small preview is ready.
+        fileData: file,
         isVideo: isVideo,
         customWidth: customWidth,
         customHeight: customHeight,
@@ -2388,173 +2428,159 @@ export default function App() {
     }[];
     if (parsedItems.length === 0) return;
 
-    const initialCards = parsedItems.map(item => item.card);
-    const newCardIds = initialCards.map(card => card.id);
+    const newCardIds: string[] = [];
 
-    // Helper to reliably wait until card entrance animation has completely landed and finished
-    const waitForCardEntrance = (cardId: string): Promise<void> => {
-      return new Promise<void>((resolve) => {
-        let finished = false;
-        const cleanup = () => {
-          if (finished) return;
-          finished = true;
-          window.removeEventListener('card-entrance-complete', handleEvent as EventListener);
-          resolve();
-        };
+    // Resolve each image's import work before mounting it with its entrance animation.
+    // This keeps expensive resize/thumbnail work out of the animation window and avoids
+    // starting several cards' entrance animations while later files are still processing.
+    const waitForCardEntrance = (cardId: string): Promise<void> => new Promise(resolve => {
+      let finished = false;
+      let timeout: ReturnType<typeof setTimeout>;
+      const cleanup = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+        window.removeEventListener('card-entrance-complete', handleEvent as EventListener);
+        resolve();
+      };
+      const handleEvent = (event: Event) => {
+        const customEvent = event as CustomEvent<{ cardId: string }>;
+        if (customEvent.detail?.cardId === cardId) cleanup();
+      };
+      window.addEventListener('card-entrance-complete', handleEvent as EventListener);
+      timeout = setTimeout(cleanup, CARD_ENTRY_MS + 80);
+    });
 
-        const handleEvent = (e: Event) => {
-          const customEvt = e as CustomEvent<{ cardId: string }>;
-          if (customEvt.detail?.cardId === cardId) {
-            cleanup();
-          }
-        };
-
-        window.addEventListener('card-entrance-complete', handleEvent as EventListener);
-
-        // Safety fallback: allow generous window (CARD_ENTRY_MS + 80ms)
-        // for reduced motion, offscreen drop, or frame boundary
-        setTimeout(cleanup, CARD_ENTRY_MS + 80);
-      });
-    };
-
-    // Sequential Entrance ("一张一张入场"):
-    // Introduce each card one by one with a complete, smooth 450ms drop-and-settle entrance animation.
-    // Each card gets a fresh start timestamp in requestCardEntries right as it enters, immediate
-    // pre-mounting in renderedCardIds and visibleCardIdSet, and 100% of the main thread and GPU.
-    const enteredCardIds: string[] = [];
-    for (let i = 0; i < parsedItems.length; i++) {
-      const item = parsedItems[i];
-      const card = item.card;
-      enteredCardIds.push(card.id);
-
-      // 1. Authorize card entrance timestamp right when THIS specific card is introduced
-      requestCardEntries(currentProjectId, [{
+    for (const item of parsedItems) {
+      const { file, fileUrl, isImage, isVideo, width, height, card } = item;
+      stageCardEntry(currentProjectId, {
         id: card.id,
         x: card.x,
         y: card.y,
         width: card.customWidth || CARD_DIMENSIONS[card.ratio].width,
         height: card.customHeight || CARD_DIMENSIONS[card.ratio].height,
-      }]);
-
-      // 2. Pre-mount in renderedCardIds and visibleCardIdSet so it mounts immediately and is never culled
+      });
       setRenderedCardIds(prev => new Set([...prev, card.id]));
       setVisibleCardIdSet(prev => new Set([...prev, card.id]));
-
-      // 3. Keep selected card list updated
-      setSelectedCardIds([...enteredCardIds]);
-
-      // 4. Mount the card to canvas state (without cluttering undo history with intermediate steps)
+      newCardIds.push(card.id);
+      setSelectedCardIds([...newCardIds]);
       setCards(prev => [...prev, card], false);
 
-      // 5. Wait for this card's entrance animation to finish its full drop-and-bounce curve
-      await waitForCardEntrance(card.id);
+      // Let React paint the card in its opening pose before doing image work.
+      await yieldToMain();
+      let processedFile: Blob = file;
+      let originalFileData: Blob | undefined;
+      let trueOriginalFileData: Blob | undefined;
+      let originalImageUrl: string | undefined;
+      let trueOriginalImageUrl: string | undefined;
 
-      // 6. If more cards remain, give a subtle 30ms breather for human visual pacing
-      if (i < parsedItems.length - 1) {
-        await new Promise(r => setTimeout(r, 30));
-      }
-    }
-
-    // Now all cards have gracefully landed! Ensure all new cards are selected together
-    setSelectedCardIds(newCardIds);
-
-    // Step 2: Background processing - strictly scheduled AFTER ALL cards finish their entrance curve!
-    // "用时间换帧数": Let ALL cards in the dropped batch complete their 450ms entrance animation curve
-    // and bounce-landing first, with ZERO setCards re-renders or CPU compression interrupts!
-    (async () => {
-      // Small 40ms post-landing settle buffer
-      await new Promise(r => setTimeout(r, 40));
-
-      // 2. NOW all cards have gracefully landed. Transition cards to the import state ('generating') together
-      const idSet = new Set(newCardIds);
-      setCards(prev => prev.map(c => idSet.has(c.id) ? { ...c, state: 'generating' } : c));
-
-      // Yield briefly to let the import spinner render
-      await new Promise(r => setTimeout(r, 20));
-
-      // 3. Process media background tasks sequentially with frame yields to avoid CPU saturation
-      for (const item of parsedItems) {
-        if (!item) continue;
-        const { file, fileUrl, isImage, isVideo, width, height, card } = item;
-
-        let processedFile: Blob = file;
-        let originalFileData: Blob | undefined = undefined;
-        let trueOriginalFileData: Blob | undefined = undefined;
-        let originalImageUrl: string | undefined = undefined;
-        let trueOriginalImageUrl: string | undefined = undefined;
-
-        if (isImage) {
-          try {
-            // Generate 1200px preview for optimal performance when zoomed
-            processedFile = await compressAndResizeImage(file, 1200);
-
-            // Check if original is > 4K (4096px) (GPU texture limit safety & LOD optimization)
-            const MAX_TEXTURE_DIM = 4096;
-            if (width > MAX_TEXTURE_DIM || height > MAX_TEXTURE_DIM) {
-              trueOriginalFileData = file;
-              trueOriginalImageUrl = fileUrl;
-
-              // Create a safe 4K proxy for the "original" view in the UI to prevent GPU crashes and optimize VRAM
-              originalFileData = await compressAndResizeImage(file, MAX_TEXTURE_DIM, 0.9);
-              originalImageUrl = URL.createObjectURL(originalFileData);
-            } else {
-              // Under 4K, original file is proxy itself
-              originalFileData = file;
-              originalImageUrl = fileUrl;
-            }
-          } catch (err) {
-            console.error("Failed to process image in background", err);
-            processedFile = await compressAndResizeImage(file, 1200);
+      if (isImage) {
+        try {
+          processedFile = await compressAndResizeImage(file, 1200);
+          const maxTextureDim = 4096;
+          if (width > maxTextureDim || height > maxTextureDim) {
+            trueOriginalFileData = file;
+            trueOriginalImageUrl = fileUrl;
+            originalFileData = await compressAndResizeImage(file, maxTextureDim, 0.9);
+            originalImageUrl = URL.createObjectURL(originalFileData);
+          } else {
             originalFileData = file;
             originalImageUrl = fileUrl;
           }
-        }
-
-        const processedFileUrl = URL.createObjectURL(processedFile);
-
-        let thumbnailUrl: string | undefined;
-        let microLodThumbnailUrl: string | undefined;
-        let fullDetailThumbnailUrl: string | undefined;
-        let closeupThumbnailUrl: string | undefined;
-        let videoPosterUrl: string | undefined;
-        try {
-          if (isVideo) {
-            videoPosterUrl = await generateNativeVideoPoster(processedFile);
-            closeupThumbnailUrl = await generateImageThumbnail(videoPosterUrl, 256);
-            thumbnailUrl = closeupThumbnailUrl;
-            microLodThumbnailUrl = await generateImageThumbnail(videoPosterUrl, 64);
-            fullDetailThumbnailUrl = await generateImageThumbnail(videoPosterUrl, 128);
-          } else {
-            closeupThumbnailUrl = await generateImageThumbnail(processedFile, 256);
-            thumbnailUrl = closeupThumbnailUrl;
-            microLodThumbnailUrl = await generateImageThumbnail(processedFile, 64);
-            fullDetailThumbnailUrl = await generateImageThumbnail(processedFile, 128);
+        } catch (err) {
+          console.error('Failed to process imported image; keeping original file', err);
+          processedFile = file;
+          originalFileData = file;
+          originalImageUrl = fileUrl;
+          if (width > 4096 || height > 4096) {
+            trueOriginalFileData = file;
+            trueOriginalImageUrl = fileUrl;
           }
-        } catch (thumbErr) {
-          console.warn('Could not pre-generate thumbnail on import:', thumbErr);
         }
-
-        // Step 4: Seamlessly complete import for this card
-        setCards(prev => prev.map(c => c.id === card.id ? {
-          ...c,
-          state: 'completed',
-          imageUrl: processedFileUrl,
-          fileData: processedFile,
-          originalFileData: originalFileData,
-          trueOriginalFileData: trueOriginalFileData,
-          originalImageUrl: originalImageUrl,
-          trueOriginalImageUrl: trueOriginalImageUrl,
-          thumbnailUrl: thumbnailUrl,
-          microLodThumbnailUrl: microLodThumbnailUrl,
-          fullDetailThumbnailUrl: fullDetailThumbnailUrl,
-          closeupThumbnailUrl: closeupThumbnailUrl,
-          videoPosterUrl,
-        } : c));
-
-        // Yield between consecutive items to let the browser paint at 60fps
-        await new Promise(r => setTimeout(r, 30));
       }
-    })();
+
+      const processedFileUrl = URL.createObjectURL(processedFile);
+      let thumbnailUrl: string | undefined;
+      let microLodThumbnailUrl: string | undefined;
+      let fullDetailThumbnailUrl: string | undefined;
+      let closeupThumbnailUrl: string | undefined;
+      let videoPosterUrl: string | undefined;
+      try {
+        if (isVideo) {
+          videoPosterUrl = await generateNativeVideoPoster(processedFile);
+          await yieldToMain();
+          const posterBlob = await fetch(videoPosterUrl).then(response => response.blob());
+          closeupThumbnailUrl = await generateImportThumbnail(posterBlob, 256);
+          thumbnailUrl = closeupThumbnailUrl;
+          await warmCanvasImage(closeupThumbnailUrl);
+          // Paint a tiny poster first so the card does not upload a video frame and animate
+          // in the same frame. Keep the import overlay until all video assets are ready.
+          setCards(prev => prev.map(existing => existing.id === card.id ? {
+            ...existing, imageUrl: closeupThumbnailUrl, thumbnailUrl,
+            fileData: processedFile, isVideo: false,
+          } : existing), false);
+          await yieldToMain();
+          await yieldToMain();
+          microLodThumbnailUrl = await generateImportThumbnail(posterBlob, 64);
+          await yieldToMain();
+          fullDetailThumbnailUrl = await generateImportThumbnail(posterBlob, 128);
+        } else {
+          await yieldToMain();
+          closeupThumbnailUrl = await generateImportThumbnail(processedFile, 256);
+          thumbnailUrl = closeupThumbnailUrl;
+          await warmCanvasImage(closeupThumbnailUrl);
+          // Show the small preview under the import indicator while the other LODs load.
+          setCards(prev => prev.map(existing => existing.id === card.id ? {
+            ...existing, imageUrl: closeupThumbnailUrl, thumbnailUrl,
+            fileData: processedFile,
+          } : existing), false);
+          await yieldToMain();
+          await yieldToMain();
+          microLodThumbnailUrl = await generateImportThumbnail(processedFile, 64);
+          await yieldToMain();
+          fullDetailThumbnailUrl = await generateImportThumbnail(processedFile, 128);
+        }
+      } catch (thumbErr) {
+        console.warn('Could not pre-generate thumbnail on import:', thumbErr);
+      }
+
+      const importingCard: CardData = {
+        ...card,
+        state: 'generating',
+        imageUrl: processedFileUrl,
+        fileData: processedFile,
+        originalFileData,
+        trueOriginalFileData,
+        originalImageUrl,
+        trueOriginalImageUrl,
+        thumbnailUrl,
+        microLodThumbnailUrl,
+        fullDetailThumbnailUrl,
+        closeupThumbnailUrl,
+        videoPosterUrl,
+      };
+
+      // Decode the full proxy into the same canvas image cache before exposing it to React.
+      // Its first canvas draw then happens while the card is still held and marked importing.
+      await warmCanvasImage(processedFileUrl);
+      if (originalImageUrl && tScale.get() > 2 && originalImageUrl !== processedFileUrl) {
+        await warmCanvasImage(originalImageUrl, 'original');
+      }
+      await yieldToMain();
+      setCards(prev => prev.map(existing => existing.id === card.id ? importingCard : existing), false);
+      await yieldToMain();
+      await yieldToMain();
+
+      // Finish import and let the canvas paint the ready image before the entrance animation.
+      const entranceComplete = waitForCardEntrance(card.id);
+      setCards(prev => prev.map(existing => existing.id === card.id ? { ...existing, state: 'completed' } : existing), false);
+      startCardEntry(card.id);
+      window.dispatchEvent(new CustomEvent('card-entry-start', { detail: { cardId: card.id } }));
+      await entranceComplete;
+    }
+
+    // Keep the whole imported batch selected once the serial import-and-entrance pass ends.
+    setSelectedCardIds(newCardIds);
   }, [tx, ty, tScale]);
 
   const handleDrop = useCallback(async (e: React.DragEvent) => {

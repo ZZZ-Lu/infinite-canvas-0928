@@ -4692,7 +4692,17 @@ export const GenerationCard = React.memo(function GenerationCard({
     displayY = posRef.current.y;
   }
 
-  const entryFrame = useState(() => cardEntryFrame(id, performance.now(), true))[0];
+  const [entryFrame, setEntryFrame] = useState(() => cardEntryFrame(id, performance.now(), true));
+  useEffect(() => {
+    const handleEntryStart = (event: Event) => {
+      const customEvent = event as CustomEvent<{ cardId: string }>;
+      if (customEvent.detail?.cardId === id) {
+        setEntryFrame(cardEntryFrame(id, performance.now(), true));
+      }
+    };
+    window.addEventListener('card-entry-start', handleEntryStart as EventListener);
+    return () => window.removeEventListener('card-entry-start', handleEntryStart as EventListener);
+  }, [id]);
   return (
     <div 
       ref={cardRef}
@@ -4706,10 +4716,12 @@ export const GenerationCard = React.memo(function GenerationCard({
     >
       <motion.div
         initial={entryFrame ? { scale: entryFrame.scale, opacity: entryFrame.opacity } : false}
-        animate={entryFrame ? { scale: entryFrame.scales, opacity: entryFrame.opacities, y: 0 } : { scale: 1, opacity: 1, y: 0 }}
+        animate={entryFrame?.held
+          ? { scale: entryFrame.scale, opacity: entryFrame.opacity, y: 0 }
+          : entryFrame ? { scale: entryFrame.scales, opacity: entryFrame.opacities, y: 0 } : { scale: 1, opacity: 1, y: 0 }}
         transition={{ duration: entryFrame?.duration || 0, delay: entryFrame?.delay || 0, ease: 'linear' }}
         onAnimationComplete={() => {
-          if (entryFrame && typeof window !== 'undefined') {
+          if (entryFrame && !entryFrame.held && typeof window !== 'undefined') {
             window.dispatchEvent(new CustomEvent('card-entrance-complete', { detail: { cardId: id } }));
           }
         }}
@@ -5375,7 +5387,9 @@ export const GenerationCard = React.memo(function GenerationCard({
             >
               <RefreshCw className={`w-8 h-8 ${imageUrl ? 'text-white' : 'text-purple-600'} animate-spin mb-2 drop-shadow-md`} />
               <span className={`text-xs ${imageUrl ? 'text-white/95 font-medium' : 'text-purple-700 font-bold'} tracking-wider drop-shadow-md`}>
-                {imageUrl ? ((data.prompt?.startsWith('Dropped') || data.prompt?.startsWith('Imported') || data.prompt?.startsWith('Pasted')) ? '正在导入...' : data.prompt ? 'Mira 正在生成...' : '导入中...') : 'Mira 正在思考...'}
+                {(data.prompt?.startsWith('Dropped') || data.prompt?.startsWith('Imported') || data.prompt?.startsWith('Pasted'))
+                  ? '正在导入...'
+                  : imageUrl ? (data.prompt ? 'Mira 正在生成...' : '导入中...') : 'Mira 正在思考...'}
               </span>
             </motion.div>
           )}

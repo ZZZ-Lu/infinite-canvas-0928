@@ -1,6 +1,8 @@
 // Renderer-only group state: all members share one world-space pivot and clock.
-type EntryGroup = { start: number; x: number; y: number };
+type EntryGroup = { start: number | null; x: number; y: number };
 const entries = new Map<string, EntryGroup>();
+// Staged import cards stay at their opening pose independently of viewport registration.
+const stagedEntries = new Map<string, Omit<EntryGroup, 'start'>>();
 const awaitingEntryDom = new Set<string>();
 let project: string | null = null;
 let known = new Set<string>();
@@ -22,6 +24,18 @@ export function requestCardEntries(
   }
 }
 export const CARD_ENTRY_MS = 450;
+// Imported cards can be mounted in their opening pose while their media is prepared.
+export function stageCardEntry(projectId: string, item: { id: string; x: number; y: number; width: number; height: number }) {
+  requested.set(item.id, projectId);
+  awaitingEntryDom.add(item.id);
+  stagedEntries.set(item.id, { x: item.x + item.width / 2, y: item.y + item.height / 2 });
+}
+export function startCardEntry(id: string) {
+  const staged = stagedEntries.get(id);
+  if (!staged) return;
+  stagedEntries.delete(id);
+  entries.set(id, { ...staged, start: performance.now() });
+}
 export function registerCardEntries(projectId: string, cards: { id: string; x: number; y: number; width: number; height: number }[], visible: Set<string>, now: number, reduced: boolean, pivot: { x: number; y: number }) {
   const isProjectEntry = project !== projectId;
   if (isProjectEntry) { project = projectId; known = new Set(); entries.clear(); awaitingEntryDom.clear(); }
@@ -31,10 +45,13 @@ export function registerCardEntries(projectId: string, cards: { id: string; x: n
     const group: EntryGroup = { start: now, x: pivot.x, y: pivot.y };
     for (const card of added) {
       if (!isProjectEntry) awaitingEntryDom.add(card.id);
-      entries.set(card.id, isProjectEntry ? group : { start: now, x: card.x + card.width / 2, y: card.y + card.height / 2 });
+      // Preserve a staged import's held opening pose until its preprocessing completes.
+      if (!stagedEntries.has(card.id)) {
+        entries.set(card.id, isProjectEntry ? group : { start: now, x: card.x + card.width / 2, y: card.y + card.height / 2 });
+      }
     }
   }
-  for (const [id, group] of entries) if (!next.has(id) || (group.start !== undefined && now >= group.start + CARD_ENTRY_MS)) entries.delete(id);
+  for (const [id, group] of entries) if (!next.has(id) || (group.start !== null && now >= group.start + CARD_ENTRY_MS)) entries.delete(id);
   for (const id of awaitingEntryDom) if (!next.has(id)) awaitingEntryDom.delete(id);
   // Consume even offscreen/reduced-motion requests; a later viewport change is not entry.
   for (const [id, owner] of requested) if (next.has(id) || owner !== projectId) requested.delete(id);
@@ -56,6 +73,11 @@ export function sampleCardEntry(progress: number) {
   return { scale, opacity: 1 };
 }
 export function cardEntryFrame(id: string, now = performance.now(), keyframes = false) {
+  const staged = stagedEntries.get(id);
+  if (staged) {
+    const openingPose = sampleCardEntry(0);
+    return { pivotX: staged.x, pivotY: staged.y, ...openingPose, scales: [openingPose.scale], opacities: [openingPose.opacity], delay: 0, duration: 0, held: true };
+  }
   const group = entries.get(id);
   if (!group) return null;
   const start = group.start;

@@ -1942,7 +1942,8 @@ ${effectiveRequirement}
         middlewareMode: true,
         hmr: false,
         ws: false,
-        watch: null,
+        // Keep the module cache current; HMR remains disabled above.
+        watch: {},
       },
       appType: "spa",
     });
