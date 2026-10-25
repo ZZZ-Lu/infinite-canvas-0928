@@ -20,13 +20,44 @@ export function requestCardEntries(
       entries.set(item.id, { start: now, x: item.x + item.width / 2, y: item.y + item.height / 2 });
     }
   }
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('card-entry-updated'));
+  }
 }
+
+export function holdCardsAtEntryStart(
+  projectId: string,
+  items: { id: string; x: number; y: number; width: number; height: number }[]
+) {
+  for (const item of items) {
+    requested.set(item.id, projectId);
+    awaitingEntryDom.add(item.id);
+    entries.set(item.id, { start: Infinity, x: item.x + item.width / 2, y: item.y + item.height / 2 });
+  }
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('card-entry-updated'));
+  }
+}
+
+export function triggerCardDrop(
+  projectId: string,
+  item: { id: string; x: number; y: number; width: number; height: number }
+) {
+  const now = performance.now();
+  requested.set(item.id, projectId);
+  awaitingEntryDom.add(item.id);
+  entries.set(item.id, { start: now, x: item.x + item.width / 2, y: item.y + item.height / 2 });
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('card-entry-updated', { detail: { cardId: item.id } }));
+  }
+}
+
 export const CARD_ENTRY_MS = 450;
 export function registerCardEntries(projectId: string, cards: { id: string; x: number; y: number; width: number; height: number }[], visible: Set<string>, now: number, reduced: boolean, pivot: { x: number; y: number }) {
   const isProjectEntry = project !== projectId;
   if (isProjectEntry) { project = projectId; known = new Set(); entries.clear(); awaitingEntryDom.clear(); }
   const next = new Set(cards.map(card => card.id));
-  const added = reduced ? [] : cards.filter(card => !known.has(card.id) && visible.has(card.id) && (isProjectEntry || requested.get(card.id) === projectId));
+  const added = reduced ? [] : cards.filter(card => !known.has(card.id) && !entries.has(card.id) && visible.has(card.id) && (isProjectEntry || requested.get(card.id) === projectId));
   if (added.length) {
     const group: EntryGroup = { start: now, x: pivot.x, y: pivot.y };
     for (const card of added) {
@@ -34,10 +65,20 @@ export function registerCardEntries(projectId: string, cards: { id: string; x: n
       entries.set(card.id, isProjectEntry ? group : { start: now, x: card.x + card.width / 2, y: card.y + card.height / 2 });
     }
   }
-  for (const [id, group] of entries) if (!next.has(id) || (group.start !== undefined && now >= group.start + CARD_ENTRY_MS)) entries.delete(id);
+  for (const [id, group] of entries) {
+    if (!next.has(id)) {
+      entries.delete(id);
+    } else if (group.start !== Infinity && group.start !== undefined && now >= group.start + CARD_ENTRY_MS) {
+      entries.delete(id);
+    }
+  }
   for (const id of awaitingEntryDom) if (!next.has(id)) awaitingEntryDom.delete(id);
   // Consume even offscreen/reduced-motion requests; a later viewport change is not entry.
-  for (const [id, owner] of requested) if (next.has(id) || owner !== projectId) requested.delete(id);
+  for (const [id, owner] of requested) {
+    if ((next.has(id) && !entries.has(id)) || owner !== projectId) {
+      requested.delete(id);
+    }
+  }
   for (const id of next) known.add(id);
   // Only whole-project entrances trigger the shared blur overlay.
   // New cards retain their individual entry animation without blurring the page.
@@ -59,17 +100,58 @@ export function cardEntryFrame(id: string, now = performance.now(), keyframes = 
   const group = entries.get(id);
   if (!group) return null;
   const start = group.start;
-  if (now >= start + CARD_ENTRY_MS) { entries.delete(id); return null; }
+
+  // Held at start pose (start === Infinity): scale 1.38x floating pose
+  if (start === Infinity) {
+    const samples = keyframes ? Array.from({ length: 41 }, () => sampleCardEntry(0)) : [];
+    return {
+      start: Infinity,
+      pivotX: group.x,
+      pivotY: group.y,
+      ...sampleCardEntry(0),
+      scales: samples.map(frame => frame.scale),
+      opacities: samples.map(frame => frame.opacity),
+      delay: 0,
+      duration: CARD_ENTRY_MS / 1000,
+    };
+  }
+
+  if (now >= start + CARD_ENTRY_MS) {
+    entries.delete(id);
+    if (awaitingEntryDom.has(id)) {
+      awaitingEntryDom.delete(id);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('card-entrance-complete', { detail: { cardId: id } }));
+      }
+    }
+    return null;
+  }
   const progress = Math.max(0, (now - start) / CARD_ENTRY_MS);
   const samples = keyframes ? Array.from({ length: 41 }, (_, i) => sampleCardEntry(progress + (1 - progress) * i / 40)) : [];
-  return { pivotX: group.x, pivotY: group.y, ...sampleCardEntry(progress), scales: samples.map(frame => frame.scale), opacities: samples.map(frame => frame.opacity), delay: Math.max(0, start - now) / 1000, duration: (1 - progress) * CARD_ENTRY_MS / 1000 };
+  return { start, pivotX: group.x, pivotY: group.y, ...sampleCardEntry(progress), scales: samples.map(frame => frame.scale), opacities: samples.map(frame => frame.opacity), delay: Math.max(0, start - now) / 1000, duration: (1 - progress) * CARD_ENTRY_MS / 1000 };
 }
 
 // New cards at DOM scale wait for that renderer rather than showing a nano placeholder.
 // Retire this one-time guard only after the normal painted/panel-ready handshake.
 export function waitForEntryDom(id: string, ready: boolean) {
   if (!awaitingEntryDom.has(id)) return false;
-  if (ready) awaitingEntryDom.delete(id);
+  if (ready) {
+    awaitingEntryDom.delete(id);
+  }
   return true;
 }
 export function isNewCardAwaitingLod(id: string) { return awaitingEntryDom.has(id); }
+
+let activeBatchCount = 0;
+export function beginBatchEntrance() {
+  activeBatchCount++;
+}
+export function endBatchEntrance() {
+  activeBatchCount = Math.max(0, activeBatchCount - 1);
+  if (activeBatchCount === 0 && typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('card-batch-entrance-complete'));
+  }
+}
+export function isBatchEntranceActive() {
+  return activeBatchCount > 0;
+}

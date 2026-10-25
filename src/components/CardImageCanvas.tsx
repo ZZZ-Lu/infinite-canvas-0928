@@ -4,6 +4,7 @@ import {
   calculateObjectCover,
 } from '../utils/imageTextureCache';
 import { getOrLoadThumbImage } from '../utils/thumbnail';
+import { isNewCardAwaitingLod, isBatchEntranceActive } from '../utils/cardEntrance';
 
 export interface CardImageCanvasProps {
   cardId?: string;
@@ -81,6 +82,25 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     onLoaded,
   };
 
+  // When card entrance lands or when batch entrance finishes, re-schedule draw to upgrade from thumbnail to full proxy texture
+  useEffect(() => {
+    const handleEntrance = (e: Event) => {
+      const customEvt = e as CustomEvent<{ cardId?: string }>;
+      if (!customEvt.detail?.cardId || customEvt.detail.cardId === cardId) {
+        scheduleDraw();
+      }
+    };
+    const handleBatchComplete = () => {
+      scheduleDraw();
+    };
+    window.addEventListener('card-entrance-complete', handleEntrance as EventListener);
+    window.addEventListener('card-batch-entrance-complete', handleBatchComplete as EventListener);
+    return () => {
+      window.removeEventListener('card-entrance-complete', handleEntrance as EventListener);
+      window.removeEventListener('card-batch-entrance-complete', handleBatchComplete as EventListener);
+    };
+  }, [cardId]);
+
   const scheduleDraw = () => {
     if (rafIdRef.current !== null) return;
     rafIdRef.current = requestAnimationFrame(() => {
@@ -156,7 +176,15 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       ? getOrLoadThumbImage(thumbnailUrl, scheduleDraw)
       : null;
 
-    const fullImg = imageUrl
+    const microImgReady = Boolean(microImg && microImg.complete && microImg.naturalWidth > 0);
+
+    // Guard during entrance: if card has a thumbnail and is actively playing its 450ms entrance animation,
+    // render the sharp thumbnail and defer heavier full-proxy decoding until after landing.
+    // Crucial: Only defer if microImg is actually ready to draw, so cards are never invisible.
+    const isEntering = (cardId ? isNewCardAwaitingLod(cardId) : false) || isBatchEntranceActive();
+    const deferFullImg = isEntering && Boolean(thumbnailUrl) && microImgReady;
+
+    const fullImg = (!deferFullImg && imageUrl)
       ? getOrLoadCanvasImage(imageUrl, scheduleDraw, 'full')
       : null;
 

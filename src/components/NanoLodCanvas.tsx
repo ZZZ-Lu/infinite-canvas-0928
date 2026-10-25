@@ -914,6 +914,13 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       ctx.scale(entry.scale, entry.scale);
       ctx.translate(-cx, -cy);
       ctx.globalAlpha *= entry.opacity;
+      if (entry.start === Infinity) {
+        ctx.filter = 'blur(12px)';
+      } else if (entry.start !== undefined) {
+        const progress = Math.max(0, Math.min(1, (performance.now() - entry.start) / 450));
+        const blurPx = Math.max(0, 12 * (1 - progress));
+        if (blurPx > 0.2) ctx.filter = `blur(${blurPx.toFixed(1)}px)`;
+      }
       renderCard(card);
       ctx.restore();
     };
