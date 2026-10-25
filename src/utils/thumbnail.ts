@@ -4,8 +4,6 @@
  * fully portable to PixiJS / WebGL / Canvas / Worker environments.
  */
 
-import { gpuResizeImage } from './gpuImageProcessor';
-
 export const MAX_THUMBNAIL_EDGE = 480;
 
 // In-memory string cache for thumbnail Data URLs (media/card id -> DataURL)
@@ -144,31 +142,11 @@ export async function generateImageThumbnail(
       reject(new Error('Image thumbnail generation timed out'));
     }, 5000);
 
-    img.onload = async () => {
+    img.onload = () => {
       try {
         const origW = img.naturalWidth || maxEdge;
         const origH = img.naturalHeight || maxEdge;
         const { width: tw, height: th } = getThumbnailDimensions(origW, origH, maxEdge);
-
-        // Try GPU WebGL hardware accelerated downsampling first
-        try {
-          const gpuBlob = await gpuResizeImage(img, tw, th, 'image/webp', quality);
-          if (gpuBlob) {
-            const reader = new FileReader();
-            const dataUrlPromise = new Promise<string>((res) => {
-              reader.onloadend = () => res((reader.result as string) || '');
-              reader.readAsDataURL(gpuBlob);
-            });
-            const url = await dataUrlPromise;
-            if (url) {
-              cleanup();
-              resolve(url);
-              return;
-            }
-          }
-        } catch (gpuErr) {
-          console.warn('[generateImageThumbnail] GPU fallback:', gpuErr);
-        }
 
         const canvas = document.createElement('canvas');
         canvas.width = tw;

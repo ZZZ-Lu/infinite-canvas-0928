@@ -1,5 +1,5 @@
 import { EntryBlurOverlay } from './components/EntryBlurOverlay';
-import { registerCardEntries, requestCardEntries, holdCardsAtEntryStart, triggerCardDrop, CARD_ENTRY_MS, isNewCardAwaitingLod } from './utils/cardEntrance';
+import { registerCardEntries, requestCardEntries, CARD_ENTRY_MS, isNewCardAwaitingLod } from './utils/cardEntrance';
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
 import { AgentContextMenu } from './components/AgentContextMenu';
@@ -10,7 +10,6 @@ import { NanoLodCanvas } from './components/NanoLodCanvas';
 import { FpsCounter, showToastNotice } from './components/FpsCounter';
 import { generateImageThumbnail, generateVideoThumbnail, generateNativeVideoPoster, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
 import { fastGetImageDimensions } from './utils/imageHeader';
-import { gpuResizeImage } from './utils/gpuImageProcessor';
 import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
 import { CANVAS_IDLE_MS, scheduleCanvasSurface, canLoadDuringCameraGesture, subscribeCanvasLoadingMode } from './utils/canvasPerformance';
 import { readyPromptPanels } from './utils/promptSurfaceCache';
@@ -216,67 +215,44 @@ const getVideoDimensions = (url: string): Promise<MediaDimensions> => {
   });
 };
 
-const compressAndResizeImage = async (file: File, maxDim = 1200, quality = 0.85): Promise<Blob> => {
-  try {
-    const dims = await fastGetImageDimensions(file).catch(() => ({ width: 0, height: 0 }));
-    let width = dims.width;
-    let height = dims.height;
-
-    if (width > 0 && height > 0) {
-      if (width > maxDim || height > maxDim) {
-        if (width > height) {
-          height = Math.round((height * maxDim) / width);
-          width = maxDim;
-        } else {
-          width = Math.round((width * maxDim) / height);
-          height = maxDim;
-        }
-      }
-      const mimeType = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
-      const gpuBlob = await gpuResizeImage(file, width, height, mimeType, quality);
-      if (gpuBlob) return gpuBlob;
-    }
-  } catch (gpuErr) {
-    console.warn('[compressAndResizeImage] GPU acceleration bypass:', gpuErr);
-  }
-
+const compressAndResizeImage = (file: File, maxDim = 1200, quality = 0.85): Promise<Blob> => {
   return new Promise((resolve) => {
-    const img = new Image();
-    const tempUrl = URL.createObjectURL(file);
-    img.onload = () => {
-      URL.revokeObjectURL(tempUrl);
-      let width = img.naturalWidth;
-      let height = img.naturalHeight;
-      
-      if (width > maxDim || height > maxDim) {
-        if (width > height) {
-          height = Math.round((height * maxDim) / width);
-          width = maxDim;
-        } else {
-          width = Math.round((width * maxDim) / height);
-          height = maxDim;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        let width = img.naturalWidth;
+        let height = img.naturalHeight;
+        
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
         }
-      }
-      
-      const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(img, 0, 0, width, height);
-        const mimeType = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
-        canvas.toBlob((blob) => {
-          resolve(blob || file);
-        }, mimeType, quality);
-      } else {
-        resolve(file);
-      }
+        
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          const mimeType = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
+          canvas.toBlob((blob) => {
+            resolve(blob || file);
+          }, mimeType, quality);
+        } else {
+          resolve(file);
+        }
+      };
+      img.onerror = () => resolve(file);
+      img.src = e.target?.result as string;
     };
-    img.onerror = () => {
-      URL.revokeObjectURL(tempUrl);
-      resolve(file);
-    };
-    img.src = tempUrl;
+    reader.onerror = () => resolve(file);
+    reader.readAsDataURL(file);
   });
 };
 
@@ -2372,7 +2348,7 @@ export default function App() {
         id: newId,
         x: dropCanvasX - dim.width / 2 + offset,
         y: dropCanvasY - dim.height / 2 + offset,
-        state: 'generating',
+        state: 'idle',
         ratio: ratio,
         res: '2K',
         prompt: `${sourceLabel} ${isVideo ? 'video' : 'image'}: ${file.name || 'unnamed'}`,
@@ -2441,130 +2417,144 @@ export default function App() {
       });
     };
 
-    // 1. 导入挂载阶段：所有卡片在导入时立即出现在页面上，固定在【入场动画开头状态】（悬浮 1.38x 缩放等候状态）！
-    holdCardsAtEntryStart(currentProjectId, parsedItems.map(item => ({
-      id: item.card.id,
-      x: item.card.x,
-      y: item.card.y,
-      width: item.card.customWidth || CARD_DIMENSIONS[item.card.ratio].width,
-      height: item.card.customHeight || CARD_DIMENSIONS[item.card.ratio].height,
-    })));
-
-    setRenderedCardIds(prev => new Set([...prev, ...newCardIds]));
-    setVisibleCardIdSet(prev => new Set([...prev, ...newCardIds]));
-    setSelectedCardIds(newCardIds);
-    setCards(prev => [...prev, ...parsedItems.map(item => item.card)], false);
-
-    // 2. 顺序 GPU 压制与逐张“落下去”落地 pipeline
+    // Sequential Entrance ("一张一张入场"):
+    // Introduce each card one by one with a complete, smooth 450ms drop-and-settle entrance animation.
+    // Each card gets a fresh start timestamp in requestCardEntries right as it enters, immediate
+    // pre-mounting in renderedCardIds and visibleCardIdSet, and 100% of the main thread and GPU.
     const enteredCardIds: string[] = [];
-
     for (let i = 0; i < parsedItems.length; i++) {
       const item = parsedItems[i];
-      const { file, fileUrl, isImage, isVideo, width, height, card } = item;
+      const card = item.card;
+      enteredCardIds.push(card.id);
 
-      // ----------------------------------------------------
-      // 阶段 1：GPU 极速完成处理（压制预览图、代理图及所有 LOD 缩略图）
-      // ----------------------------------------------------
-      let processedFile: Blob = file;
-      let originalFileData: Blob | undefined = undefined;
-      let trueOriginalFileData: Blob | undefined = undefined;
-      let originalImageUrl: string | undefined = undefined;
-      let trueOriginalImageUrl: string | undefined = undefined;
+      // 1. Authorize card entrance timestamp right when THIS specific card is introduced
+      requestCardEntries(currentProjectId, [{
+        id: card.id,
+        x: card.x,
+        y: card.y,
+        width: card.customWidth || CARD_DIMENSIONS[card.ratio].width,
+        height: card.customHeight || CARD_DIMENSIONS[card.ratio].height,
+      }]);
 
-      if (isImage) {
-        try {
-          // Generate 1200px preview via WebGL GPU acceleration
-          processedFile = await compressAndResizeImage(file, 1200);
+      // 2. Pre-mount in renderedCardIds and visibleCardIdSet so it mounts immediately and is never culled
+      setRenderedCardIds(prev => new Set([...prev, card.id]));
+      setVisibleCardIdSet(prev => new Set([...prev, card.id]));
 
-          // Check if original is > 4K (4096px) (GPU texture limit safety & LOD optimization)
-          const MAX_TEXTURE_DIM = 4096;
-          if (width > MAX_TEXTURE_DIM || height > MAX_TEXTURE_DIM) {
-            trueOriginalFileData = file;
-            trueOriginalImageUrl = fileUrl;
+      // 3. Keep selected card list updated
+      setSelectedCardIds([...enteredCardIds]);
 
-            // Create 4K proxy for high-resolution view via WebGL GPU
-            originalFileData = await compressAndResizeImage(file, MAX_TEXTURE_DIM, 0.9);
-            originalImageUrl = URL.createObjectURL(originalFileData);
-          } else {
-            originalFileData = file;
-            originalImageUrl = fileUrl;
-          }
-        } catch (err) {
-          console.error("Failed to process image via GPU", err);
-          processedFile = await compressAndResizeImage(file, 1200);
-          originalFileData = file;
-          originalImageUrl = fileUrl;
-        }
-      }
+      // 4. Mount the card to canvas state (without cluttering undo history with intermediate steps)
+      setCards(prev => [...prev, card], false);
 
-      const processedFileUrl = URL.createObjectURL(processedFile);
+      // 5. Wait for this card's entrance animation to finish its full drop-and-bounce curve
+      await waitForCardEntrance(card.id);
 
-      let thumbnailUrl: string | undefined;
-      let microLodThumbnailUrl: string | undefined;
-      let fullDetailThumbnailUrl: string | undefined;
-      let closeupThumbnailUrl: string | undefined;
-      let videoPosterUrl: string | undefined;
-      try {
-        if (isVideo) {
-          videoPosterUrl = await generateNativeVideoPoster(processedFile);
-          closeupThumbnailUrl = await generateImageThumbnail(videoPosterUrl, 256);
-          thumbnailUrl = closeupThumbnailUrl;
-          microLodThumbnailUrl = await generateImageThumbnail(videoPosterUrl, 64);
-          fullDetailThumbnailUrl = await generateImageThumbnail(videoPosterUrl, 128);
-        } else {
-          closeupThumbnailUrl = await generateImageThumbnail(processedFile, 256);
-          thumbnailUrl = closeupThumbnailUrl;
-          microLodThumbnailUrl = await generateImageThumbnail(processedFile, 64);
-          fullDetailThumbnailUrl = await generateImageThumbnail(processedFile, 128);
-        }
-      } catch (thumbErr) {
-        console.warn('Could not pre-generate thumbnail on import:', thumbErr);
-      }
-
-      // Update card state in canvas to 'completed' with all GPU processed media
-      const readyCard: CardData = {
-        ...card,
-        state: 'completed',
-        imageUrl: processedFileUrl,
-        fileData: processedFile,
-        originalFileData,
-        trueOriginalFileData,
-        originalImageUrl,
-        trueOriginalImageUrl,
-        thumbnailUrl,
-        microLodThumbnailUrl,
-        fullDetailThumbnailUrl,
-        closeupThumbnailUrl,
-        videoPosterUrl,
-      };
-
-      setCards(prev => prev.map(c => c.id === readyCard.id ? readyCard : c), false);
-
-      // ----------------------------------------------------
-      // 阶段 2：正式触发该卡片“落下去”（从 1.38x 悬浮状态掉落落地）
-      // ----------------------------------------------------
-      enteredCardIds.push(readyCard.id);
-
-      // Trigger card drop clock start from performance.now()
-      triggerCardDrop(currentProjectId, {
-        id: readyCard.id,
-        x: readyCard.x,
-        y: readyCard.y,
-        width: readyCard.customWidth || CARD_DIMENSIONS[readyCard.ratio].width,
-        height: readyCard.customHeight || CARD_DIMENSIONS[readyCard.ratio].height,
-      });
-
-      // Wait for THIS card's entrance drop animation curve to land and settle
-      await waitForCardEntrance(readyCard.id);
-
-      // Brief 30ms breather before starting the next card
+      // 6. If more cards remain, give a subtle 30ms breather for human visual pacing
       if (i < parsedItems.length - 1) {
         await new Promise(r => setTimeout(r, 30));
       }
     }
 
-    // Ensure all newly imported cards remain selected
+    // Now all cards have gracefully landed! Ensure all new cards are selected together
     setSelectedCardIds(newCardIds);
+
+    // Step 2: Background processing - strictly scheduled AFTER ALL cards finish their entrance curve!
+    // "用时间换帧数": Let ALL cards in the dropped batch complete their 450ms entrance animation curve
+    // and bounce-landing first, with ZERO setCards re-renders or CPU compression interrupts!
+    (async () => {
+      // Small 40ms post-landing settle buffer
+      await new Promise(r => setTimeout(r, 40));
+
+      // 2. NOW all cards have gracefully landed. Transition cards to the import state ('generating') together
+      const idSet = new Set(newCardIds);
+      setCards(prev => prev.map(c => idSet.has(c.id) ? { ...c, state: 'generating' } : c));
+
+      // Yield briefly to let the import spinner render
+      await new Promise(r => setTimeout(r, 20));
+
+      // 3. Process media background tasks sequentially with frame yields to avoid CPU saturation
+      for (const item of parsedItems) {
+        if (!item) continue;
+        const { file, fileUrl, isImage, isVideo, width, height, card } = item;
+
+        let processedFile: Blob = file;
+        let originalFileData: Blob | undefined = undefined;
+        let trueOriginalFileData: Blob | undefined = undefined;
+        let originalImageUrl: string | undefined = undefined;
+        let trueOriginalImageUrl: string | undefined = undefined;
+
+        if (isImage) {
+          try {
+            // Generate 1200px preview for optimal performance when zoomed
+            processedFile = await compressAndResizeImage(file, 1200);
+
+            // Check if original is > 4K (4096px) (GPU texture limit safety & LOD optimization)
+            const MAX_TEXTURE_DIM = 4096;
+            if (width > MAX_TEXTURE_DIM || height > MAX_TEXTURE_DIM) {
+              trueOriginalFileData = file;
+              trueOriginalImageUrl = fileUrl;
+
+              // Create a safe 4K proxy for the "original" view in the UI to prevent GPU crashes and optimize VRAM
+              originalFileData = await compressAndResizeImage(file, MAX_TEXTURE_DIM, 0.9);
+              originalImageUrl = URL.createObjectURL(originalFileData);
+            } else {
+              // Under 4K, original file is proxy itself
+              originalFileData = file;
+              originalImageUrl = fileUrl;
+            }
+          } catch (err) {
+            console.error("Failed to process image in background", err);
+            processedFile = await compressAndResizeImage(file, 1200);
+            originalFileData = file;
+            originalImageUrl = fileUrl;
+          }
+        }
+
+        const processedFileUrl = URL.createObjectURL(processedFile);
+
+        let thumbnailUrl: string | undefined;
+        let microLodThumbnailUrl: string | undefined;
+        let fullDetailThumbnailUrl: string | undefined;
+        let closeupThumbnailUrl: string | undefined;
+        let videoPosterUrl: string | undefined;
+        try {
+          if (isVideo) {
+            videoPosterUrl = await generateNativeVideoPoster(processedFile);
+            closeupThumbnailUrl = await generateImageThumbnail(videoPosterUrl, 256);
+            thumbnailUrl = closeupThumbnailUrl;
+            microLodThumbnailUrl = await generateImageThumbnail(videoPosterUrl, 64);
+            fullDetailThumbnailUrl = await generateImageThumbnail(videoPosterUrl, 128);
+          } else {
+            closeupThumbnailUrl = await generateImageThumbnail(processedFile, 256);
+            thumbnailUrl = closeupThumbnailUrl;
+            microLodThumbnailUrl = await generateImageThumbnail(processedFile, 64);
+            fullDetailThumbnailUrl = await generateImageThumbnail(processedFile, 128);
+          }
+        } catch (thumbErr) {
+          console.warn('Could not pre-generate thumbnail on import:', thumbErr);
+        }
+
+        // Step 4: Seamlessly complete import for this card
+        setCards(prev => prev.map(c => c.id === card.id ? {
+          ...c,
+          state: 'completed',
+          imageUrl: processedFileUrl,
+          fileData: processedFile,
+          originalFileData: originalFileData,
+          trueOriginalFileData: trueOriginalFileData,
+          originalImageUrl: originalImageUrl,
+          trueOriginalImageUrl: trueOriginalImageUrl,
+          thumbnailUrl: thumbnailUrl,
+          microLodThumbnailUrl: microLodThumbnailUrl,
+          fullDetailThumbnailUrl: fullDetailThumbnailUrl,
+          closeupThumbnailUrl: closeupThumbnailUrl,
+          videoPosterUrl,
+        } : c));
+
+        // Yield between consecutive items to let the browser paint at 60fps
+        await new Promise(r => setTimeout(r, 30));
+      }
+    })();
   }, [tx, ty, tScale]);
 
   const handleDrop = useCallback(async (e: React.DragEvent) => {

@@ -4692,21 +4692,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     displayY = posRef.current.y;
   }
 
-  const [entryFrame, setEntryFrame] = useState(() => cardEntryFrame(id, performance.now(), true));
-
-  useEffect(() => {
-    const handleEntryUpdate = (e: Event) => {
-      const detail = (e as CustomEvent)?.detail;
-      if (!detail?.cardId || detail.cardId === id) {
-        setEntryFrame(cardEntryFrame(id, performance.now(), true));
-      }
-    };
-    window.addEventListener('card-entry-updated', handleEntryUpdate);
-    return () => {
-      window.removeEventListener('card-entry-updated', handleEntryUpdate);
-    };
-  }, [id]);
-
+  const entryFrame = useState(() => cardEntryFrame(id, performance.now(), true))[0];
   return (
     <div 
       ref={cardRef}
@@ -4719,25 +4705,12 @@ export const GenerationCard = React.memo(function GenerationCard({
       onPointerDownCapture={handleContainerPointerDown}
     >
       <motion.div
-        initial={entryFrame ? { scale: entryFrame.scale, opacity: entryFrame.opacity, filter: 'blur(24px)' } : false}
-        animate={
-          entryFrame
-            ? (entryFrame.start === Infinity
-                ? { scale: 1.38, opacity: 1, y: 0, filter: 'blur(24px)' }
-                : { scale: entryFrame.scales, opacity: entryFrame.opacities, y: 0, filter: 'blur(0px)' })
-            : { scale: 1, opacity: 1, y: 0, filter: 'blur(0px)' }
-        }
-        transition={
-          (entryFrame && entryFrame.start !== Infinity)
-            ? { duration: entryFrame.duration, delay: entryFrame.delay || 0, ease: [0.55, 0, 0.85, 0.45] }
-            : { duration: 0 }
-        }
+        initial={entryFrame ? { scale: entryFrame.scale, opacity: entryFrame.opacity } : false}
+        animate={entryFrame ? { scale: entryFrame.scales, opacity: entryFrame.opacities, y: 0 } : { scale: 1, opacity: 1, y: 0 }}
+        transition={{ duration: entryFrame?.duration || 0, delay: entryFrame?.delay || 0, ease: 'linear' }}
         onAnimationComplete={() => {
-          if (entryFrame && entryFrame.start !== Infinity) {
-            setEntryFrame(null);
-            if (typeof window !== 'undefined') {
-              window.dispatchEvent(new CustomEvent('card-entrance-complete', { detail: { cardId: id } }));
-            }
+          if (entryFrame && typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('card-entrance-complete', { detail: { cardId: id } }));
           }
         }}
         transformTemplate={(_, generated) => generated.replace(/translateZ\([^)]+\)/g, '')}
