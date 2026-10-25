@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 
 export interface ToastNotice {
@@ -37,7 +37,9 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, n
   const lastTimeRef = useRef(performance.now());
   const rafIdRef = useRef<number | null>(null);
   const dotRef = useRef<HTMLSpanElement | null>(null);
-  const textRef = useRef<HTMLSpanElement | null>(null);
+  const primaryContentRef = useRef<HTMLDivElement | null>(null);
+  const [fps, setFps] = useState(60);
+  const [primaryWidth, setPrimaryWidth] = useState<number | null>(null);
 
   const [eventToasts, setEventToasts] = useState<ToastNotice[]>([]);
 
@@ -83,9 +85,7 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, n
         const calculatedFps = Math.round((frameCountRef.current * 1000) / elapsed);
         frameCountRef.current = 0;
         lastTimeRef.current = now;
-        if (textRef.current) {
-          textRef.current.textContent = String(calculatedFps);
-        }
+        setFps(calculatedFps);
         if (dotRef.current) {
           const colorClass =
             calculatedFps >= 58
@@ -120,6 +120,14 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, n
 
   const primaryNotice = activeNotices.length > 0 ? activeNotices[0] : null;
   const secondaryNotices = activeNotices.length > 1 ? activeNotices.slice(1) : [];
+  // Measure the newly rendered content before paint, then animate a numeric
+  // width instead of letting simultaneous entering/exiting content affect layout.
+  useLayoutEffect(() => {
+    const content = primaryContentRef.current;
+    if (!content) return;
+    const contentWidth = content.getBoundingClientRect().width;
+    if (contentWidth > 0) setPrimaryWidth(Math.ceil(contentWidth + 30));
+  }, [primaryNotice?.id, primaryNotice?.text, fps]);
 
   return (
     <div
@@ -129,17 +137,15 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, n
     >
       {/* PERSISTENT MORPHING PRIMARY CAPSULE SHELL */}
       <motion.div
-        layout
-        transition={{ duration: 0.32, ease: [0.16, 1, 0.3, 1] }}
-        className="relative overflow-hidden flex items-center justify-center px-3.5 h-[36px] bg-gray-100/90 dark:bg-neutral-800/90 backdrop-blur-md border border-gray-200/80 dark:border-[#404040]/80 shadow-md rounded-2xl corner-squircle text-[11px] font-bold select-none pointer-events-auto will-change-[width,transform] whitespace-nowrap"
+        style={{ width: primaryWidth ?? undefined }}
+        className="relative overflow-hidden flex items-center justify-center px-3.5 h-[36px] bg-gray-100/90 dark:bg-neutral-800/90 backdrop-blur-md border border-gray-200/80 dark:border-[#404040]/80 shadow-md rounded-2xl corner-squircle text-[11px] font-bold select-none pointer-events-auto transition-[width] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] will-change-[width] whitespace-nowrap"
       >
-        <AnimatePresence mode="sync" initial={false}>
-          {primaryNotice ? (
+        {primaryNotice ? (
             <motion.div
-              key={primaryNotice.id}
+              key={`notice-${primaryNotice.id}`}
+              ref={primaryContentRef}
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
               transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
               className="flex items-center gap-2"
             >
@@ -166,20 +172,19 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, n
           ) : (
             <motion.div
               key="fps-content"
+              ref={primaryContentRef}
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
               transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
               className="flex items-center gap-1.5 font-mono"
             >
               <span ref={dotRef} className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
               <span className="text-gray-400 dark:text-neutral-500">FPS:</span>
-              <span ref={textRef} className="text-gray-700 dark:text-neutral-200">
-                60
+              <span className="text-gray-700 dark:text-neutral-200 tabular-nums">
+                {fps}
               </span>
             </motion.div>
           )}
-        </AnimatePresence>
       </motion.div>
 
       {/* Secondary notifications stack below primary capsule ONLY if multiple exist simultaneously */}
