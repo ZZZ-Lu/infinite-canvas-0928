@@ -13,7 +13,7 @@ import {
   thumbCache,
 } from '../utils/thumbnail';
 import { calculateObjectCover, fullImageCache } from '../utils/imageTextureCache';
-import { getNanoLodThreshold, NANO_LOD_EXIT_HIGH_THRESHOLD, getCardWorldBounds } from '../utils/viewportCulling';
+import { getNanoLodThreshold, getCardWorldBounds } from '../utils/viewportCulling';
 import { getBottomPanelHeight, getPromptAreaHeight, calculatePromptLines } from '../utils/cardLayout';
 import { buildCardQuadTree, QuadTree, BoundingBox } from '../utils/quadTree';
 
@@ -40,6 +40,7 @@ export interface NanoLodCanvasProps {
   ty: MotionValue<number>;
   isDarkMode: boolean;
   isOverviewMode?: boolean;
+  domCardsActive?: boolean;
   dotModeThreshold?: number;
   isActive?: boolean;
   onReady?: (frame: LodFrame) => void;
@@ -156,6 +157,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   ty,
   isDarkMode,
   isOverviewMode = false,
+  domCardsActive = true,
   dotModeThreshold = DEFAULT_OVERVIEW_DOT_THRESHOLD,
   isActive = true,
   onReady,
@@ -210,6 +212,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
   const isActiveRef = useRef(isActive);
   isActiveRef.current = isActive;
+  const domCardsActiveRef = useRef(domCardsActive);
+  domCardsActiveRef.current = domCardsActive;
 
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;
@@ -579,7 +583,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       const paintedSet = typeof window !== 'undefined' ? (window as any).__paintedCardIds : null;
       const isPainted = Boolean(paintedSet?.has(card.id));
       const panelReady = Boolean(card.fileName || card.isAsset) || readyPromptPanels.has(card.id);
-      const isCardReadyInDom = currentScale >= NANO_LOD_EXIT_HIGH_THRESHOLD && Boolean(renderedSet?.has(card.id) && isPainted && panelReady);
+      const isCardReadyInDom = currentScale >= getNanoLodThreshold() && domCardsActiveRef.current && Boolean(renderedSet?.has(card.id) && isPainted && panelReady);
 
       // Instant seamless handoff: if card is rendered and painted in DOM, DOM handles rendering directly!
       if (isCardReadyInDom) {
@@ -977,7 +981,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   // Re-draw when data changes (renderedCardIds excluded to prevent canvas redraw thrashing on DOM card mount)
   useEffect(() => {
     scheduleDraw();
-  }, [cards, selectedCardIds, agentTargetCardId, agentTargetCardIds, agentReferenceCardIds, agentFocusMap, pickerSession, isDarkMode, isOverviewMode, dotModeThreshold]);
+  }, [cards, selectedCardIds, agentTargetCardId, agentTargetCardIds, agentReferenceCardIds, agentFocusMap, pickerSession, isDarkMode, isOverviewMode, dotModeThreshold, domCardsActive]);
 
   // Listen to custom card painted and surface ready events for seamless DOM handoff
   useEffect(() => {

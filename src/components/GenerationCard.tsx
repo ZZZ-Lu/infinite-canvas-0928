@@ -38,7 +38,7 @@ import { CANVAS_IDLE_MS, scheduleCanvasSurface, scheduleOriginalImageRestore } f
 import { fullImageCache, originalImageCache, preloadAndDecodeImage } from '../utils/imageTextureCache';
 import { ScriptProject } from '../types/script';
 import { generateImageThumbnail, generateVideoThumbnail, generateNativeVideoPoster, thumbCache, MAX_THUMBNAIL_EDGE } from '../utils/thumbnail';
-import { captureLiveVideoFrame } from '../utils/videoFrameBus';
+import { captureLiveVideoFrame, clearLiveVideoFrame, getLiveVideoFrame } from '../utils/videoFrameBus';
 import { getActiveMcpKey, getActiveMcpKeySync, getActiveMcpTokenSync } from '../utils/mcpStorage';
 import { useMcpKey } from '../hooks/useMcpKey';
 import { useWorkrallyModels } from '../hooks/useWorkrallyModels';
@@ -2460,8 +2460,10 @@ export const GenerationCard = React.memo(function GenerationCard({
   // Track whether the card itself has finished loading & painting
   const [isCardLoaded, setIsCardLoaded] = useState(() => {
     if (typeof window === 'undefined') return false;
-    return Boolean((window as any).__paintedCardIds?.has(id));
+    return !isVideo && Boolean((window as any).__paintedCardIds?.has(id));
   });
+  const [loadedVideoFrameSrc, setLoadedVideoFrameSrc] = useState('');
+  const effectiveVideoSrcRef = useRef('');
   const handleImageLoaded = useCallback(() => setIsCardLoaded(true), []);
   // Initial state: tags start strictly with opacity: 0 while card is loading, then smoothly fade in after load
   const [isTagsReady, setIsTagsReady] = useState(false);
@@ -2470,14 +2472,14 @@ export const GenerationCard = React.memo(function GenerationCard({
   useEffect(() => {
     if (isCardLoaded) return;
 
-    if (typeof window !== 'undefined' && (window as any).__paintedCardIds?.has(id)) {
+    if (!isVideo && typeof window !== 'undefined' && (window as any).__paintedCardIds?.has(id)) {
       setIsCardLoaded(true);
       return;
     }
 
     const handleCardPainted = (e: Event) => {
       const customEvent = e as CustomEvent;
-      if (customEvent.detail?.cardId === id) {
+      if (customEvent.detail?.cardId === id && (!isVideo || loadedVideoFrameSrc === effectiveVideoSrcRef.current)) {
         setIsCardLoaded(true);
       }
     };
@@ -2486,7 +2488,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     return () => {
       window.removeEventListener('card-painted', handleCardPainted);
     };
-  }, [id, isCardLoaded]);
+  }, [id, isCardLoaded, isVideo, loadedVideoFrameSrc]);
 
   // When the card finishes loading, smoothly fade in the tags (give browser 1-2 frames to paint card first)
   useEffect(() => {
@@ -2556,8 +2558,8 @@ export const GenerationCard = React.memo(function GenerationCard({
     let raf2: number | null = null;
     if (!hasImageCanvas && typeof window !== "undefined") {
       if (isVideo) {
-        // Video cards must ONLY declare painted when the video element has decoded frame data (readyState >= 2)
-        if (videoRef.current && videoRef.current.readyState >= 2) {
+        // Retire the Nano underlay only after the restored Micro frame is ready.
+        if (videoRef.current && videoRef.current.readyState >= 2 && loadedVideoFrameSrc === effectiveVideoSrc) {
           markVideoPainted();
         }
       } else {
@@ -2592,6 +2594,8 @@ export const GenerationCard = React.memo(function GenerationCard({
   const [duration, setDuration] = useState(0);
   const [videoHasError, setVideoHasError] = useState(false);
   const [videoLoadError, setVideoLoadError] = useState<string>('');
+  const [hasVideoBridgeFrame, setHasVideoBridgeFrame] = useState(false);
+  const videoBridgeRef = useRef<HTMLCanvasElement>(null);
   const isRefreshingVideoRef = useRef(false);
   const [hasEverMountedVideo, setHasEverMountedVideo] = useState(false);
   const [showLandmarksHUD, setShowLandmarksHUD] = useState(() => {
@@ -2744,6 +2748,79 @@ export const GenerationCard = React.memo(function GenerationCard({
     }
     return activeVideoSrc;
   }, [activeVideoSrc]);
+  effectiveVideoSrcRef.current = effectiveVideoSrc;
+
+  // Keep the Nano canvas's exact paused frame behind the Micro video while its
+  // saved position is restored. The persisted poster can still be the first frame.
+  const bridgeMediaIdentityRef = useRef(imageUrl);
+  useLayoutEffect(() => {
+    const bridge = videoBridgeRef.current;
+    if (!bridge || !isVideo) return;
+    if (bridgeMediaIdentityRef.current !== imageUrl) {
+      bridgeMediaIdentityRef.current = imageUrl;
+      clearLiveVideoFrame(id);
+      setHasVideoBridgeFrame(false);
+      return;
+    }
+    const frame = getLiveVideoFrame(id);
+    if (!frame) return;
+    const ratio = Math.min(1, 1200 / Math.max(frame.width, frame.height));
+    bridge.width = Math.max(1, Math.round(frame.width * ratio));
+    bridge.height = Math.max(1, Math.round(frame.height * ratio));
+    bridge.getContext('2d')?.drawImage(frame, 0, 0, bridge.width, bridge.height);
+    setHasVideoBridgeFrame(true);
+  }, [id, isVideo, imageUrl, effectiveVideoSrc]);
+
+  // Compare against the exact `src` supplied to <video>, including #t=.
+  useEffect(() => {
+    setLoadedVideoFrameSrc('');
+    if (isVideo) setIsCardLoaded(false);
+  }, [id, effectiveVideoSrc, isVideo]);
+
+  useEffect(() => {
+    if (!hasVideoBridgeFrame || loadedVideoFrameSrc !== effectiveVideoSrc) return;
+    const timer = window.setTimeout(() => {
+      setHasVideoBridgeFrame(false);
+      const bridge = videoBridgeRef.current;
+      if (bridge) {
+        bridge.width = 0;
+        bridge.height = 0;
+      }
+      clearLiveVideoFrame(id);
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [hasVideoBridgeFrame, loadedVideoFrameSrc, effectiveVideoSrc, id]);
+
+  const revealRestoredVideoFrame = useCallback((video: HTMLVideoElement) => {
+    if (loadedVideoFrameSrc === effectiveVideoSrc) return;
+    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.seeking) return;
+    const savedPos = initialSeekPosRef.current || 0;
+    const targetTime = savedPos > 0 && video.duration > 0 && savedPos < video.duration - 0.4
+      ? savedPos
+      : video.duration > 0.05 ? 0.05 : 0;
+    if (Math.abs(video.currentTime - targetTime) > 0.3) {
+      video.currentTime = targetTime;
+      return;
+    }
+    setLoadedVideoFrameSrc(effectiveVideoSrc);
+    const expectedSrc = effectiveVideoSrc;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (
+        videoRef.current === video &&
+        video.getAttribute('src') === expectedSrc &&
+        video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+        !video.seeking &&
+        Math.abs(video.currentTime - targetTime) <= 0.3 &&
+        expectedSrc === effectiveVideoSrc
+      ) {
+        // Refresh persisted previews after restoring an older card whose poster
+        // may still show the video's original first frame.
+        captureVideoFrameRef.current(video);
+        setIsCardLoaded(true);
+        markVideoPainted();
+      }
+    }));
+  }, [effectiveVideoSrc, loadedVideoFrameSrc, markVideoPainted]);
 
   // Synchronize playback with isPlaying state
   useEffect(() => {
@@ -3120,6 +3197,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   useEffect(() => {
     return () => {
       if (videoRef.current) {
+        captureVideoFrameRef.current(videoRef.current);
         captureLiveVideoFrame(id, videoRef.current);
       }
     };
@@ -5051,21 +5129,25 @@ export const GenerationCard = React.memo(function GenerationCard({
               style={{
                 width: w,
                 height: h,
-                backgroundImage: (!effectiveVideoSrc || videoHasError || !isCardLoaded)
-                  ? (data.videoPosterUrl || data.thumbnailUrl || localThumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined))
-                    ? `url(${data.videoPosterUrl || data.thumbnailUrl || localThumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined)})`
-                    : undefined
+                backgroundImage: (data.videoPosterUrl || data.thumbnailUrl || localThumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined))
+                  ? `url(${data.videoPosterUrl || data.thumbnailUrl || localThumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined)})`
                   : undefined,
                 backgroundSize: 'cover',
                 backgroundPosition: 'center',
               }}
             >
               <div className="absolute inset-0 w-full h-full overflow-hidden squircle group/video pointer-events-auto">
+                <canvas
+                  ref={videoBridgeRef}
+                  className="absolute inset-0 w-full h-full object-cover pointer-events-none"
+                  style={{ display: hasVideoBridgeFrame ? 'block' : 'none' }}
+                  aria-hidden="true"
+                />
                 {effectiveVideoSrc && effectiveVideoSrc.trim() !== '' && !videoHasError && (
                   <motion.video 
                   initial={false}
-                  animate={{ opacity: 1 }}
-                  transition={{ duration: 0 }}
+                  animate={{ opacity: loadedVideoFrameSrc === effectiveVideoSrc ? 1 : 0 }}
+                  transition={{ opacity: { duration: 0.28, ease: 'easeOut' } }}
                   ref={videoRef}
                   {...({ referrerPolicy: "no-referrer" } as any)}
                   src={effectiveVideoSrc} 
@@ -5076,9 +5158,8 @@ export const GenerationCard = React.memo(function GenerationCard({
                   autoPlay={isPlaying && !isCameraGestureActive()}
                   className="absolute inset-0 w-full h-full object-cover pointer-events-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform"
                   onLoadedData={(e) => {
-                    setIsCardLoaded(true);
-                    markVideoPainted();
                     const video = e.currentTarget;
+                    revealRestoredVideoFrame(video);
                     if (video.duration) {
                       setDuration(video.duration);
                     }
@@ -5100,13 +5181,10 @@ export const GenerationCard = React.memo(function GenerationCard({
                     } else if (dur > 0.05) {
                       video.currentTime = 0.05;
                     }
+                    revealRestoredVideoFrame(video);
                   }}
                   onCanPlay={(e) => {
                     const video = e.currentTarget;
-                    if (video.readyState >= 2) {
-                      setIsCardLoaded(true);
-                      markVideoPainted();
-                    }
                     if (video.duration) setDuration(video.duration);
                     if (!hasRestoredInitialTimeRef.current) {
                       hasRestoredInitialTimeRef.current = true;
@@ -5115,6 +5193,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                         video.currentTime = savedPos;
                       }
                     }
+                    revealRestoredVideoFrame(video);
                     if (isPlaying && video.paused && !isCameraGestureActive()) {
                       const p = video.play();
                       if (p !== undefined) {
@@ -5157,10 +5236,12 @@ export const GenerationCard = React.memo(function GenerationCard({
                       saveStoredVideoProgress(currTime);
                       onUpdate(id, { currentTime: currTime }, false);
                     }
+                    captureVideoFrameRef.current(video);
                     captureLiveVideoFrame(id, video);
                   }}
                   onSeeked={(e) => {
                     const video = e.currentTarget;
+                    revealRestoredVideoFrame(video);
                     const currTime = video.currentTime;
                     if (currTime > 0) {
                       saveStoredVideoProgress(currTime);

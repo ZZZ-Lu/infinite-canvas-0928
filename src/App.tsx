@@ -1,6 +1,6 @@
 import { EntryBlurOverlay } from './components/EntryBlurOverlay';
 import { registerCardEntries, requestCardEntries, stageCardEntry, startCardEntry, CARD_ENTRY_MS, isNewCardAwaitingLod } from './utils/cardEntrance';
-import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useRef, useState, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
 import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
 import { AgentContextMenu } from './components/AgentContextMenu';
 import { GenerationCard, CardData, CARD_DIMENSIONS, getCardSize, safeParseJsonResponse, compressImageBlob, resolveReferenceToPayload, SubjectLandmarks, VisualElementAnnotation, pauseVideosForNanoLod } from './components/GenerationCard';
@@ -184,35 +184,35 @@ const getImageDimensions = (url: string): Promise<MediaDimensions> => {
 };
 
 const getVideoDimensions = (url: string): Promise<MediaDimensions> => {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     if (!url || url.trim() === '') {
-      resolve({ width: 640, height: 360 });
+      reject(new Error('视频地址为空，无法读取画面尺寸'));
       return;
     }
     let settled = false;
-    const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        resolve({ width: 1280, height: 720 });
-      }
-    }, 80);
-
     const video = document.createElement('video');
     (video as any).referrerPolicy = 'no-referrer';
     video.preload = 'metadata';
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (complete: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      video.onloadedmetadata = null;
+      video.onerror = null;
+      complete();
+    };
+    timer = setTimeout(() => {
+      finish(() => reject(new Error('读取视频尺寸超时')));
+    }, 30000);
     video.onloadedmetadata = () => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        resolve({ width: video.videoWidth || 1280, height: video.videoHeight || 720 });
-      }
+      const width = video.videoWidth;
+      const height = video.videoHeight;
+      if (width > 0 && height > 0) finish(() => resolve({ width, height }));
+      else finish(() => reject(new Error('视频元数据没有有效的画面尺寸')));
     };
     video.onerror = () => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        resolve({ width: 1280, height: 720 });
-      }
+      finish(() => reject(new Error('视频元数据读取失败')));
     };
     video.src = url;
   });
@@ -2366,6 +2366,11 @@ export default function App() {
         }
       } catch (err) {
         console.warn('Fast dimensions parsing failed, fallback:', err);
+        if (isVideo) {
+          URL.revokeObjectURL(fileUrl);
+          showToastNotice(`视频导入失败，无法读取尺寸：${file.name || '未命名视频'}`, { duration: 6000 });
+          return null;
+        }
       }
 
       // Preserve natural aspect ratio and scale to standard visual area
@@ -2451,6 +2456,38 @@ export default function App() {
       timeout = setTimeout(cleanup, CARD_ENTRY_MS + 80);
     });
 
+    const waitForCardMediaPaint = (cardId: string): Promise<void> => new Promise(resolve => {
+      let finished = false;
+      let firstFrame: number | null = null;
+      let secondFrame: number | null = null;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+        window.removeEventListener('card-painted', handleEvent as EventListener);
+        if (firstFrame !== null) cancelAnimationFrame(firstFrame);
+        if (secondFrame !== null) cancelAnimationFrame(secondFrame);
+        resolve();
+      };
+      const confirmPresentedFrame = () => {
+        if (finished || !(window as any).__paintedCardIds?.has(cardId)) return;
+        firstFrame = requestAnimationFrame(() => {
+          firstFrame = null;
+          secondFrame = requestAnimationFrame(() => {
+            secondFrame = null;
+            finish();
+          });
+        });
+      };
+      const handleEvent = (event: Event) => {
+        if ((event as CustomEvent<{ cardId?: string }>).detail?.cardId === cardId) confirmPresentedFrame();
+      };
+      const timeout = setTimeout(finish, 2000);
+      window.addEventListener('card-painted', handleEvent as EventListener);
+      // The media may have painted while the card was still in its import state.
+      confirmPresentedFrame();
+    });
+
     for (const item of parsedItems) {
       const { file, fileUrl, isImage, isVideo, width, height, card } = item;
       stageCardEntry(currentProjectId, {
@@ -2512,13 +2549,6 @@ export default function App() {
           const posterBlob = await fetch(videoPosterUrl).then(response => response.blob());
           closeupThumbnailUrl = await generateImportThumbnail(posterBlob, 256);
           thumbnailUrl = closeupThumbnailUrl;
-          await warmCanvasImage(closeupThumbnailUrl);
-          // Paint a tiny poster first so the card does not upload a video frame and animate
-          // in the same frame. Keep the import overlay until all video assets are ready.
-          setCards(prev => prev.map(existing => existing.id === card.id ? {
-            ...existing, imageUrl: closeupThumbnailUrl, thumbnailUrl,
-            fileData: processedFile, isVideo: false,
-          } : existing), false);
           await yieldToMain();
           await yieldToMain();
           microLodThumbnailUrl = await generateImportThumbnail(posterBlob, 64);
@@ -2528,12 +2558,6 @@ export default function App() {
           await yieldToMain();
           closeupThumbnailUrl = await generateImportThumbnail(processedFile, 256);
           thumbnailUrl = closeupThumbnailUrl;
-          await warmCanvasImage(closeupThumbnailUrl);
-          // Show the small preview under the import indicator while the other LODs load.
-          setCards(prev => prev.map(existing => existing.id === card.id ? {
-            ...existing, imageUrl: closeupThumbnailUrl, thumbnailUrl,
-            fileData: processedFile,
-          } : existing), false);
           await yieldToMain();
           await yieldToMain();
           microLodThumbnailUrl = await generateImportThumbnail(processedFile, 64);
@@ -2573,7 +2597,9 @@ export default function App() {
 
       // Finish import and let the canvas paint the ready image before the entrance animation.
       const entranceComplete = waitForCardEntrance(card.id);
+      const mediaPainted = waitForCardMediaPaint(card.id);
       setCards(prev => prev.map(existing => existing.id === card.id ? { ...existing, state: 'completed' } : existing), false);
+      await mediaPainted;
       startCardEntry(card.id);
       window.dispatchEvent(new CustomEvent('card-entry-start', { detail: { cardId: card.id } }));
       await entranceComplete;
@@ -3905,7 +3931,6 @@ export default function App() {
 
   // Track LOD switch from Low -> Standard to animate text labels fade-in
   const [isLodFading, setIsLodFading] = useState(false);
-  const wasMicroLodRef = useRef(tScale.get() < getNanoLodThreshold());
   const lodFadeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const triggerLodFadeIn = useCallback(() => {
@@ -3928,6 +3953,17 @@ export default function App() {
     const ws = document.getElementById('canvas-workspace');
     if (ws) ws.removeAttribute('data-lod-fade');
   }, []);
+
+  // Wait for React to commit the new LOD attributes before starting the fade.
+  const previousCommittedMicroLodRef = useRef(isMicroLod);
+  useLayoutEffect(() => {
+    const wasMicro = previousCommittedMicroLodRef.current;
+    if (wasMicro !== isMicroLod) {
+      if (wasMicro && !isMicroLod) triggerLodFadeIn();
+      else cancelLodFade();
+      previousCommittedMicroLodRef.current = isMicroLod;
+    }
+  }, [isMicroLod, triggerLodFadeIn, cancelLodFade]);
 
   const handleNanoCanvasReady = useCallback((frame: LodFrame) => {
     if (isNanoLod && canRetireDomForNano(frame, { scale: tScale.get(), tx: tx.get(), ty: ty.get() })) {
@@ -3956,21 +3992,12 @@ export default function App() {
       const threshold = getNanoLodThreshold();
       const isMicro = s < threshold;
       const isNano = s < threshold;
-      
-      if (wasMicroLodRef.current && !isMicro) {
-        // Switched from Micro/Nano to Standard LOD: trigger smooth fade-in
-        triggerLodFadeIn();
-      } else if (!wasMicroLodRef.current && isMicro) {
-        // Switched from Standard to Micro/Nano LOD: immediately cancel fade and hide tags
-        cancelLodFade();
-      }
-      wasMicroLodRef.current = isMicro;
 
       setIsMicroLod(isMicro);
       setIsNanoLod(isNano);
     });
     return unsub;
-  }, [tScale, triggerLodFadeIn, cancelLodFade]);
+  }, [tScale]);
 
   // Set of DOM-mounted card IDs (Center-Out Sequential Queue)
   const cardMountStore = useMemo(createCardMountStore, []);
@@ -6442,12 +6469,6 @@ export default function App() {
     const currentScale = tScale.get();
     const threshold = getNanoLodThreshold();
     const isMicro = currentScale < threshold;
-    if (wasMicroLodRef.current && !isMicro) {
-      triggerLodFadeIn();
-    } else if (!wasMicroLodRef.current && isMicro) {
-      cancelLodFade();
-    }
-    wasMicroLodRef.current = isMicro;
 
     setIsMicroLod(isMicro);
     setIsNanoLod(isMicro);
@@ -6457,7 +6478,7 @@ export default function App() {
       setIsZooming(false); // MUST sync React state so it doesn't revert on next render
       window.dispatchEvent(new CustomEvent('canvas-styles-restored'));
     }
-  }, [updateCircularCulling, tScale, triggerLodFadeIn, cancelLodFade]);
+  }, [updateCircularCulling, tScale]);
 
   useEffect(() => {
     (window as any).resetGlobalZoomTimer = () => {
@@ -7777,6 +7798,7 @@ export default function App() {
             ty={ty}
             isDarkMode={isDarkMode}
             isOverviewMode={isOverviewMode}
+            domCardsActive={isDomCardsActive}
             onReady={handleNanoCanvasReady}
             onThumbnailGenerated={(id, thumbnailUrl) => {
               handleBatchThumbnailGenerated(id, thumbnailUrl);
