@@ -1,11 +1,9 @@
 // Shared by native card CSS and the loading canvas. Values are world pixels.
 export const NANO_LOD_THRESHOLD = 0.40;
-export const NANO_LOD_ENTER_HIGH_THRESHOLD = 0.40;
-export const NANO_LOD_EXIT_HIGH_THRESHOLD = 0.34;
 export const CARD_CORNER_RADIUS = 20;
 export const CARD_PANEL_WIDTH = 480;
 export const cardCornerStyle = { '--card-corner-radius': `${CARD_CORNER_RADIUS}px` };
-export const isStandardCardLod = (scale: number) => scale >= NANO_LOD_EXIT_HIGH_THRESHOLD;
+export const isStandardCardLod = (scale: number) => scale >= NANO_LOD_THRESHOLD;
 export const EMPTY_CARD_PATHS = [
   'M8.5 2C8.8 4.5 10.5 6.2 13 6.5C10.5 6.8 8.8 8.5 8.5 11C8.2 8.5 6.5 6.8 4 6.5C6.5 6.2 8.2 4.5 8.5 2Z',
   'M15.5 10L22 20H9L15.5 10Z',

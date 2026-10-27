@@ -65,7 +65,7 @@ export const PromptCanvas = React.memo(function PromptCanvas({
   useLayoutEffect(() => {
     if (suspended) return;
     const canvas = canvasRef.current;
-    const ctx = canvas?.getContext('2d', { alpha: true, desynchronized: true, willReadFrequently: false });
+    const ctx = canvas?.getContext('2d');
     if (!canvas || !ctx) return;
     return scheduleCanvasSurface(() => {
     canvas.width = Math.ceil(width * resolution);

@@ -46,8 +46,6 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafIdRef = useRef<number | null>(null);
-  const paintedNoticeFrameRef = useRef<number | null>(null);
-  const paintedNoticeCardRef = useRef<string | null>(null);
 
   // Cross-fade animation progress states
   const fullAlphaRef = useRef<number>(1);
@@ -83,25 +81,6 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     onLoaded,
   };
 
-  // When card entrance lands or when batch entrance finishes, re-schedule draw to upgrade from thumbnail to full proxy texture
-  useEffect(() => {
-    const handleEntrance = (e: Event) => {
-      const customEvt = e as CustomEvent<{ cardId?: string }>;
-      if (!customEvt.detail?.cardId || customEvt.detail.cardId === cardId) {
-        scheduleDraw();
-      }
-    };
-    const handleBatchComplete = () => {
-      scheduleDraw();
-    };
-    window.addEventListener('card-entrance-complete', handleEntrance as EventListener);
-    window.addEventListener('card-batch-entrance-complete', handleBatchComplete as EventListener);
-    return () => {
-      window.removeEventListener('card-entrance-complete', handleEntrance as EventListener);
-      window.removeEventListener('card-batch-entrance-complete', handleBatchComplete as EventListener);
-    };
-  }, [cardId]);
-
   const scheduleDraw = () => {
     if (rafIdRef.current !== null) return;
     rafIdRef.current = requestAnimationFrame(() => {
@@ -114,7 +93,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const ctx = canvas.getContext('2d', { alpha: true, desynchronized: true, willReadFrequently: false });
+    const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
     const {
@@ -177,7 +156,6 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       ? getOrLoadThumbImage(thumbnailUrl, scheduleDraw)
       : null;
 
-    // Always initiate loading for the full-resolution preview image
     const fullImg = imageUrl
       ? getOrLoadCanvasImage(imageUrl, scheduleDraw, 'full')
       : null;
@@ -201,15 +179,13 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       ctx.drawImage(img, sx, sy, sw, sh, 0, 0, w, h);
     };
 
-    const fullImgReady = Boolean(fullImg && fullImg.complete && fullImg.naturalWidth > 0);
-
-    // 2. Base Tier: Render Micro / Thumbnail if full image is not yet ready
-    if (!fullImgReady && microImg && microImg.complete && microImg.naturalWidth > 0) {
+    // 2. Base Tier: Render Micro / Thumbnail
+    if (microImg && microImg.complete && microImg.naturalWidth > 0) {
       drawCover(microImg, 1);
     }
 
     // 3. Middle Tier: Render Full standard preview
-    if (fullImgReady && fullImg) {
+    if (fullImg && fullImg.complete && fullImg.naturalWidth > 0) {
       if (isGenerating && !imageUrl) {
         // Generating placeholder filter
         ctx.filter = 'blur(12px) brightness(0.95)';
@@ -274,19 +250,17 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       if (!(window as any).__paintedCardIds) {
         (window as any).__paintedCardIds = new Set<string>();
       }
-      if (!(window as any).__paintedCardIds.has(cardId) && paintedNoticeCardRef.current !== cardId) {
-        paintedNoticeCardRef.current = cardId;
-        // A completed draw in useLayoutEffect has not necessarily reached the
-        // screen. Let the browser present it before retiring the Nano underlay.
-        paintedNoticeFrameRef.current = requestAnimationFrame(() => {
-          paintedNoticeFrameRef.current = requestAnimationFrame(() => {
-            paintedNoticeFrameRef.current = null;
-            paintedNoticeCardRef.current = null;
-            if (canvasRef.current && propsRef.current.cardId === cardId) {
+      if (!(window as any).__paintedCardIds.has(cardId)) {
+        requestAnimationFrame(() => {
+          if (typeof window !== 'undefined') {
+            if (!(window as any).__paintedCardIds) {
+              (window as any).__paintedCardIds = new Set<string>();
+            }
+            if (!(window as any).__paintedCardIds.has(cardId)) {
               (window as any).__paintedCardIds.add(cardId);
               window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId } }));
             }
-          });
+          }
         });
       }
     }
@@ -318,11 +292,6 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
   // Clean up painted registration on unmount
   useEffect(() => {
     return () => {
-      if (paintedNoticeFrameRef.current !== null) {
-        cancelAnimationFrame(paintedNoticeFrameRef.current);
-        paintedNoticeFrameRef.current = null;
-        paintedNoticeCardRef.current = null;
-      }
       if (cardId && typeof window !== 'undefined') {
         if ((window as any).__paintedCardIds) {
           (window as any).__paintedCardIds.delete(cardId);
@@ -347,8 +316,6 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     };
   }, []);
 
-  const fallbackBgUrl = thumbnailUrl || imageUrl;
-
   return (
     <canvas
       ref={canvasRef}
@@ -356,9 +323,6 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       style={{
         width: `${width}px`,
         height: `${height}px`,
-        backgroundImage: fallbackBgUrl ? `url(${fallbackBgUrl})` : undefined,
-        backgroundSize: 'cover',
-        backgroundPosition: 'center',
       }}
     />
   );
